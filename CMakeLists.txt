@@ -144,6 +144,15 @@ set(APPLICATION_HEADERS
 
 if (WIN32)
     list(APPEND APPLICATION_3_1_SOURCE src/util/win32/getopt.c)
+    if(MSVC)
+
+
+      # Disable MSVC iterator debugging to avoid O(n^2) overhead when
+      # destroying large containers of std::list iterators (e.g., in
+      # HalfedgeMesh::build). Without this, debug builds hang on large meshes.
+      add_compile_definitions(_ITERATOR_DEBUG_LEVEL=0)
+
+    endif(MSVC)
 endif()
 
 if (WIN32 OR APPLE)

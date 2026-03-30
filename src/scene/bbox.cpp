@@ -3,6 +3,7 @@
 #include "GL/glew.h"
 
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 
 namespace CGL {
@@ -13,7 +14,26 @@ bool BBox::intersect(const Ray& r, double& t0, double& t1) const {
   // Implement ray - bounding box intersection test
   // If the ray intersected the bouding box within the range given by
   // t0, t1, update t0 and t1 with the new intersection times.
+  for (int axis = 0; axis < 3; axis++) {
+    if (std::abs(r.d[axis]) < 1e-12) {
+      if (r.o[axis] < min[axis] || r.o[axis] > max[axis]) {
+        return false;
+      }
+      continue;
+    }
 
+    double t_near = (min[axis] - r.o[axis]) / r.d[axis];
+    double t_far = (max[axis] - r.o[axis]) / r.d[axis];
+    if (t_near > t_far) {
+      std::swap(t_near, t_far);
+    }
+
+    t0 = std::max(t0, t_near);
+    t1 = std::min(t1, t_far);
+    if (t0 > t1) {
+      return false;
+    }
+  }
 
   return true;
 
