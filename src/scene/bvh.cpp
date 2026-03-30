@@ -85,22 +85,38 @@ BVHNode *BVHAccel::construct_bvh(std::vector<Primitive *>::iterator start,
     axis = 2;
   }
 
-  double split = 0.0;
-  for (auto p = start; p != end; p++) {
-    split += (*p)->get_bbox().centroid()[axis];
-  }
-  split /= n_prims;
-
-  auto mid = std::partition(start, end, [axis, split](Primitive *p) {
-    return p->get_bbox().centroid()[axis] < split;
+  std::sort(start, end, [axis](Primitive *a, Primitive *b) {
+    return a->get_bbox().centroid()[axis] < b->get_bbox().centroid()[axis];
   });
 
-  if (mid == start || mid == end) {
-    mid = start + n_prims / 2;
-    std::nth_element(start, mid, end, [axis](Primitive *a, Primitive *b) {
-      return a->get_bbox().centroid()[axis] < b->get_bbox().centroid()[axis];
-    });
+  std::vector<BBox> left_boxes(n_prims);
+  std::vector<BBox> right_boxes(n_prims);
+
+  BBox left_accum;
+  for (size_t i = 0; i < n_prims; i++) {
+    left_accum.expand((*(start + i))->get_bbox());
+    left_boxes[i] = left_accum;
   }
+
+  BBox right_accum;
+  for (size_t i = n_prims; i > 0; i--) {
+    right_accum.expand((*(start + (i - 1)))->get_bbox());
+    right_boxes[i - 1] = right_accum;
+  }
+
+  double best_cost = INF_D;
+  size_t best_split = n_prims / 2;
+  for (size_t i = 0; i + 1 < n_prims; i++) {
+    double left_cost = left_boxes[i].surface_area() * (double)(i + 1);
+    double right_cost = right_boxes[i + 1].surface_area() * (double)(n_prims - i - 1);
+    double cost = left_cost + right_cost;
+    if (cost < best_cost) {
+      best_cost = cost;
+      best_split = i + 1;
+    }
+  }
+
+  auto mid = start + best_split;
 
   node->l = construct_bvh(start, mid, max_leaf_size);
   node->r = construct_bvh(mid, end, max_leaf_size);
