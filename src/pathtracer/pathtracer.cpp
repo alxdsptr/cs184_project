@@ -1,5 +1,7 @@
 #include "pathtracer.h"
 
+#include <cmath>
+
 #include "scene/light.h"
 #include "scene/sphere.h"
 #include "scene/triangle.h"
@@ -267,17 +269,40 @@ void PathTracer::raytrace_pixel(size_t x, size_t y) {
   int num_samples = ns_aa;          // total samples to evaluate
   Vector2D origin = Vector2D(x, y); // bottom left corner of the pixel
   Vector3D radiance_sum(0.0);
+
+  double s1 = 0.0;
+  double s2 = 0.0;
+  int actual_samples = 0;
+  size_t batch_size = samplesPerBatch > 0 ? samplesPerBatch : 1;
+
   for (int i = 0; i < num_samples; ++i) {
     Vector2D sample = origin + gridSampler->get_sample();
     Ray r = camera->generate_ray(sample.x / sampleBuffer.w, sample.y / sampleBuffer.h);
     r.depth = max_ray_depth;
     Vector3D radiance = est_radiance_global_illumination(r);
     radiance_sum += radiance;
+
+    double illum = radiance.illum();
+    s1 += illum;
+    s2 += illum * illum;
+    actual_samples = i + 1;
+
+    if (actual_samples % batch_size == 0 && actual_samples > 1) {
+      double n = static_cast<double>(actual_samples);
+      double mean = s1 / n;
+      double variance = (s2 - (s1 * s1) / n) / (n - 1.0);
+      if (variance < 0.0) variance = 0.0;
+
+      double I = 1.96 * std::sqrt(variance / n);
+      if (I <= maxTolerance * mean) {
+        break;
+      }
+    }
   }
 
-  sampleBuffer.update_pixel(radiance_sum / num_samples, x, y);
+  sampleBuffer.update_pixel(radiance_sum / actual_samples, x, y);
 
-  sampleCountBuffer[x + y * sampleBuffer.w] = num_samples;
+  sampleCountBuffer[x + y * sampleBuffer.w] = actual_samples;
 
 }
 
