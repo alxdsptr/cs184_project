@@ -181,6 +181,48 @@ Vector3D PathTracer::at_least_one_bounce_radiance(const Ray &r,
   // TODO: Part 4, Task 2
   // Returns the one bounce radiance + radiance from extra bounces at this point.
   // Should be called recursively to simulate extra bounces.
+  if (r.depth <= 0) {
+    return L_out;
+  }
+
+  if (isAccumBounces || r.depth == 1) {
+    L_out += one_bounce_radiance(r, isect);
+  }
+
+  if (r.depth <= 1) {
+    return L_out;
+  }
+
+  // Russian Roulette: always keep the first indirect bounce, then randomly
+  // terminate deeper paths while preserving unbiasedness in expectation.
+  const double continue_prob = 0.65;
+  const bool force_first_indirect = (r.depth == max_ray_depth);
+  if (!force_first_indirect && !coin_flip(continue_prob)) {
+    return L_out;
+  }
+
+  Vector3D wi;
+  double pdf;
+  Vector3D f = isect.bsdf->sample_f(w_out, &wi, &pdf);
+
+  if (pdf <= 0.0 || wi.z <= 0.0) {
+    return L_out;
+  }
+
+  Ray next_ray(hit_p, o2w * wi);
+  next_ray.depth = r.depth - 1;
+  next_ray.min_t = EPS_F;
+
+  Intersection next_isect;
+  Vector3D L_in;
+  if (bvh->intersect(next_ray, &next_isect)) {
+    L_in = at_least_one_bounce_radiance(next_ray, next_isect);
+  } else {
+    L_in = envLight ? envLight->sample_dir(next_ray) : Vector3D();
+  }
+
+  double rr_weight = force_first_indirect ? 1.0 : continue_prob;
+  L_out += f * L_in * abs_cos_theta(wi) / (pdf * rr_weight);
 
 
   return L_out;
@@ -205,7 +247,7 @@ Vector3D PathTracer::est_radiance_global_illumination(const Ray &r) {
 
 
   // TODO (Part 3): Return the direct illumination.
-  L_out = zero_bounce_radiance(r, isect) + one_bounce_radiance(r, isect);
+  L_out = zero_bounce_radiance(r, isect) + at_least_one_bounce_radiance(r, isect);
 
   // TODO (Part 4): Accumulate the "direct" and "indirect"
   // parts of global illumination into L_out rather than just direct
@@ -228,6 +270,7 @@ void PathTracer::raytrace_pixel(size_t x, size_t y) {
   for (int i = 0; i < num_samples; ++i) {
     Vector2D sample = origin + gridSampler->get_sample();
     Ray r = camera->generate_ray(sample.x / sampleBuffer.w, sample.y / sampleBuffer.h);
+    r.depth = max_ray_depth;
     Vector3D radiance = est_radiance_global_illumination(r);
     radiance_sum += radiance;
   }
