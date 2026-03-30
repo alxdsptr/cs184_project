@@ -85,11 +85,22 @@ BVHNode *BVHAccel::construct_bvh(std::vector<Primitive *>::iterator start,
     axis = 2;
   }
 
-  std::sort(start, end, [axis](Primitive *a, Primitive *b) {
-    return a->get_bbox().centroid()[axis] < b->get_bbox().centroid()[axis];
+  double split = 0.0;
+  for (auto p = start; p != end; p++) {
+    split += (*p)->get_bbox().centroid()[axis];
+  }
+  split /= n_prims;
+
+  auto mid = std::partition(start, end, [axis, split](Primitive *p) {
+    return p->get_bbox().centroid()[axis] < split;
   });
 
-  auto mid = start + n_prims / 2;
+  if (mid == start || mid == end) {
+    mid = start + n_prims / 2;
+    std::nth_element(start, mid, end, [axis](Primitive *a, Primitive *b) {
+      return a->get_bbox().centroid()[axis] < b->get_bbox().centroid()[axis];
+    });
+  }
 
   node->l = construct_bvh(start, mid, max_leaf_size);
   node->r = construct_bvh(mid, end, max_leaf_size);
