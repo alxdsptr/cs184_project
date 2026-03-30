@@ -28,9 +28,36 @@ bool Triangle::has_intersection(const Ray &r) const {
   // function records the "intersection" while this function only tests whether
   // there is a intersection.
 
+  // Möller-Trumbore algorithm
+  Vector3D e1 = p2 - p1;
+  Vector3D e2 = p3 - p1;
+  Vector3D s1 = cross(r.d, e2);
+  double a = dot(e1, s1);
 
-  return true;
+  if (std::abs(a) < 1e-8) {
+    return false;
+  }
 
+  Vector3D s = r.o - p1;
+  double f = 1.0 / a;
+  double u = f * dot(s, s1);
+
+  if (u < 0.0 || u > 1.0) {
+    return false;
+  }
+
+  Vector3D s2 = cross(s, e1);
+  double v = f * dot(r.d, s2);
+
+  // Check if v is in valid range [0, 1] and u + v <= 1
+  if (v < 0.0 || u + v > 1.0) {
+    return false;
+  }
+
+  double t = f * dot(e2, s2);
+
+  // Check if t is in valid range [min_t, max_t]
+  return t >= r.min_t && t <= r.max_t;
 }
 
 bool Triangle::intersect(const Ray &r, Intersection *isect) const {
@@ -38,9 +65,57 @@ bool Triangle::intersect(const Ray &r, Intersection *isect) const {
   // implement ray-triangle intersection. When an intersection takes
   // place, the Intersection data should be updated accordingly
 
+  // Möller-Trumbore algorithm
+  Vector3D e1 = p2 - p1;
+  Vector3D e2 = p3 - p1;
+  Vector3D s1 = cross(r.d, e2);
+  double a = dot(e1, s1);
+
+  // If a is near zero, ray is parallel to triangle
+  if (std::abs(a) < 1e-8) {
+    return false;
+  }
+
+  Vector3D s = r.o - p1;
+  double f = 1.0 / a;
+  double u = f * dot(s, s1);
+
+  // Check if u is in valid range [0, 1]
+  if (u < 0.0 || u > 1.0) {
+    return false;
+  }
+
+  Vector3D s2 = cross(s, e1);
+  double v = f * dot(r.d, s2);
+
+  // Check if v is in valid range [0, 1] and u + v <= 1
+  if (v < 0.0 || u + v > 1.0) {
+    return false;
+  }
+
+  double t = f * dot(e2, s2);
+
+  // Check if t is in valid range [min_t, max_t]
+  if (t < r.min_t || t > r.max_t) {
+    return false;
+  }
+
+  // Update intersection information
+  isect->t = t;
+  isect->primitive = this;
+
+  // Interpolate normals using barycentric coordinates
+  // The barycentric coordinates are (w, u, v) where w = 1 - u - v
+  double w = 1.0 - u - v;
+  isect->n = w * n1 + u * n2 + v * n3;
+
+  // Get the BSDF
+  isect->bsdf = get_bsdf();
+
+  // Update the ray's max_t to be the nearest intersection
+  r.max_t = t;
 
   return true;
-
 
 }
 
