@@ -12,6 +12,68 @@
 #include <iomanip>
 #include <sstream>
 
+static float3 normalizeOrFallback(float3 v, float3 fallback) {
+    float len = length(v);
+    if (len <= 1e-6f) {
+        return fallback;
+    }
+    return v / len;
+}
+
+static float computeVerticalFovRadians(const SceneCamera& camera, float aspect) {
+    float horizontal = camera.horizontalFovRadians > 1e-6f
+        ? camera.horizontalFovRadians
+        : 60.0f * 3.14159265358979323846f / 180.0f;
+    float safeAspect = aspect > 1e-6f ? aspect : 1.0f;
+    return 2.0f * atanf(tanf(horizontal * 0.5f) / safeAspect);
+}
+
+static float computeFitDistance(const AABB& bounds, float3 forward, float3 up, float aspect, float verticalFovRadians) {
+    if (bounds.empty()) {
+        return 3.0f;
+    }
+
+    forward = normalizeOrFallback(forward, make_float3(0.0f, 0.0f, -1.0f));
+    up = normalizeOrFallback(up, make_float3(0.0f, 1.0f, 0.0f));
+    float3 right = normalizeOrFallback(cross(forward, up), make_float3(1.0f, 0.0f, 0.0f));
+    up = normalizeOrFallback(cross(right, forward), make_float3(0.0f, 1.0f, 0.0f));
+
+    float tanHalfV = tanf(verticalFovRadians * 0.5f);
+    float tanHalfH = tanHalfV * (aspect > 1e-6f ? aspect : 1.0f);
+    if (tanHalfV <= 1e-6f) {
+        tanHalfV = 1e-6f;
+    }
+    if (tanHalfH <= 1e-6f) {
+        tanHalfH = 1e-6f;
+    }
+
+    const float3 center = bounds.center();
+    const float3 corners[8] = {
+        make_float3(bounds.bmin.x, bounds.bmin.y, bounds.bmin.z),
+        make_float3(bounds.bmax.x, bounds.bmin.y, bounds.bmin.z),
+        make_float3(bounds.bmin.x, bounds.bmax.y, bounds.bmin.z),
+        make_float3(bounds.bmax.x, bounds.bmax.y, bounds.bmin.z),
+        make_float3(bounds.bmin.x, bounds.bmin.y, bounds.bmax.z),
+        make_float3(bounds.bmax.x, bounds.bmin.y, bounds.bmax.z),
+        make_float3(bounds.bmin.x, bounds.bmax.y, bounds.bmax.z),
+        make_float3(bounds.bmax.x, bounds.bmax.y, bounds.bmax.z),
+    };
+
+    float requiredDistance = 0.0f;
+    for (const float3& corner : corners) {
+        float3 rel = corner - center;
+        float x = dot(rel, right);
+        float y = dot(rel, up);
+        float z = dot(rel, forward);
+        requiredDistance = fmaxf(requiredDistance, fabsf(x) / tanHalfH - z);
+        requiredDistance = fmaxf(requiredDistance, fabsf(y) / tanHalfV - z);
+    }
+
+    float extentLength = length(bounds.bmax - bounds.bmin);
+    float paddedDistance = fmaxf(requiredDistance, extentLength * 0.5f);
+    return fmaxf(paddedDistance * 1.15f, 0.25f);
+}
+
 static void glfwErrorCb(int code, const char* msg) {
     LOG_ERROR("GLFW [%d]: %s", code, msg);
 }
@@ -104,9 +166,31 @@ bool Application::loadScene(const std::string& path) {
     m_sceneLoaded = true;
     m_renderer.resetAccumulation();
 
-    // Auto-position camera based on scene bounds
-    // For now, keep default camera position
+    frameCameraToScene();
+    m_renderer.resetAccumulation();
     return true;
+}
+
+void Application::frameCameraToScene() {
+    const SceneCamera& sceneCamera = m_scene.getCamera();
+    const AABB& bounds = m_scene.getBounds();
+    float aspect = m_height > 0 ? (float)m_width / (float)m_height : 1.0f;
+
+    float3 forward = sceneCamera.valid ? sceneCamera.forward : make_float3(0.0f, 0.0f, -1.0f);
+    float3 up = sceneCamera.valid ? sceneCamera.up : make_float3(0.0f, 1.0f, 0.0f);
+    float verticalFov = computeVerticalFovRadians(sceneCamera, aspect);
+
+    float3 target = bounds.empty() ? make_float3(0.0f, 0.0f, 0.0f) : bounds.center();
+    if (sceneCamera.valid) {
+        float3 toTarget = normalizeOrFallback(target - sceneCamera.position, forward);
+        if (dot(forward, toTarget) < 0.0f) {
+            forward = -forward;
+        }
+    }
+    float distance = computeFitDistance(bounds, forward, up, aspect, verticalFov);
+    float3 position = target - normalizeOrFallback(forward, make_float3(0.0f, 0.0f, -1.0f)) * distance;
+
+    m_camera.init(position, target, verticalFov * 180.0f / 3.14159265358979323846f, aspect);
 }
 
 void Application::processInput() {

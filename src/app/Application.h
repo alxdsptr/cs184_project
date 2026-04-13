@@ -26,6 +26,7 @@ private:
     void runGui();
     void runHeadless();
     void renderSceneSample(uchar4* d_pbo, bool timeHeadless);
+    void frameCameraToScene();
 
     GLFWwindow* m_window = nullptr;
     uint32_t    m_width  = 1280;

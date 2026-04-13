@@ -11,6 +11,14 @@
 static float3 toFloat3(const aiVector3D& v) { return make_float3(v.x, v.y, v.z); }
 static float3 toFloat3(const aiColor3D& c)  { return make_float3(c.r, c.g, c.b); }
 
+static float3 transformDirection(const aiMatrix4x4& m, const aiVector3D& v) {
+    return make_float3(
+        m.a1 * v.x + m.a2 * v.y + m.a3 * v.z,
+        m.b1 * v.x + m.b2 * v.y + m.b3 * v.z,
+        m.c1 * v.x + m.c2 * v.y + m.c3 * v.z
+    );
+}
+
 static bool containsLightName(const std::string& name) {
     return name.find("light") != std::string::npos || name.find("Light") != std::string::npos;
 }
@@ -54,8 +62,10 @@ static void processNode(
 
         // Positions
         mesh.positions.resize(aiM->mNumVertices);
-        for (unsigned v = 0; v < aiM->mNumVertices; v++)
+        for (unsigned v = 0; v < aiM->mNumVertices; v++) {
             mesh.positions[v] = toFloat3(aiM->mVertices[v]);
+            scene.getBounds().expand(mesh.positions[v]);
+        }
 
         // Normals
         if (aiM->HasNormals()) {
@@ -115,6 +125,51 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
     }
 
     std::string baseDir = std::filesystem::path(path).parent_path().string();
+
+    if (aiScn->mNumCameras > 0) {
+        const aiCamera* aiCam = aiScn->mCameras[0];
+        if (aiCam) {
+            SceneCamera& camera = scene.getCamera();
+            camera.valid = true;
+
+            const aiNode* cameraNode = findNodeByName(aiScn->mRootNode, aiCam->mName);
+            aiMatrix4x4 cameraWorld = cameraNode ? computeWorldTransform(cameraNode) : aiMatrix4x4();
+
+            aiVector3D position = aiCam->mPosition;
+            float3 forward3 = toFloat3(aiCam->mLookAt);
+            float3 up3 = toFloat3(aiCam->mUp);
+            if (cameraNode) {
+                position = cameraWorld * position;
+                forward3 = transformDirection(cameraWorld, aiCam->mLookAt);
+                up3 = transformDirection(cameraWorld, aiCam->mUp);
+            }
+
+            if (length(forward3) > 1e-6f) {
+                camera.forward = normalize(forward3);
+            }
+            if (length(up3) > 1e-6f) {
+                camera.up = normalize(up3);
+            }
+
+            camera.position = toFloat3(position);
+            if (aiCam->mHorizontalFOV > 1e-6f) {
+                camera.horizontalFovRadians = aiCam->mHorizontalFOV;
+            }
+            camera.aspect = aiCam->mAspect;
+            if (aiCam->mClipPlaneNear > 1e-6f) {
+                camera.nearPlane = aiCam->mClipPlaneNear;
+            }
+            if (aiCam->mClipPlaneFar > camera.nearPlane) {
+                camera.farPlane = aiCam->mClipPlaneFar;
+            }
+
+            if (aiCam->mOrthographicWidth > 0.0f) {
+                LOG_WARN("Assimp camera %s is orthographic; using its direction but treating it as perspective", aiCam->mName.C_Str());
+            }
+
+            LOG_INFO("Loaded camera: %s", aiCam->mName.C_Str());
+        }
+    }
 
     // Materials
     for (unsigned i = 0; i < aiScn->mNumMaterials; i++) {

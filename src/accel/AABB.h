@@ -9,6 +9,10 @@ struct AABB {
     HD AABB() : bmin(make_float3(1e30f,1e30f,1e30f)), bmax(make_float3(-1e30f,-1e30f,-1e30f)) {}
     HD AABB(float3 mn, float3 mx) : bmin(mn), bmax(mx) {}
 
+    HD bool empty() const {
+        return bmin.x > bmax.x || bmin.y > bmax.y || bmin.z > bmax.z;
+    }
+
     HD void expand(float3 p) {
         bmin = make_float3(fminf(bmin.x,p.x), fminf(bmin.y,p.y), fminf(bmin.z,p.z));
         bmax = make_float3(fmaxf(bmax.x,p.x), fmaxf(bmax.y,p.y), fmaxf(bmax.z,p.z));
