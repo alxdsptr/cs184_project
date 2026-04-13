@@ -88,20 +88,47 @@ static uint32_t buildRecursive(
     float bestCost = 1e30f;
     int bestSplit = -1;
 
+    // Precompute prefix/suffix bounds and counts while skipping empty bins.
+    // This avoids expanding with default-initialized invalid AABBs from empty bins.
+    AABB prefixBounds[NUM_BINS];
+    AABB suffixBounds[NUM_BINS];
+    uint32_t prefixCount[NUM_BINS] = {};
+    uint32_t suffixCount[NUM_BINS] = {};
+
+    AABB runningLeft;
+    uint32_t runningLeftCount = 0;
+    for (int i = 0; i < NUM_BINS; i++) {
+        if (bins[i].count > 0) {
+            runningLeft.expand(bins[i].bounds);
+            runningLeftCount += bins[i].count;
+        }
+        prefixBounds[i] = runningLeft;
+        prefixCount[i] = runningLeftCount;
+    }
+
+    AABB runningRight;
+    uint32_t runningRightCount = 0;
+    for (int i = NUM_BINS - 1; i >= 0; i--) {
+        if (bins[i].count > 0) {
+            runningRight.expand(bins[i].bounds);
+            runningRightCount += bins[i].count;
+        }
+        suffixBounds[i] = runningRight;
+        suffixCount[i] = runningRightCount;
+    }
+
     for (int s = 0; s < NUM_BINS - 1; s++) {
-        AABB bLeft, bRight;
-        uint32_t cntLeft = 0, cntRight = 0;
-        for (int j = 0; j <= s; j++) {
-            bLeft.expand(bins[j].bounds);
-            cntLeft += bins[j].count;
-        }
-        for (int j = s + 1; j < NUM_BINS; j++) {
-            bRight.expand(bins[j].bounds);
-            cntRight += bins[j].count;
-        }
+        const AABB& bLeft = prefixBounds[s];
+        const AABB& bRight = suffixBounds[s + 1];
+        uint32_t cntLeft = prefixCount[s];
+        uint32_t cntRight = suffixCount[s + 1];
         if (cntLeft == 0 || cntRight == 0) continue;
+        float totalSA = totalBounds.surfaceArea();
+        if (totalSA < 1e-20f) {
+            continue;
+        }
         float cost = 0.125f + (cntLeft * bLeft.surfaceArea() + cntRight * bRight.surfaceArea())
-                     / totalBounds.surfaceArea();
+                     / totalSA;
         if (cost < bestCost) {
             bestCost  = cost;
             bestSplit = s;
