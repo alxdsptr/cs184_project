@@ -7,6 +7,7 @@ project(Assignment3)
 #-------------------------------------------------------------------------------
 option(BUILD_DEBUG     "Build with debug settings"    OFF)
 option(BUILD_DOCS      "Build documentation"          OFF)
+option(BUILD_CUDA      "Build with CUDA GPU path tracing" OFF)
 
 
 set(BUILD_DEBUG ${BUILD_DEBUG} CACHE BOOL "Build debug" FORCE)
@@ -183,6 +184,44 @@ set(OpenGL_GL_PREFERENCE LEGACY)
 find_package(OpenGL REQUIRED)
 target_link_libraries(pt31 PUBLIC OpenGL::GL)
 target_link_libraries(pt31 PUBLIC OpenGL::GLU)
+
+#-------------------------------------------------------------------------------
+# CUDA support
+#-------------------------------------------------------------------------------
+if(BUILD_CUDA)
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+
+  set(CMAKE_CUDA_ARCHITECTURES "75;86" CACHE STRING "CUDA architectures")
+
+  set(CUDA_SOURCES
+    src/cuda/cuda_pathtracer.cu
+  )
+
+  set(CUDA_CPP_SOURCES
+    src/cuda/cuda_scene.cpp
+  )
+
+  add_library(pt31_cuda STATIC ${CUDA_SOURCES})
+  target_include_directories(pt31_cuda PUBLIC src)
+  target_include_directories(pt31_cuda PUBLIC ${CGL_INCLUDE_DIRS})
+  set_target_properties(pt31_cuda PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+  )
+  if(MSVC)
+    target_compile_options(pt31_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--std=c++17>)
+  else()
+    target_compile_options(pt31_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--std=c++14>)
+  endif()
+
+  # Add CUDA scene linearization code (compiled as regular C++)
+  target_sources(pt31 PRIVATE ${CUDA_CPP_SOURCES})
+
+  target_link_libraries(pt31 PUBLIC pt31_cuda CUDA::cudart)
+  target_compile_definitions(pt31 PUBLIC USE_CUDA=1)
+  target_compile_definitions(pt31_cuda PUBLIC USE_CUDA=1)
+  target_compile_definitions(pathtracer PUBLIC USE_CUDA=1)
+endif()
 
 #-------------------------------------------------------------------------------
 # Add subdirectories

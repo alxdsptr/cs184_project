@@ -63,6 +63,7 @@ struct AppConfig {
     pathtracer_filename = "";
     pathtracer_lensRadius = 0.0;
     pathtracer_focalDistance = 4.7;
+    pathtracer_use_cuda = false;
   }
 
   size_t pathtracer_ns_aa;
@@ -86,6 +87,8 @@ struct AppConfig {
 
   double pathtracer_lensRadius;
   double pathtracer_focalDistance;
+
+  bool pathtracer_use_cuda;
 };
 
 class Application : public Renderer {

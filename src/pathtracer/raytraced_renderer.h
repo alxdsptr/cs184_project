@@ -20,6 +20,12 @@
 
 #include "application/renderer.h"
 
+#ifdef USE_CUDA
+#include "cuda/cuda_types.h"
+#include "cuda/cuda_buffers.h"
+#include "cuda/cuda_scene.h"
+#endif
+
 #include "scene/scene.h"
 using CGL::SceneObjects::Scene;
 
@@ -64,7 +70,7 @@ public:
    * Default constructor.
    * Creates a new pathtracer instance.
    */
-  RaytracedRenderer(size_t ns_aa = 1, 
+  RaytracedRenderer(size_t ns_aa = 1,
              size_t max_ray_depth = 4, bool is_accumulate_bounces = true, size_t ns_area_light = 1,
              size_t ns_diff = 1, size_t ns_glsy = 1, size_t ns_refr = 1,
              size_t num_threads = 1,
@@ -74,7 +80,8 @@ public:
              bool direct_hemisphere_sample = false,
              string filename = "",
              double lensRadius = 0.25,
-             double focalDistance = 4.7);
+             double focalDistance = 4.7,
+             bool use_cuda = false);
 
   /**
    * Destructor.
@@ -247,6 +254,13 @@ public:
   bool show_rays;                         ///< show rays from raylog
   
   std::string filename;
+
+#ifdef USE_CUDA
+  bool use_cuda;
+  CUDASceneBuffers cuda_buffers;
+  bool cuda_scene_uploaded;
+  bool cuda_output_allocated;
+#endif
 };
 
 }  // namespace CGL

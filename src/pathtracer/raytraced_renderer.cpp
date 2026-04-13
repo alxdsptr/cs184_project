@@ -47,7 +47,8 @@ RaytracedRenderer::RaytracedRenderer(size_t ns_aa,
                        bool direct_hemisphere_sample,
                        string filename,
                        double lensRadius,
-                       double focalDistance) {
+                       double focalDistance,
+                       bool use_cuda) {
   state = INIT;
 
   pt = new PathTracer();
@@ -83,6 +84,17 @@ RaytracedRenderer::RaytracedRenderer(size_t ns_aa,
   imageTileSize = 32;                     // Size of the rendering tile.
   numWorkerThreads = num_threads;         // Number of threads
   workerThreads.resize(numWorkerThreads);
+
+#ifdef USE_CUDA
+  this->use_cuda = use_cuda;
+  cuda_scene_uploaded = false;
+  cuda_output_allocated = false;
+  if (use_cuda) {
+    fprintf(stdout, "[PathTracer] CUDA GPU rendering enabled.\n");
+  }
+#else
+  (void)use_cuda;
+#endif
 }
 
 /**
@@ -90,6 +102,12 @@ RaytracedRenderer::RaytracedRenderer(size_t ns_aa,
  * Frees all the internal resources used by the pathtracer.
  */
 RaytracedRenderer::~RaytracedRenderer() {
+
+#ifdef USE_CUDA
+  if (use_cuda) {
+    cuda_free_all(cuda_buffers);
+  }
+#endif
 
   delete bvh;
   delete pt;
@@ -171,6 +189,13 @@ void RaytracedRenderer::set_frame_size(size_t width, size_t height) {
 
   pt->set_frame_size(width, height);
 
+#ifdef USE_CUDA
+  if (use_cuda && cuda_scene_uploaded) {
+    cuda_alloc_output(cuda_buffers, (int)width, (int)height);
+    cuda_output_allocated = true;
+  }
+#endif
+
   if (has_valid_configuration()) {
     state = READY;
   }
@@ -226,6 +251,13 @@ void RaytracedRenderer::stop() {
     case RENDERING:
       continueRaytracing = false;
     case DONE:
+#ifdef USE_CUDA
+      if (use_cuda) {
+        // CUDA render is synchronous, no threads to join
+        state = READY;
+        break;
+      }
+#endif
       for (int i=0; i<numWorkerThreads; i++) {
             workerThreads[i]->join();
             delete workerThreads[i];
@@ -267,6 +299,66 @@ void RaytracedRenderer::start_visualizing() {
  */
 void RaytracedRenderer::start_raytracing() {
   if (state != READY) return;
+
+#ifdef USE_CUDA
+  if (use_cuda && cuda_scene_uploaded && cuda_output_allocated) {
+    state = RENDERING;
+    fprintf(stdout, "[PathTracer] Rendering with CUDA GPU...\n"); fflush(stdout);
+
+    timer.start();
+
+    // Build camera params
+    CUDACameraParams cam = cuda_build_camera(camera, (int)frame_w, (int)frame_h);
+
+    // Build render params
+    CUDARenderParams params;
+    params.ns_aa = (int)pt->ns_aa;
+    params.max_ray_depth = (int)pt->max_ray_depth;
+    params.ns_area_light = (int)pt->ns_area_light;
+    params.is_accum_bounces = pt->isAccumBounces ? 1 : 0;
+    params.direct_hemisphere_sample = pt->direct_hemisphere_sample ? 1 : 0;
+    params.samples_per_batch = (int)pt->samplesPerBatch;
+    params.max_tolerance = (float)pt->maxTolerance;
+    params.num_lights = cuda_buffers.num_lights;
+
+    // Launch CUDA render
+    cuda_render(cuda_buffers, cam, params);
+
+    // Download results to CPU
+    size_t num_pixels = frame_w * frame_h;
+    std::vector<float> hdr_host(num_pixels * 3);
+    std::vector<int> sample_count_host(num_pixels);
+
+    cuda_download_results(cuda_buffers,
+                          hdr_host.data(), sample_count_host.data(),
+                          (int)frame_w, (int)frame_h);
+
+    // Copy into PathTracer's sampleBuffer (Vector3D = 3 doubles)
+    pt->set_frame_size(frame_w, frame_h);
+    for (size_t i = 0; i < num_pixels; i++) {
+      pt->sampleBuffer.update_pixel(
+        Vector3D((double)hdr_host[i * 3 + 0],
+                 (double)hdr_host[i * 3 + 1],
+                 (double)hdr_host[i * 3 + 2]),
+        i % frame_w, i / frame_w);
+      pt->sampleCountBuffer[i] = sample_count_host[i];
+    }
+
+    // Tonemap to framebuffer
+    pt->write_to_framebuffer(frameBuffer, 0, 0, frame_w, frame_h);
+
+    timer.stop();
+    fprintf(stdout, "[PathTracer] CUDA rendering complete! (%.4fs)\n", timer.duration());
+
+    // CUDA render is synchronous on the calling thread.
+    // If called from render_to_file(), m_done is already locked by the caller,
+    // so we must NOT lock it again (std::mutex is not reentrant).
+    // Just set state and notify — the caller holds the lock and is waiting on cv_done.
+    state = DONE;
+    cv_done.notify_one();
+    return;
+  }
+#endif
 
   rayLog.clear();
   workQueue.clear();
@@ -372,6 +464,35 @@ void RaytracedRenderer::build_accel() {
 
   // initial visualization //
   selectionHistory.push(bvh->get_root());
+
+#ifdef USE_CUDA
+  if (use_cuda) {
+    fprintf(stdout, "[PathTracer] Linearizing BVH for CUDA... "); fflush(stdout);
+    timer.start();
+
+    std::vector<CUDABVHNode> gpu_nodes;
+    std::vector<CUDAPrimitive> gpu_prims;
+    std::map<BSDF*, int> material_map;
+
+    cuda_flatten_bvh(bvh->get_root(), gpu_nodes, gpu_prims, material_map);
+
+    std::vector<CUDAMaterial> gpu_materials;
+    cuda_build_materials(material_map, gpu_materials);
+
+    std::vector<CUDALight> gpu_lights;
+    cuda_build_lights(scene->lights, gpu_lights);
+
+    cuda_upload_scene(cuda_buffers,
+                      gpu_nodes.data(), (int)gpu_nodes.size(),
+                      gpu_prims.data(), (int)gpu_prims.size(),
+                      gpu_materials.data(), (int)gpu_materials.size(),
+                      gpu_lights.data(), (int)gpu_lights.size());
+
+    cuda_scene_uploaded = true;
+    timer.stop();
+    fprintf(stdout, "Done! (%.4f sec)\n", timer.duration());
+  }
+#endif
 }
 
 void RaytracedRenderer::visualize_accel() const {

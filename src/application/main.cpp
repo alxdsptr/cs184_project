@@ -37,6 +37,7 @@ void usage(const char *binaryName) {
          "mode\n");
   printf(
       "  -r  <INT> <INT>  Width and height of output image (if windowless)\n");
+  printf("  -g               Use CUDA GPU rendering\n");
   printf("  -h               Print this help message\n");
   printf("\n");
 }
@@ -123,7 +124,7 @@ int main(int argc, char **argv) {
       config.pathtracer_accumulate_bounces = settings.pathtracer_accumulate_bounces;
     }
   } else {
-    while ((opt = getopt(argc, argv, "s:l:t:m:o:e:h:H:f:r:c:b:d:a:p:")) !=
+    while ((opt = getopt(argc, argv, "s:l:t:m:o:e:h:H:f:r:c:b:d:a:p:g")) !=
            -1) { // for each option...
       switch (opt) {
       case 'f':
@@ -179,6 +180,9 @@ int main(int argc, char **argv) {
       case 'H':
         config.pathtracer_direct_hemisphere_sample = true;
         optind--;
+        break;
+      case 'g':
+        config.pathtracer_use_cuda = true;
         break;
       default:
         usage(argv[0]);
