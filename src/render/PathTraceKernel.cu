@@ -410,7 +410,7 @@ __global__ void pathTraceKernel(
         float3 V = -ray.direction;
 
         float3 newDir;
-        float pdf;
+        float pdf; // TODO: fixing washed out images removed the use of this value, so what was intent?
 
         if (pcg32_float(rng) < specProb) {
             // GGX importance sampling (simplified: sample around reflection)
@@ -447,7 +447,8 @@ __global__ void pathTraceKernel(
             lastBounceSpecular = false;
         }
 
-        if (pdf < 1e-7f || dot(newDir, N) < 0.0f) break;
+        float fullPdf = bsdfMixturePdf(N, V, newDir, mat.roughness, mat.metallic);
+        if (fullPdf < 1e-7f || dot(newDir, N) < 0.0f) break;
 
         // Evaluate BRDF
         float3 H = normalize(V + newDir);
@@ -466,10 +467,10 @@ __global__ void pathTraceKernel(
         float3 diffuse = kd * albedo * (1.0f / M_PI_F);
         float3 brdf = (diffuse + specular) * NdotL;
 
-        throughput = throughput * brdf * (1.0f / (pdf + 1e-7f));
+        throughput = throughput * brdf * (1.0f / (fullPdf + 1e-7f));
 
         prevSurfacePos = hit.position;
-        prevBsdfPdf = pdf;
+        prevBsdfPdf = fullPdf;
         havePrevSurface = true;
 
         // Russian roulette after bounce 3
