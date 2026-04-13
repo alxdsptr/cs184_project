@@ -1,13 +1,46 @@
 #include "scene/SceneLoader.h"
+#include "core/Math.h"
 #include "util/Log.h"
 
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
+#include <assimp/matrix4x4.h>
 #include <filesystem>
 
 static float3 toFloat3(const aiVector3D& v) { return make_float3(v.x, v.y, v.z); }
 static float3 toFloat3(const aiColor3D& c)  { return make_float3(c.r, c.g, c.b); }
+
+static bool containsLightName(const std::string& name) {
+    return name.find("light") != std::string::npos || name.find("Light") != std::string::npos;
+}
+
+static float luminance(const float3& c) {
+    return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+}
+
+static const aiNode* findNodeByName(const aiNode* node, const aiString& name) {
+    if (!node) return nullptr;
+    if (node->mName == name) return node;
+    for (unsigned i = 0; i < node->mNumChildren; i++) {
+        const aiNode* found = findNodeByName(node->mChildren[i], name);
+        if (found) return found;
+    }
+    return nullptr;
+}
+
+static aiMatrix4x4 computeWorldTransform(const aiNode* node) {
+    aiMatrix4x4 world;
+    if (!node) return world;
+
+    world = node->mTransformation;
+    const aiNode* parent = node->mParent;
+    while (parent) {
+        world = parent->mTransformation * world;
+        parent = parent->mParent;
+    }
+    return world;
+}
 
 static void processNode(
     const aiScene* aiScn, const aiNode* node,
@@ -87,6 +120,9 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
     for (unsigned i = 0; i < aiScn->mNumMaterials; i++) {
         const aiMaterial* aiMat = aiScn->mMaterials[i];
         PBRMaterial mat;
+        aiString matName;
+        aiMat->Get(AI_MATKEY_NAME, matName);
+        const std::string materialName = matName.C_Str();
 
         // Base color
         aiColor3D color(0.8f, 0.8f, 0.8f);
@@ -121,18 +157,107 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
         mat.metallicRoughTexPath = getTexturePath(aiMat, aiTextureType_METALNESS, baseDir);
         mat.emissiveTexPath      = getTexturePath(aiMat, aiTextureType_EMISSIVE, baseDir);
 
+        if (mat.emissionStrength <= 0.0f && containsLightName(materialName)) {
+            mat.emission = make_float3(10.0f, 10.0f, 10.0f);
+            mat.emissionStrength = 1.0f;
+        }
+
         scene.getMaterials().push_back(std::move(mat));
+    }
+
+    // Lights (currently import point lights)
+    for (unsigned i = 0; i < aiScn->mNumLights; i++) {
+        const aiLight* aiL = aiScn->mLights[i];
+        if (!aiL) continue;
+
+        if (aiL->mType != aiLightSource_POINT) {
+            LOG_WARN("Skipping unsupported light type %d for %s",
+                     (int)aiL->mType, aiL->mName.C_Str());
+            continue;
+        }
+
+        PointLight light;
+
+        aiVector3D lightPos = aiL->mPosition;
+        const aiNode* lightNode = findNodeByName(aiScn->mRootNode, aiL->mName);
+        if (lightNode) {
+            aiMatrix4x4 world = computeWorldTransform(lightNode);
+            lightPos = world * aiL->mPosition;
+        }
+
+        light.position = toFloat3(lightPos);
+        light.color = toFloat3(aiL->mColorDiffuse);
+        if (light.color.x <= 0.0f && light.color.y <= 0.0f && light.color.z <= 0.0f) {
+            light.color = make_float3(1.0f, 1.0f, 1.0f);
+        }
+        light.intensity = 1.0f;
+        light.constantAttenuation = aiL->mAttenuationConstant;
+        light.linearAttenuation = aiL->mAttenuationLinear;
+        light.quadraticAttenuation = aiL->mAttenuationQuadratic;
+
+        scene.getLights().push_back(light);
     }
 
     // Meshes
     processNode(aiScn, aiScn->mRootNode, scene, baseDir);
 
-    LOG_INFO("Loaded: %s (%u meshes, %u materials, %u triangles, %u vertices)",
+    // Emissive triangle area lights
+    const auto& meshes = scene.getMeshes();
+    const auto& materials = scene.getMaterials();
+    for (const auto& mesh : meshes) {
+        if (mesh.materialIndex < 0 || (size_t)mesh.materialIndex >= materials.size()) {
+            continue;
+        }
+
+        const PBRMaterial& mat = materials[(size_t)mesh.materialIndex];
+        if (mat.emissionStrength <= 0.0f) {
+            continue;
+        }
+
+        float3 emission = mat.emission * mat.emissionStrength;
+        float emissionLum = luminance(emission);
+        if (emissionLum <= 0.0f) {
+            continue;
+        }
+
+        uint32_t triCount = (uint32_t)mesh.indices.size() / 3;
+        for (uint32_t t = 0; t < triCount; t++) {
+            uint32_t i0 = mesh.indices[t * 3 + 0];
+            uint32_t i1 = mesh.indices[t * 3 + 1];
+            uint32_t i2 = mesh.indices[t * 3 + 2];
+
+            float3 v0 = mesh.positions[i0];
+            float3 v1 = mesh.positions[i1];
+            float3 v2 = mesh.positions[i2];
+            float3 e1 = v1 - v0;
+            float3 e2 = v2 - v0;
+            float3 n = cross(e1, e2);
+            float area = 0.5f * length(n);
+            if (area <= 1e-8f) {
+                continue;
+            }
+
+            TriangleAreaLight light;
+            light.v0 = v0;
+            light.e1 = e1;
+            light.e2 = e2;
+            light.normal = normalize(n);
+            light.emission = emission;
+            light.area = area;
+            light.weight = area * emissionLum;
+            scene.getAreaLights().push_back(light);
+        }
+    }
+
+    LOG_INFO("Loaded: %s (%u meshes, %u materials, %u lights, %u triangles, %u vertices)",
              path.c_str(),
              (unsigned)scene.getMeshes().size(),
              (unsigned)scene.getMaterials().size(),
+             (unsigned)scene.getLights().size(),
              scene.totalTriangles(),
              scene.totalVertices());
+
+    LOG_INFO("Emissive triangle lights: %u", (unsigned)scene.getAreaLights().size());
 
     return true;
 }

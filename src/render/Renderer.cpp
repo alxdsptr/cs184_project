@@ -25,7 +25,8 @@ void Renderer::renderFrame(
     const CameraParams& camera,
     const DeviceSceneData& scene,
     RayTracingBackend* backend,
-    uchar4* d_ldrOutput)
+    uchar4* d_ldrOutput,
+    bool enableEnvironment)
 {
     uint32_t sampleIndex = m_accumBuffer.getSampleCount();
 
@@ -35,7 +36,8 @@ void Renderer::renderFrame(
         m_accumBuffer.getAccumBuffer(),
         m_accumBuffer.getOutputBuffer(),
         m_auxBuffers.getPtrs(),
-        m_width, m_height, sampleIndex
+        m_width, m_height, sampleIndex,
+        enableEnvironment
     );
 
     // Tonemap HDR -> LDR into the display PBO

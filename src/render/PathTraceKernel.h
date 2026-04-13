@@ -12,5 +12,6 @@ void launchPathTraceKernel(
     AuxBufferPtrs auxBuffers,
     uint32_t width,
     uint32_t height,
-    uint32_t sampleIndex
+    uint32_t sampleIndex,
+    bool enableEnvironment
 );

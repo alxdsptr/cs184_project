@@ -107,7 +107,8 @@ void Application::processInput() {
             m_firstMouse = false;
         }
         m_input.mouseDx = (float)(mx - m_lastMouseX);
-        m_input.mouseDy = (float)(my - m_lastMouseY);
+        float rawDy = (float)(my - m_lastMouseY);
+        m_input.mouseDy = m_invertMouseY ? -rawDy : rawDy;
         m_lastMouseX = mx;
         m_lastMouseY = my;
     }
@@ -161,7 +162,7 @@ void Application::run() {
         if (m_sceneLoaded) {
             CameraParams camParams = m_camera.getParams(m_frameIndex);
             DeviceSceneData sceneData = m_backend->getSceneData();
-            m_renderer.renderFrame(camParams, sceneData, m_backend.get(), d_pbo);
+            m_renderer.renderFrame(camParams, sceneData, m_backend.get(), d_pbo, m_enableEnvironment);
         } else {
             // No scene: dark gray
             CUDA_CHECK(cudaMemset(d_pbo, 40, m_width * m_height * sizeof(uchar4)));
@@ -175,7 +176,16 @@ void Application::run() {
 
         // GUI overlay
         m_gui.beginFrame();
-        m_gui.render(m_fps, m_renderer.getSampleCount(), m_width, m_height);
+        bool envChanged = m_gui.render(
+            m_fps,
+            m_renderer.getSampleCount(),
+            m_width,
+            m_height,
+            m_enableEnvironment,
+            m_invertMouseY);
+        if (envChanged) {
+            m_renderer.resetAccumulation();
+        }
         m_gui.endFrame();
 
         glfwSwapBuffers(m_window);

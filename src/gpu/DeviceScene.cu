@@ -8,6 +8,8 @@ void DeviceScene::upload(const Scene& scene) {
 
     const auto& meshes = scene.getMeshes();
     const auto& materials = scene.getMaterials();
+    const auto& lights = scene.getLights();
+    const auto& areaLights = scene.getAreaLights();
 
     // Count totals
     uint32_t totalVerts = 0, totalTris = 0;
@@ -19,6 +21,8 @@ void DeviceScene::upload(const Scene& scene) {
     m_data.totalVertices  = totalVerts;
     m_data.totalTriangles = totalTris;
     m_data.materialCount  = (uint32_t)materials.size();
+    m_data.pointLightCount = (uint32_t)lights.size();
+    m_data.areaLightCount = (uint32_t)areaLights.size();
 
     // Flatten all meshes into contiguous arrays
     std::vector<float3>   allPositions;
@@ -108,8 +112,58 @@ void DeviceScene::upload(const Scene& scene) {
     CUDA_CHECK(cudaMemcpy(m_data.d_materials, gpuMats.data(),
                            materials.size() * sizeof(GPUMaterial), cudaMemcpyHostToDevice));
 
-    LOG_INFO("GPU upload: %u vertices, %u triangles, %u materials",
-             totalVerts, totalTris, (uint32_t)materials.size());
+    if (!lights.empty()) {
+        std::vector<GPUPointLight> gpuLights(lights.size());
+        for (size_t i = 0; i < lights.size(); i++) {
+            gpuLights[i].position = lights[i].position;
+            gpuLights[i].color = lights[i].color;
+            gpuLights[i].intensity = lights[i].intensity;
+            gpuLights[i].constantAttenuation = lights[i].constantAttenuation;
+            gpuLights[i].linearAttenuation = lights[i].linearAttenuation;
+            gpuLights[i].quadraticAttenuation = lights[i].quadraticAttenuation;
+        }
+
+        CUDA_CHECK(cudaMalloc(&m_data.d_pointLights, lights.size() * sizeof(GPUPointLight)));
+        CUDA_CHECK(cudaMemcpy(m_data.d_pointLights, gpuLights.data(),
+                               lights.size() * sizeof(GPUPointLight), cudaMemcpyHostToDevice));
+    }
+
+    if (!areaLights.empty()) {
+        std::vector<GPUAreaLight> gpuAreaLights(areaLights.size());
+        std::vector<float> cdf(areaLights.size());
+        float totalWeight = 0.0f;
+        for (size_t i = 0; i < areaLights.size(); i++) {
+            const auto& src = areaLights[i];
+            auto& dst = gpuAreaLights[i];
+            dst.v0 = src.v0;
+            dst.e1 = src.e1;
+            dst.e2 = src.e2;
+            dst.normal = src.normal;
+            dst.emission = src.emission;
+            dst.area = src.area;
+            dst.weight = src.weight;
+            totalWeight += src.weight;
+            cdf[i] = totalWeight;
+        }
+
+        if (totalWeight > 0.0f) {
+            for (auto& value : cdf) {
+                value /= totalWeight;
+            }
+            m_data.areaLightTotalWeight = totalWeight;
+
+            CUDA_CHECK(cudaMalloc(&m_data.d_areaLights, areaLights.size() * sizeof(GPUAreaLight)));
+            CUDA_CHECK(cudaMemcpy(m_data.d_areaLights, gpuAreaLights.data(),
+                                   areaLights.size() * sizeof(GPUAreaLight), cudaMemcpyHostToDevice));
+
+            CUDA_CHECK(cudaMalloc(&m_data.d_areaLightCDF, areaLights.size() * sizeof(float)));
+            CUDA_CHECK(cudaMemcpy(m_data.d_areaLightCDF, cdf.data(),
+                                   areaLights.size() * sizeof(float), cudaMemcpyHostToDevice));
+        }
+    }
+
+    LOG_INFO("GPU upload: %u vertices, %u triangles, %u materials, %u lights, %u area lights",
+             totalVerts, totalTris, (uint32_t)materials.size(), (uint32_t)lights.size(), (uint32_t)areaLights.size());
 }
 
 void DeviceScene::free() {
@@ -119,6 +173,9 @@ void DeviceScene::free() {
     if (m_data.d_indices)         { cudaFree(m_data.d_indices); }
     if (m_data.d_materials)       { cudaFree(m_data.d_materials); }
     if (m_data.d_materialIndices) { cudaFree(m_data.d_materialIndices); }
+    if (m_data.d_pointLights)     { cudaFree(m_data.d_pointLights); }
+    if (m_data.d_areaLights)      { cudaFree(m_data.d_areaLights); }
+    if (m_data.d_areaLightCDF)    { cudaFree(m_data.d_areaLightCDF); }
     if (m_data.d_bvhNodes)        { cudaFree(m_data.d_bvhNodes); }
     m_data = DeviceSceneData{};
 }

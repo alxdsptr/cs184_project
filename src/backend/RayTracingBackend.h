@@ -17,7 +17,8 @@ public:
         float4* d_outputBuffer,
         AuxBufferPtrs auxBuffers,
         uint32_t width, uint32_t height,
-        uint32_t sampleIndex
+        uint32_t sampleIndex,
+        bool enableEnvironment
     ) = 0;
 
     // BDPT-ready: visibility test for connection strategies

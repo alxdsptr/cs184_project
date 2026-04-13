@@ -1,6 +1,7 @@
 #include "render/PathTraceKernel.h"
 #include "core/Math.h"
 #include "core/Halton.h"
+#include "gpu/AreaLightGPU.h"
 #include "gpu/RayTypes.h"
 #include "gpu/MaterialGPU.h"
 #include "gpu/Random.h"
@@ -70,6 +71,24 @@ __device__ inline float smithG1_local(float NdotX, float roughness) {
     return NdotX / (NdotX * (1.0f - k) + k + 1e-7f);
 }
 
+__device__ inline uint32_t sampleAreaLightIndex(
+    const float* cdf,
+    uint32_t count,
+    float target)
+{
+    uint32_t low = 0;
+    uint32_t high = count;
+    while (low < high) {
+        uint32_t mid = (low + high) / 2;
+        if (target <= cdf[mid]) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    return (low >= count) ? (count - 1) : low;
+}
+
 // ── Path Trace Kernel ────────────────────────────────────────
 __global__ void pathTraceKernel(
     DeviceSceneData scene,
@@ -79,7 +98,8 @@ __global__ void pathTraceKernel(
     AuxBufferPtrs   auxBuffers,
     uint32_t        width,
     uint32_t        height,
-    uint32_t        sampleIndex)
+    uint32_t        sampleIndex,
+    bool            enableEnvironment)
 {
     uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -103,6 +123,7 @@ __global__ void pathTraceKernel(
     float3 throughput = make_float3(1, 1, 1);
     float3 radiance   = make_float3(0, 0, 0);
     bool firstBounce  = true;
+    bool lastBounceSpecular = false;
 
     for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
         HitRecord hit;
@@ -117,8 +138,9 @@ __global__ void pathTraceKernel(
         }
 
         if (!didHit) {
-            // Environment
-            radiance += throughput * sampleEnvironment(ray.direction);
+            if (enableEnvironment) {
+                radiance += throughput * sampleEnvironment(ray.direction);
+            }
             break;
         }
 
@@ -177,9 +199,139 @@ __global__ void pathTraceKernel(
             firstBounce = false;
         }
 
-        // Emission
-        if (mat.emissionStrength > 0.0f) {
-            radiance += throughput * mat.emission * mat.emissionStrength;
+        bool isEmissive = mat.emissionStrength > 0.0f &&
+                          (mat.emission.x > 0.0f || mat.emission.y > 0.0f || mat.emission.z > 0.0f);
+        if (isEmissive) {
+            if (bounce == 0 || lastBounceSpecular) {
+                radiance += throughput * mat.emission * mat.emissionStrength;
+            }
+            break;
+        }
+
+        // Direct lighting from emissive triangle lights (next-event estimation).
+        if (scene.d_areaLights && scene.areaLightCount > 0 &&
+            scene.d_areaLightCDF && scene.areaLightTotalWeight > 0.0f) {
+            uint32_t lightIndex = sampleAreaLightIndex(
+                scene.d_areaLightCDF, scene.areaLightCount,
+                pcg32_float(rng));
+
+            GPUAreaLight light = scene.d_areaLights[lightIndex];
+
+            float r1 = pcg32_float(rng);
+            float r2 = pcg32_float(rng);
+            float su = sqrtf(r1);
+            float b0 = 1.0f - su;
+            float b1 = su * (1.0f - r2);
+            float b2 = su * r2;
+
+            float3 lightV0 = light.v0;
+            float3 lightV1 = light.v0 + light.e1;
+            float3 lightV2 = light.v0 + light.e2;
+            float3 lightPos = lightV0 * b0 + lightV1 * b1 + lightV2 * b2;
+
+            float3 toLight = lightPos - hit.position;
+            float dist2 = fmaxf(dot(toLight, toLight), 1e-6f);
+            float dist = sqrtf(dist2);
+            float3 Ld = toLight * (1.0f / dist);
+
+            float NdotL = fmaxf(dot(N, Ld), 0.0f);
+            float lightNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
+            if (NdotL > 0.0f && lightNdot > 0.0f) {
+                bool occluded = false;
+                if (scene.d_bvhNodes && scene.totalTriangles > 0) {
+                    Ray shadowRay;
+                    shadowRay.origin = hit.position + N * 0.001f;
+                    shadowRay.direction = Ld;
+                    shadowRay.tmin = 0.001f;
+                    shadowRay.tmax = fmaxf(dist - 0.002f, 0.001f);
+
+                    HitRecord shadowHit;
+                    shadowHit.t = shadowRay.tmax;
+                    occluded = bvh_closestHit(
+                        shadowRay, scene.d_bvhNodes, scene.bvhRootIndex,
+                        scene.d_positions, scene.d_indices, scene.d_materialIndices,
+                        shadowHit);
+                }
+
+                if (!occluded) {
+                    float pTri = light.weight / scene.areaLightTotalWeight;
+                    float pArea = pTri / fmaxf(light.area, 1e-7f);
+                    float pdfOmega = pArea * dist2 / fmaxf(lightNdot, 1e-7f);
+
+                    float3 V = -ray.direction;
+                    float3 H = normalize(V + Ld);
+                    float NdotV = fmaxf(dot(N, V), 0.0f);
+                    float NdotH = fmaxf(dot(N, H), 0.0f);
+                    float LdotH = fmaxf(dot(Ld, H), 0.0f);
+                    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, mat.metallic);
+                    float3 F = fresnelSchlick_local(LdotH, F0);
+                    float D_val = ggxD_local(NdotH, mat.roughness);
+                    float G_val = smithG1_local(NdotL, mat.roughness) * smithG1_local(NdotV, mat.roughness);
+                    float3 specular = F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
+                    float3 kd = (make_float3(1,1,1) - F) * (1.0f - mat.metallic);
+                    float3 diffuse = kd * albedo * (1.0f / M_PI_F);
+                    float3 brdf = diffuse + specular;
+
+                    radiance += throughput * brdf * light.emission * (NdotL / fmaxf(pdfOmega, 1e-7f));
+                }
+            }
+        } else if (scene.d_pointLights && scene.pointLightCount > 0) {
+            float3 direct = make_float3(0.0f, 0.0f, 0.0f);
+            float3 V = -ray.direction;
+            float3 kdBase = albedo * (1.0f - mat.metallic);
+
+            for (uint32_t li = 0; li < scene.pointLightCount; li++) {
+                GPUPointLight light = scene.d_pointLights[li];
+
+                float3 toLight = light.position - hit.position;
+                float dist2 = fmaxf(dot(toLight, toLight), 1e-6f);
+                float dist = sqrtf(dist2);
+                float3 Ld = toLight * (1.0f / dist);
+
+                float NdotL = fmaxf(dot(N, Ld), 0.0f);
+                if (NdotL <= 0.0f) continue;
+
+                bool occluded = false;
+                if (scene.d_bvhNodes && scene.totalTriangles > 0) {
+                    Ray shadowRay;
+                    shadowRay.origin = hit.position + N * 0.001f;
+                    shadowRay.direction = Ld;
+                    shadowRay.tmin = 0.001f;
+                    shadowRay.tmax = fmaxf(dist - 0.002f, 0.001f);
+
+                    HitRecord shadowHit;
+                    shadowHit.t = shadowRay.tmax;
+                    occluded = bvh_closestHit(
+                        shadowRay, scene.d_bvhNodes, scene.bvhRootIndex,
+                        scene.d_positions, scene.d_indices, scene.d_materialIndices,
+                        shadowHit);
+                }
+
+                if (occluded) continue;
+
+                float attenDen = light.constantAttenuation
+                               + light.linearAttenuation * dist
+                               + light.quadraticAttenuation * dist2;
+                float attenuation = 1.0f / fmaxf(attenDen, 1e-4f);
+                float3 Li = light.color * (light.intensity * attenuation);
+
+                float3 H = normalize(V + Ld);
+                float NdotV = fmaxf(dot(N, V), 0.0f);
+                float NdotH = fmaxf(dot(N, H), 0.0f);
+                float LdotH = fmaxf(dot(Ld, H), 0.0f);
+                float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, mat.metallic);
+                float3 F = fresnelSchlick_local(LdotH, F0);
+                float D_val = ggxD_local(NdotH, mat.roughness);
+                float G_val = smithG1_local(NdotL, mat.roughness) * smithG1_local(NdotV, mat.roughness);
+                float3 specular = F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
+                float3 kd = (make_float3(1,1,1) - F) * (1.0f - mat.metallic);
+                float3 diffuse = kd * albedo * (1.0f / M_PI_F);
+                float3 brdf = diffuse + specular;
+
+                direct += brdf * Li * NdotL;
+            }
+
+            radiance += throughput * direct;
         }
 
         // BRDF sampling: metallic blend between diffuse and specular
@@ -211,16 +363,17 @@ __global__ void pathTraceKernel(
             float D_val = ggxD_local(NdotH, mat.roughness);
             pdf = D_val * NdotH / (4.0f * VdotH + 1e-7f);
             pdf *= specProb;
+            lastBounceSpecular = true;
         } else {
             // Cosine-weighted hemisphere sampling (diffuse)
             float u1 = pcg32_float(rng);
             float u2 = pcg32_float(rng);
-            float cosTheta;
             float3 localDir = sampleCosineHemisphere(u1, u2, pdf);
             float3 T, B;
             buildONB(N, T, B);
             newDir = localToWorld(localDir, T, N, B);
             pdf *= (1.0f - specProb);
+            lastBounceSpecular = false;
         }
 
         if (pdf < 1e-7f || dot(newDir, N) < 0.0f) break;
@@ -273,12 +426,13 @@ void launchPathTraceKernel(
     AuxBufferPtrs auxBuffers,
     uint32_t width,
     uint32_t height,
-    uint32_t sampleIndex)
+    uint32_t sampleIndex,
+    bool enableEnvironment)
 {
     dim3 block(8, 8);
     dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
     pathTraceKernel<<<grid, block>>>(
         scene, camera, d_accumBuffer, d_outputBuffer, auxBuffers,
-        width, height, sampleIndex);
+        width, height, sampleIndex, enableEnvironment);
     CUDA_CHECK(cudaGetLastError());
 }

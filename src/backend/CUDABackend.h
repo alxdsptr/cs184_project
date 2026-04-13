@@ -13,7 +13,8 @@ public:
         float4* d_outputBuffer,
         AuxBufferPtrs auxBuffers,
         uint32_t width, uint32_t height,
-        uint32_t sampleIndex
+        uint32_t sampleIndex,
+        bool enableEnvironment
     ) override;
     void traceOcclusionRays(
         const float3* d_origins,

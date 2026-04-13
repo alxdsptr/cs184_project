@@ -1,5 +1,7 @@
 #pragma once
+#include "gpu/AreaLightGPU.h"
 #include "gpu/MaterialGPU.h"
+#include "gpu/LightGPU.h"
 #include "accel/BVHNode.h"
 #include <cuda_runtime.h>
 
@@ -13,6 +15,12 @@ struct DeviceSceneData {
     uint32_t     totalTriangles    = 0;
     uint32_t     totalVertices     = 0;
     uint32_t     materialCount     = 0;
+    GPUPointLight* d_pointLights   = nullptr;
+    uint32_t       pointLightCount = 0;
+    GPUAreaLight* d_areaLights     = nullptr;
+    float*       d_areaLightCDF    = nullptr;
+    uint32_t     areaLightCount    = 0;
+    float        areaLightTotalWeight = 0.0f;
     BVHNode*     d_bvhNodes        = nullptr;
     uint32_t     bvhRootIndex      = 0;
 };

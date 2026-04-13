@@ -18,7 +18,8 @@ public:
         const CameraParams& camera,
         const DeviceSceneData& scene,
         RayTracingBackend* backend,
-        uchar4* d_ldrOutput
+        uchar4* d_ldrOutput,
+        bool enableEnvironment
     );
 
     uint32_t getSampleCount() const { return m_accumBuffer.getSampleCount(); }

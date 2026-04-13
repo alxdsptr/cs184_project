@@ -86,7 +86,8 @@ void CUDABackend::launchPathTrace(
     float4* d_outputBuffer,
     AuxBufferPtrs auxBuffers,
     uint32_t width, uint32_t height,
-    uint32_t sampleIndex)
+    uint32_t sampleIndex,
+    bool enableEnvironment)
 {
     // Patch in BVH data (since DeviceScene may not have it directly)
     DeviceSceneData patchedScene = scene;
@@ -96,7 +97,7 @@ void CUDABackend::launchPathTrace(
     launchPathTraceKernel(
         patchedScene, camera,
         d_accumBuffer, d_outputBuffer, auxBuffers,
-        width, height, sampleIndex
+        width, height, sampleIndex, enableEnvironment
     );
 }
 

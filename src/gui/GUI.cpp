@@ -22,7 +22,9 @@ void GUI::beginFrame() {
     ImGui::NewFrame();
 }
 
-void GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t height) {
+bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t height, bool& enableEnvironment, bool& invertMouseY) {
+    bool changed = false;
+
     // Overlay window: top-left corner
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.5f);
@@ -33,8 +35,13 @@ void GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
     ImGui::Text("FPS: %.1f", fps);
     ImGui::Text("Samples: %u", sampleCount);
     ImGui::Text("Resolution: %ux%u", width, height);
+    if (ImGui::Checkbox("Environment Light", &enableEnvironment)) {
+        changed = true;
+    }
+    ImGui::Checkbox("Invert Mouse Y", &invertMouseY);
 
     ImGui::End();
+    return changed;
 }
 
 void GUI::endFrame() {
