@@ -1,14 +1,73 @@
 #include "app/Application.h"
 #include "util/Log.h"
 
+#include <cstdint>
+#include <cstdlib>
+#include <string>
+
 int main(int argc, char** argv) {
-    Application app;
-    if (!app.init(1280, 720, "CUDA Path Tracer")) {
+    std::string scenePath;
+    std::string outputPath;
+    uint32_t width = 1280;
+    uint32_t height = 720;
+    uint32_t maxBounces = 8;
+    uint32_t samples = 1;
+
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "-m" && i + 1 < argc) {
+            int value = std::atoi(argv[++i]);
+            if (value > 0) {
+                maxBounces = (uint32_t)value;
+            } else {
+                LOG_WARN("Invalid max bounce value: %s", argv[i]);
+            }
+        } else if (arg == "-s" && i + 1 < argc) {
+            int value = std::atoi(argv[++i]);
+            if (value > 0) {
+                samples = (uint32_t)value;
+            } else {
+                LOG_WARN("Invalid sample count value: %s", argv[i]);
+            }
+        } else if (arg == "-f" && i + 1 < argc) {
+            outputPath = argv[++i];
+        } else if (arg == "-r" && i + 2 < argc) {
+            int parsedWidth = std::atoi(argv[++i]);
+            int parsedHeight = std::atoi(argv[++i]);
+            if (parsedWidth > 0 && parsedHeight > 0) {
+                width = (uint32_t)parsedWidth;
+                height = (uint32_t)parsedHeight;
+            } else {
+                LOG_WARN("Invalid resolution value: %s x %s", argv[i - 1], argv[i]);
+            }
+        } else if (!arg.empty() && arg[0] != '-') {
+            if (scenePath.empty()) {
+                scenePath = arg;
+            } else {
+                LOG_WARN("Ignoring extra positional argument: %s", arg.c_str());
+            }
+        } else {
+            LOG_WARN("Ignoring unknown argument: %s", arg.c_str());
+        }
+    }
+
+    if (!outputPath.empty() && scenePath.empty()) {
+        LOG_ERROR("-f requires a scene file argument");
         return 1;
     }
 
-    if (argc > 1) {
-        if (!app.loadScene(argv[1])) {
+    Application app;
+    app.setMaxBounces(maxBounces);
+    if (!outputPath.empty()) {
+        app.setHeadlessOutput(outputPath, samples);
+    }
+
+    if (!app.init(width, height, "CUDA Path Tracer", outputPath.empty())) {
+        return 1;
+    }
+
+    if (!scenePath.empty()) {
+        if (!app.loadScene(scenePath)) {
             LOG_ERROR("Usage: pathtracer <scene_file>");
         }
     } else {

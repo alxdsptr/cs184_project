@@ -13,8 +13,6 @@
 #define M_PI_F 3.14159265358979323846f
 #endif
 
-static constexpr int MAX_BOUNCES = 8;
-
 // ── Environment ──────────────────────────────────────────────
 __device__ inline float3 sampleEnvironment(float3 dir) {
     // Constant sky color with slight gradient
@@ -171,7 +169,8 @@ __global__ void pathTraceKernel(
     uint32_t        width,
     uint32_t        height,
     uint32_t        sampleIndex,
-    bool            enableEnvironment)
+    bool            enableEnvironment,
+    uint32_t        maxBounces)
 {
     uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -200,7 +199,7 @@ __global__ void pathTraceKernel(
     float3 prevSurfacePos = make_float3(0.0f, 0.0f, 0.0f);
     float prevBsdfPdf = 1.0f;
 
-    for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
+    for (uint32_t bounce = 0; bounce < maxBounces; bounce++) {
         HitRecord hit;
         hit.t = ray.tmax;
 
@@ -503,12 +502,13 @@ void launchPathTraceKernel(
     uint32_t width,
     uint32_t height,
     uint32_t sampleIndex,
-    bool enableEnvironment)
+    bool enableEnvironment,
+    uint32_t maxBounces)
 {
     dim3 block(8, 8);
     dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
     pathTraceKernel<<<grid, block>>>(
         scene, camera, d_accumBuffer, d_outputBuffer, auxBuffers,
-        width, height, sampleIndex, enableEnvironment);
+        width, height, sampleIndex, enableEnvironment, maxBounces);
     CUDA_CHECK(cudaGetLastError());
 }

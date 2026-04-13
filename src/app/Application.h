@@ -14,13 +14,18 @@ struct GLFWwindow;
 
 class Application {
 public:
-    bool init(uint32_t width, uint32_t height, const std::string& title);
+    bool init(uint32_t width, uint32_t height, const std::string& title, bool enableGui = true);
     bool loadScene(const std::string& path);
     void run();
     void shutdown();
+    void setMaxBounces(uint32_t maxBounces);
+    void setHeadlessOutput(const std::string& outputPath, uint32_t sampleCount);
 
 private:
     void processInput();
+    void runGui();
+    void runHeadless();
+    void renderSceneSample(uchar4* d_pbo, bool timeHeadless);
 
     GLFWwindow* m_window = nullptr;
     uint32_t    m_width  = 1280;
@@ -52,4 +57,10 @@ private:
     bool m_enableEnvironment = false;
     bool m_invertMouseY = false;
     bool m_prevF12Down = false;
+    uint32_t m_maxBounces = 8;
+    bool m_guiEnabled = true;
+    std::string m_headlessOutputPath;
+    uint32_t m_targetSamples = 1;
+    double m_headlessRenderMs = 0.0;
+    double m_headlessTotalMs = 0.0;
 };

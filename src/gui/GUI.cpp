@@ -22,7 +22,7 @@ void GUI::beginFrame() {
     ImGui::NewFrame();
 }
 
-bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t height, bool& enableEnvironment, bool& invertMouseY) {
+bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t height, bool& enableEnvironment, bool& invertMouseY, uint32_t& maxBounces) {
     bool changed = false;
 
     // Overlay window: top-left corner
@@ -39,6 +39,15 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
         changed = true;
     }
     ImGui::Checkbox("Invert Mouse Y", &invertMouseY);
+
+    int bounceValue = (int)maxBounces;
+    if (ImGui::SliderInt("Max Bounces", &bounceValue, 1, 16)) {
+        if (bounceValue < 1) {
+            bounceValue = 1;
+        }
+        maxBounces = (uint32_t)bounceValue;
+        changed = true;
+    }
 
     ImGui::End();
     return changed;

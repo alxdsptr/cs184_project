@@ -26,7 +26,8 @@ void Renderer::renderFrame(
     const DeviceSceneData& scene,
     RayTracingBackend* backend,
     uchar4* d_ldrOutput,
-    bool enableEnvironment)
+    bool enableEnvironment,
+    uint32_t maxBounces)
 {
     uint32_t sampleIndex = m_accumBuffer.getSampleCount();
 
@@ -37,7 +38,8 @@ void Renderer::renderFrame(
         m_accumBuffer.getOutputBuffer(),
         m_auxBuffers.getPtrs(),
         m_width, m_height, sampleIndex,
-        enableEnvironment
+        enableEnvironment,
+        maxBounces
     );
 
     // Tonemap HDR -> LDR into the display PBO

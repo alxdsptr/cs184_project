@@ -7,6 +7,7 @@
 #include <GLFW/glfw3.h>
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
@@ -15,9 +16,23 @@ static void glfwErrorCb(int code, const char* msg) {
     LOG_ERROR("GLFW [%d]: %s", code, msg);
 }
 
-bool Application::init(uint32_t width, uint32_t height, const std::string& title) {
+void Application::setMaxBounces(uint32_t maxBounces) {
+    m_maxBounces = maxBounces;
+    if (m_maxBounces < 1) {
+        m_maxBounces = 1;
+    }
+}
+
+void Application::setHeadlessOutput(const std::string& outputPath, uint32_t sampleCount) {
+    m_headlessOutputPath = outputPath;
+    m_targetSamples = sampleCount < 1 ? 1 : sampleCount;
+    m_headlessTotalMs = 0.0;
+}
+
+bool Application::init(uint32_t width, uint32_t height, const std::string& title, bool enableGui) {
     m_width  = width;
     m_height = height;
+    m_guiEnabled = enableGui;
 
     // GLFW
     glfwSetErrorCallback(glfwErrorCb);
@@ -26,6 +41,7 @@ bool Application::init(uint32_t width, uint32_t height, const std::string& title
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_VISIBLE, m_guiEnabled ? GLFW_TRUE : GLFW_FALSE);
 
     m_window = glfwCreateWindow(width, height, title.c_str(), nullptr, nullptr);
     if (!m_window) { LOG_ERROR("glfwCreateWindow failed"); return false; }
@@ -48,7 +64,9 @@ bool Application::init(uint32_t width, uint32_t height, const std::string& title
 
     // Initialize subsystems
     m_display.init(width, height);
-    m_gui.init(m_window);
+    if (m_guiEnabled) {
+        m_gui.init(m_window);
+    }
     m_renderer.init(width, height);
     m_backend = std::make_unique<CUDABackend>();
 
@@ -94,6 +112,10 @@ bool Application::loadScene(const std::string& path) {
 void Application::processInput() {
     m_input = InputState{};
 
+    if (!m_guiEnabled) {
+        return;
+    }
+
     if (!m_gui.wantCaptureKeyboard()) {
         m_input.forward  = glfwGetKey(m_window, GLFW_KEY_W) == GLFW_PRESS;
         m_input.backward = glfwGetKey(m_window, GLFW_KEY_S) == GLFW_PRESS;
@@ -120,16 +142,24 @@ void Application::processInput() {
     }
 }
 
-void Application::run() {
+void Application::renderSceneSample(uchar4* d_pbo, bool timeHeadless) {
+    if (m_sceneLoaded) {
+        CameraParams camParams = m_camera.getParams(m_frameIndex);
+        DeviceSceneData sceneData = m_backend->getSceneData();
+        m_renderer.renderFrame(camParams, sceneData, m_backend.get(), d_pbo, m_enableEnvironment, m_maxBounces);
+    } else {
+        CUDA_CHECK(cudaMemset(d_pbo, 40, m_width * m_height * sizeof(uchar4)));
+    }
+}
+
+void Application::runGui() {
     while (!glfwWindowShouldClose(m_window)) {
         glfwPollEvents();
 
-        // Timing
         float now = (float)glfwGetTime();
         float dt  = now - m_lastFrameTime;
         m_lastFrameTime = now;
 
-        // FPS counter
         m_fpsFrames++;
         m_fpsTimer += dt;
         if (m_fpsTimer >= 0.5f) {
@@ -138,7 +168,6 @@ void Application::run() {
             m_fpsTimer  = 0.0f;
         }
 
-        // Handle resize
         int fbW, fbH;
         glfwGetFramebufferSize(m_window, &fbW, &fbH);
         if (fbW > 0 && fbH > 0 && ((uint32_t)fbW != m_width || (uint32_t)fbH != m_height)) {
@@ -151,36 +180,24 @@ void Application::run() {
             glViewport(0, 0, fbW, fbH);
         }
 
-        // Input
         processInput();
         m_camera.update(dt, m_input);
         if (m_camera.hasMoved()) {
             m_renderer.resetAccumulation();
         }
 
-        // ESC to close
-        if (glfwGetKey(m_window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+        if (glfwGetKey(m_window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
             glfwSetWindowShouldClose(m_window, true);
+        }
 
         bool f12Down = glfwGetKey(m_window, GLFW_KEY_F12) == GLFW_PRESS;
         bool saveScreenshot = f12Down && !m_prevF12Down;
         m_prevF12Down = f12Down;
 
-        // ── Render ─────────────────────────────────────────
         uchar4* d_pbo = (uchar4*)m_display.mapForCUDA();
-
-        if (m_sceneLoaded) {
-            CameraParams camParams = m_camera.getParams(m_frameIndex);
-            DeviceSceneData sceneData = m_backend->getSceneData();
-            m_renderer.renderFrame(camParams, sceneData, m_backend.get(), d_pbo, m_enableEnvironment);
-        } else {
-            // No scene: dark gray
-            CUDA_CHECK(cudaMemset(d_pbo, 40, m_width * m_height * sizeof(uchar4)));
-        }
-
+        renderSceneSample(d_pbo, false);
         m_display.unmapFromCUDA();
 
-        // Display
         glClear(GL_COLOR_BUFFER_BIT);
         m_display.present();
 
@@ -195,7 +212,6 @@ void Application::run() {
             }
         }
 
-        // GUI overlay
         m_gui.beginFrame();
         bool envChanged = m_gui.render(
             m_fps,
@@ -203,15 +219,50 @@ void Application::run() {
             m_width,
             m_height,
             m_enableEnvironment,
-            m_invertMouseY);
+            m_invertMouseY,
+            m_maxBounces);
         if (envChanged) {
             m_renderer.resetAccumulation();
         }
         m_gui.endFrame();
 
         glfwSwapBuffers(m_window);
-
         m_frameIndex++;
+    }
+}
+
+void Application::runHeadless() {
+    const auto totalStart = std::chrono::steady_clock::now();
+
+    while (!glfwWindowShouldClose(m_window)) {
+        uchar4* d_pbo = (uchar4*)m_display.mapForCUDA();
+        renderSceneSample(d_pbo, true);
+        m_display.unmapFromCUDA();
+
+        if (m_sceneLoaded && m_renderer.getSampleCount() >= m_targetSamples) {
+            CUDA_CHECK(cudaDeviceSynchronize());
+            const auto totalEnd = std::chrono::steady_clock::now();
+            m_headlessTotalMs = std::chrono::duration<double, std::milli>(totalEnd - totalStart).count();
+            LOG_INFO("Target samples reached: %u", m_renderer.getSampleCount());
+            LOG_INFO("Headless total elapsed time: %.3f ms", m_headlessTotalMs);
+            if (m_display.saveToPNG(m_headlessOutputPath)) {
+                LOG_INFO("Saved image: %s", m_headlessOutputPath.c_str());
+            } else {
+                LOG_ERROR("Failed to save image: %s", m_headlessOutputPath.c_str());
+            }
+            glfwSetWindowShouldClose(m_window, true);
+        }
+
+        glfwSwapBuffers(m_window);
+        m_frameIndex++;
+    }
+}
+
+void Application::run() {
+    if (!m_guiEnabled && !m_headlessOutputPath.empty()) {
+        runHeadless();
+    } else {
+        runGui();
     }
 }
 
