@@ -4,14 +4,7 @@ out/
 .vscode/
 *.user
 CMakeSettings.json
-assets/*.glb
-assets/*.gltf
-assets/*.obj
-assets/*.dae
-assets/*.hdr
-assets/**/*.bin
-assets/**/*.png
-assets/**/*.jpg
+assets/
 .claude
 screenshots/
 Bistro_v5_2/

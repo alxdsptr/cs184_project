@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
+#include <unordered_map>
 
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
@@ -182,18 +183,36 @@ bool Application::init(uint32_t width, uint32_t height, const std::string& title
 }
 
 bool Application::loadScene(const std::string& path) {
+    // Release previous scene textures before loading a new scene.
+    m_textures.freeAll();
+
     m_scene = Scene{};
     if (!SceneLoader::load(path, m_scene)) {
         LOG_ERROR("Failed to load scene: %s", path.c_str());
         return false;
     }
 
-    // Load textures
+    // Load textures and bind CUDA texture objects per material.
+    std::unordered_map<std::string, cudaTextureObject_t> textureCache;
+    auto loadCachedTexture = [&](const std::string& texPath) -> cudaTextureObject_t {
+        if (texPath.empty()) {
+            return 0;
+        }
+        auto it = textureCache.find(texPath);
+        if (it != textureCache.end()) {
+            return it->second;
+        }
+        cudaTextureObject_t obj = m_textures.loadTexture(texPath);
+        textureCache.emplace(texPath, obj);
+        return obj;
+    };
+
     auto& materials = m_scene.getMaterials();
     for (auto& mat : materials) {
-        // Texture loading is handled but we store the objects per-material
-        // The TextureManager loads and the DeviceScene upload will set them
-        // For now, textures will be loaded when the scene is uploaded
+        mat.albedoTexObj = loadCachedTexture(mat.albedoTexPath);
+        mat.normalTexObj = loadCachedTexture(mat.normalTexPath);
+        mat.metallicRoughTexObj = loadCachedTexture(mat.metallicRoughTexPath);
+        mat.emissiveTexObj = loadCachedTexture(mat.emissiveTexPath);
     }
 
     // Build acceleration structure (uploads geometry + builds BVH)

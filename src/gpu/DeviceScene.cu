@@ -134,11 +134,10 @@ void DeviceScene::upload(const Scene& scene) {
         dst.emissionStrength = src.emissionStrength;
         dst.ior              = src.ior;
         dst.transmission     = src.transmission;
-        // Texture objects are set separately by the caller after TextureManager loads them
-        dst.albedoTex        = 0;
-        dst.normalTex        = 0;
-        dst.metallicRoughTex = 0;
-        dst.emissiveTex      = 0;
+        dst.albedoTex        = src.albedoTexObj;
+        dst.normalTex        = src.normalTexObj;
+        dst.metallicRoughTex = src.metallicRoughTexObj;
+        dst.emissiveTex      = src.emissiveTexObj;
     }
 
     CUDA_CHECK(cudaMalloc(&m_data.d_materials, materials.size() * sizeof(GPUMaterial)));

@@ -15,4 +15,10 @@ struct PBRMaterial {
     std::string normalTexPath;
     std::string metallicRoughTexPath;
     std::string emissiveTexPath;
+
+    // Runtime CUDA texture handles (0 means no texture bound).
+    cudaTextureObject_t albedoTexObj = 0;
+    cudaTextureObject_t normalTexObj = 0;
+    cudaTextureObject_t metallicRoughTexObj = 0;
+    cudaTextureObject_t emissiveTexObj = 0;
 };

@@ -54,7 +54,7 @@ __device__ inline float ggxD_local(float NdotH, float roughness) {
     float a  = roughness * roughness;
     float a2 = a * a;
     float denom = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
-    return a2 / (M_PI_F * denom * denom + 1e-7f);
+    return a2 / (M_PI_F * denom * denom + 1e-14f);
 }
 
 __device__ inline float3 fresnelSchlick_local(float cosTheta, float3 F0) {
@@ -63,10 +63,11 @@ __device__ inline float3 fresnelSchlick_local(float cosTheta, float3 F0) {
     return F0 + (make_float3(1,1,1) - F0) * t5;
 }
 
-__device__ inline float smithG1_local(float NdotX, float roughness) {
-    float a = roughness * roughness;
-    float k = a * 0.5f;
-    return NdotX / (NdotX * (1.0f - k) + k + 1e-7f);
+__device__ inline float smithG1_GGX(float NdotX, float alpha) {
+    // Smith G1 for GGX (exact form, not Schlick approximation)
+    float a2 = alpha * alpha;
+    float cos2 = NdotX * NdotX;
+    return 2.0f * NdotX / (NdotX + sqrtf(a2 + (1.0f - a2) * cos2) + 1e-7f);
 }
 
 __device__ inline float powerHeuristic(float pdfA, float pdfB) {
@@ -95,7 +96,7 @@ __device__ inline float bsdfSpecularPdf(
     float a = roughness * roughness;
     float a2 = a * a;
     float denom = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
-    float D_val = a2 / (M_PI_F * denom * denom + 1e-7f);
+    float D_val = a2 / (M_PI_F * denom * denom + 1e-14f);
     return D_val * NdotH / (4.0f * VdotH + 1e-7f);
 }
 
@@ -150,7 +151,8 @@ __device__ inline float3 bsdfEvaluate(
     float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, metallic);
     float3 F = fresnelSchlick_local(LdotH, F0);
     float D_val = ggxD_local(NdotH, roughness);
-    float G_val = smithG1_local(NdotL, roughness) * smithG1_local(NdotV, roughness);
+    float alpha = roughness * roughness;
+    float G_val = smithG1_GGX(NdotL, alpha) * smithG1_GGX(NdotV, alpha);
 
     float3 specular = F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
     float3 kd = (make_float3(1, 1, 1) - F) * (1.0f - metallic);
@@ -247,9 +249,6 @@ __global__ void pathTraceKernel(
             mat.emissionStrength = 0.0f;
         }
 
-        // Clamp roughness to avoid singularities in GGX sampling/evaluation
-        mat.roughness = fmaxf(mat.roughness, 0.045f);
-
         // Fetch vertex indices and barycentric coords for interpolation
         uint32_t triIdx = (uint32_t)hit.primitiveIndex;
         uint32_t i0 = scene.d_indices[triIdx * 3 + 0];
@@ -272,6 +271,24 @@ __global__ void pathTraceKernel(
         if (mat.albedoTex != 0) {
             float4 texColor = tex2D<float4>(mat.albedoTex, texUV.x, texUV.y);
             albedo = make_float3(texColor.x, texColor.y, texColor.z);
+        }
+
+        // Sample metallic-roughness texture (glTF convention: G=roughness, B=metallic)
+        if (mat.metallicRoughTex != 0) {
+            float4 mrTexel = tex2D<float4>(mat.metallicRoughTex, texUV.x, texUV.y);
+            mat.roughness = mat.roughness * mrTexel.y;
+            mat.metallic = mat.metallic * mrTexel.z;
+        }
+
+        // Clamp roughness/metallic to stable ranges for BRDF sampling/evaluation
+        mat.roughness = fmaxf(mat.roughness, 0.045f);
+        mat.metallic = clampf(mat.metallic, 0.0f, 1.0f);
+
+        // Sample emissive texture if available
+        float3 emissiveColor = mat.emission;
+        if (mat.emissiveTex != 0) {
+            float4 emissiveTexel = tex2D<float4>(mat.emissiveTex, texUV.x, texUV.y);
+            emissiveColor = make_float3(emissiveTexel.x, emissiveTexel.y, emissiveTexel.z);
         }
 
         // Interpolate vertex normals if available
@@ -306,9 +323,9 @@ __global__ void pathTraceKernel(
         }
 
         bool isEmissive = mat.emissionStrength > 0.0f &&
-                          (mat.emission.x > 0.0f || mat.emission.y > 0.0f || mat.emission.z > 0.0f);
+                          (emissiveColor.x > 0.0f || emissiveColor.y > 0.0f || emissiveColor.z > 0.0f);
         if (isEmissive) {
-            float3 Le = mat.emission * mat.emissionStrength;
+            float3 Le = emissiveColor * mat.emissionStrength;
             float weight = 1.0f;
 
             if (bounce > 0 && havePrevSurface && !lastBounceSpecular && scene.d_triangleAreaLightIndex) {

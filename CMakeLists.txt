@@ -20,6 +20,7 @@ include(cmake/CompilerFlags.cmake)
 include(cmake/FetchGLFW.cmake)
 include(cmake/FetchGLEW.cmake)
 include(cmake/FetchImGui.cmake)
+include(cmake/FetchGLI.cmake)
 
 # Assimp (existing submodule)
 set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -76,6 +77,7 @@ target_link_libraries(pathtracer PRIVATE
     libglew_static
     imgui
     assimp
+    gli_headers
     CUDA::cudart
 )
 
