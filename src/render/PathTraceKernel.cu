@@ -230,25 +230,40 @@ __global__ void pathTraceKernel(
             mat.emissionStrength = 0.0f;
         }
 
+        // Clamp roughness to avoid singularities in GGX sampling/evaluation
+        mat.roughness = fmaxf(mat.roughness, 0.045f);
+
+        // Fetch vertex indices and barycentric coords for interpolation
+        uint32_t triIdx = (uint32_t)hit.primitiveIndex;
+        uint32_t i0 = scene.d_indices[triIdx * 3 + 0];
+        uint32_t i1 = scene.d_indices[triIdx * 3 + 1];
+        uint32_t i2 = scene.d_indices[triIdx * 3 + 2];
+        float baryU = hit.uv.x, baryV = hit.uv.y;
+        float baryW = 1.0f - baryU - baryV;
+
+        // Interpolate actual texture UVs from vertex data
+        float2 texUV = make_float2(0.0f, 0.0f);
+        if (scene.d_uvs) {
+            float2 uv0 = scene.d_uvs[i0];
+            float2 uv1 = scene.d_uvs[i1];
+            float2 uv2 = scene.d_uvs[i2];
+            texUV = uv0 * baryW + uv1 * baryU + uv2 * baryV;
+        }
+
         // Sample albedo texture if available
         float3 albedo = mat.albedo;
         if (mat.albedoTex != 0) {
-            float4 texColor = tex2D<float4>(mat.albedoTex, hit.uv.x, hit.uv.y);
+            float4 texColor = tex2D<float4>(mat.albedoTex, texUV.x, texUV.y);
             albedo = make_float3(texColor.x, texColor.y, texColor.z);
         }
 
         // Interpolate vertex normals if available
         float3 N = hit.shadingNormal;
         if (scene.d_normals) {
-            uint32_t triIdx = (uint32_t)hit.primitiveIndex;
-            uint32_t i0 = scene.d_indices[triIdx * 3 + 0];
-            uint32_t i1 = scene.d_indices[triIdx * 3 + 1];
-            uint32_t i2 = scene.d_indices[triIdx * 3 + 2];
             float3 n0 = scene.d_normals[i0];
             float3 n1 = scene.d_normals[i1];
             float3 n2 = scene.d_normals[i2];
-            float u = hit.uv.x, v = hit.uv.y;
-            N = normalize(n0 * (1.0f - u - v) + n1 * u + n2 * v);
+            N = normalize(n0 * baryW + n1 * baryU + n2 * baryV);
             if (dot(N, ray.direction) > 0) N = -N;
         }
 
@@ -410,10 +425,9 @@ __global__ void pathTraceKernel(
         float3 V = -ray.direction;
 
         float3 newDir;
-        float pdf;
 
         if (pcg32_float(rng) < specProb) {
-            // GGX importance sampling (simplified: sample around reflection)
+            // GGX importance sampling
             float a = mat.roughness * mat.roughness;
             float u1 = pcg32_float(rng);
             float u2 = pcg32_float(rng);
@@ -428,53 +442,39 @@ __global__ void pathTraceKernel(
 
             newDir = ray.direction - H * (2.0f * dot(ray.direction, H));
             newDir = normalize(newDir);
-
-            float NdotH = fmaxf(dot(N, H), 0.0f);
-            float VdotH = fmaxf(dot(V, H), 0.0f);
-            float D_val = ggxD_local(NdotH, mat.roughness);
-            pdf = D_val * NdotH / (4.0f * VdotH + 1e-7f);
-            pdf *= specProb;
             lastBounceSpecular = true;
         } else {
             // Cosine-weighted hemisphere sampling (diffuse)
             float u1 = pcg32_float(rng);
             float u2 = pcg32_float(rng);
-            float3 localDir = sampleCosineHemisphere(u1, u2, pdf);
+            float dummyPdf;
+            float3 localDir = sampleCosineHemisphere(u1, u2, dummyPdf);
             float3 T, B;
             buildONB(N, T, B);
             newDir = localToWorld(localDir, T, N, B);
-            pdf *= (1.0f - specProb);
             lastBounceSpecular = false;
         }
 
-        if (pdf < 1e-7f || dot(newDir, N) < 0.0f) break;
+        float NdotL_new = dot(N, newDir);
+        if (NdotL_new < 1e-6f) break;
+
+        // Compute full mixture PDF for the sampled direction
+        float pdf = bsdfMixturePdf(N, V, newDir, mat.roughness, mat.metallic);
+        if (pdf < 1e-7f) break;
 
         // Evaluate BRDF
-        float3 H = normalize(V + newDir);
-        float NdotL = fmaxf(dot(N, newDir), 0.0f);
-        float NdotV = fmaxf(dot(N, V), 0.0f);
-        float NdotH = fmaxf(dot(N, H), 0.0f);
-        float LdotH = fmaxf(dot(newDir, H), 0.0f);
+        float3 brdf = bsdfEvaluate(N, V, newDir, albedo, mat.roughness, mat.metallic);
 
-        float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, mat.metallic);
-        float3 F = fresnelSchlick_local(LdotH, F0);
-        float D_val = ggxD_local(NdotH, mat.roughness);
-        float G_val = smithG1_local(NdotL, mat.roughness) * smithG1_local(NdotV, mat.roughness);
-
-        float3 specular = F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
-        float3 kd = (make_float3(1,1,1) - F) * (1.0f - mat.metallic);
-        float3 diffuse = kd * albedo * (1.0f / M_PI_F);
-        float3 brdf = (diffuse + specular) * NdotL;
-
-        throughput = throughput * brdf * (1.0f / (pdf + 1e-7f));
+        throughput = throughput * brdf * (NdotL_new / (pdf + 1e-7f));
 
         prevSurfacePos = hit.position;
         prevBsdfPdf = pdf;
         havePrevSurface = true;
 
-        // Russian roulette after bounce 3
-        if (bounce >= 3) {
-            float p = fminf(fmaxf(fmaxf(throughput.x, throughput.y), throughput.z), 0.95f);
+        // Russian roulette
+        if (bounce >= 2) {
+            float lum = 0.2126f * throughput.x + 0.7152f * throughput.y + 0.0722f * throughput.z;
+            float p = fminf(fmaxf(lum, 0.05f), 0.95f);
             if (pcg32_float(rng) >= p) break;
             throughput = throughput * (1.0f / p);
         }
@@ -484,6 +484,18 @@ __global__ void pathTraceKernel(
         ray.direction = newDir;
         ray.tmin      = 0.001f;
         ray.tmax      = 1e30f;
+    }
+
+    // Clamp fireflies and reject NaN/inf before accumulation
+    if (isnan(radiance.x) || isnan(radiance.y) || isnan(radiance.z) ||
+        isinf(radiance.x) || isinf(radiance.y) || isinf(radiance.z)) {
+        radiance = make_float3(0.0f, 0.0f, 0.0f);
+    }
+    float luminance = 0.2126f * radiance.x + 0.7152f * radiance.y + 0.0722f * radiance.z;
+    float clampMax = 100.0f;
+    if (luminance > clampMax) {
+        float scale = clampMax / luminance;
+        radiance = radiance * scale;
     }
 
     // Accumulate
