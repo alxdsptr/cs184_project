@@ -68,7 +68,23 @@ void DeviceScene::upload(const Scene& scene) {
         for (uint32_t t = 0; t < triCount; t++) {
             allMatIndices.push_back(mesh.materialIndex);
             if (emissiveMesh && areaLightIndex < areaLights.size()) {
-                allAreaLightIndices.push_back((int)areaLightIndex++);
+                // Check if this triangle matches the next area light (non-degenerate).
+                // SceneLoader skips degenerate triangles (area <= 1e-8), so we must
+                // replicate that check to keep indices in sync.
+                uint32_t li0 = mesh.indices[t * 3 + 0];
+                uint32_t li1 = mesh.indices[t * 3 + 1];
+                uint32_t li2 = mesh.indices[t * 3 + 2];
+                float3 lv0 = mesh.positions[li0];
+                float3 lv1 = mesh.positions[li1];
+                float3 lv2 = mesh.positions[li2];
+                float3 le1 = lv1 - lv0;
+                float3 le2 = lv2 - lv0;
+                float triArea = 0.5f * length(cross(le1, le2));
+                if (triArea > 1e-8f) {
+                    allAreaLightIndices.push_back((int)areaLightIndex++);
+                } else {
+                    allAreaLightIndices.push_back(-1);
+                }
             } else {
                 allAreaLightIndices.push_back(-1);
             }

@@ -8,12 +8,107 @@
 #include <cuda_runtime.h>
 
 #include <chrono>
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
 
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+
+static float3 normalizeOrFallback(float3 v, float3 fallback) {
+    float len = length(v);
+    if (len <= 1e-6f) {
+        return fallback;
+    }
+    return v / len;
+}
+
+static float computeVerticalFovRadians(const SceneCamera& camera, float aspect) {
+    float horizontal = camera.horizontalFovRadians > 1e-6f
+        ? camera.horizontalFovRadians
+        : 60.0f * 3.14159265358979323846f / 180.0f;
+    float safeAspect = aspect > 1e-6f ? aspect : 1.0f;
+    return 2.0f * atanf(tanf(horizontal * 0.5f) / safeAspect);
+}
+
+static float computeFitDistance(const AABB& bounds, float3 forward, float3 up, float aspect, float verticalFovRadians) {
+    if (bounds.empty()) {
+        return 3.0f;
+    }
+
+    forward = normalizeOrFallback(forward, make_float3(0.0f, 0.0f, -1.0f));
+    up = normalizeOrFallback(up, make_float3(0.0f, 1.0f, 0.0f));
+    float3 right = normalizeOrFallback(cross(forward, up), make_float3(1.0f, 0.0f, 0.0f));
+    up = normalizeOrFallback(cross(right, forward), make_float3(0.0f, 1.0f, 0.0f));
+
+    float tanHalfV = tanf(verticalFovRadians * 0.5f);
+    float tanHalfH = tanHalfV * (aspect > 1e-6f ? aspect : 1.0f);
+    if (tanHalfV <= 1e-6f) {
+        tanHalfV = 1e-6f;
+    }
+    if (tanHalfH <= 1e-6f) {
+        tanHalfH = 1e-6f;
+    }
+
+    const float3 center = bounds.center();
+    const float3 corners[8] = {
+        make_float3(bounds.bmin.x, bounds.bmin.y, bounds.bmin.z),
+        make_float3(bounds.bmax.x, bounds.bmin.y, bounds.bmin.z),
+        make_float3(bounds.bmin.x, bounds.bmax.y, bounds.bmin.z),
+        make_float3(bounds.bmax.x, bounds.bmax.y, bounds.bmin.z),
+        make_float3(bounds.bmin.x, bounds.bmin.y, bounds.bmax.z),
+        make_float3(bounds.bmax.x, bounds.bmin.y, bounds.bmax.z),
+        make_float3(bounds.bmin.x, bounds.bmax.y, bounds.bmax.z),
+        make_float3(bounds.bmax.x, bounds.bmax.y, bounds.bmax.z),
+    };
+
+    float requiredDistance = 0.0f;
+    for (const float3& corner : corners) {
+        float3 rel = corner - center;
+        float x = dot(rel, right);
+        float y = dot(rel, up);
+        float z = dot(rel, forward);
+        requiredDistance = fmaxf(requiredDistance, fabsf(x) / tanHalfH - z);
+        requiredDistance = fmaxf(requiredDistance, fabsf(y) / tanHalfV - z);
+    }
+
+    float extentLength = length(bounds.bmax - bounds.bmin);
+    float paddedDistance = fmaxf(requiredDistance, extentLength * 0.5f);
+    return fmaxf(paddedDistance * 1.15f, 0.25f);
+}
+
 static void glfwErrorCb(int code, const char* msg) {
     LOG_ERROR("GLFW [%d]: %s", code, msg);
+}
+
+static std::string lowerString(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return (char)std::tolower(c);
+    });
+    return value;
+}
+
+static float horizontalToVerticalFovDeg(float horizontalFovRadians, float aspect) {
+    float safeAspect = aspect > 1e-6f ? aspect : 1.0f;
+    float verticalRadians = 2.0f * atanf(tanf(horizontalFovRadians * 0.5f) / safeAspect);
+    return verticalRadians * 180.0f / 3.14159265358979323846f;
+}
+
+void Application::glfwScrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
+    ImGui_ImplGlfw_ScrollCallback(window, xoffset, yoffset);
+
+    Application* app = static_cast<Application*>(glfwGetWindowUserPointer(window));
+    if (!app) {
+        return;
+    }
+
+    if (ImGui::GetIO().WantCaptureMouse) {
+        return;
+    }
+
+    app->m_pendingScrollY += yoffset;
 }
 
 void Application::setMaxBounces(uint32_t maxBounces) {
@@ -47,6 +142,7 @@ bool Application::init(uint32_t width, uint32_t height, const std::string& title
     if (!m_window) { LOG_ERROR("glfwCreateWindow failed"); return false; }
     glfwMakeContextCurrent(m_window);
     glfwSwapInterval(0);
+    glfwSetWindowUserPointer(m_window, this);
 
     // GLEW
     glewExperimental = GL_TRUE;
@@ -67,6 +163,7 @@ bool Application::init(uint32_t width, uint32_t height, const std::string& title
     if (m_guiEnabled) {
         m_gui.init(m_window);
     }
+    glfwSetScrollCallback(m_window, glfwScrollCallback);
     m_renderer.init(width, height);
     m_backend = std::make_unique<CUDABackend>();
 
@@ -104,9 +201,43 @@ bool Application::loadScene(const std::string& path) {
     m_sceneLoaded = true;
     m_renderer.resetAccumulation();
 
-    // Auto-position camera based on scene bounds
-    // For now, keep default camera position
+    std::string ext = lowerString(std::filesystem::path(path).extension().string());
+    const SceneCamera& sceneCamera = m_scene.getCamera();
+    float aspect = m_height > 0 ? (float)m_width / (float)m_height : 1.0f;
+
+    if (ext == ".dae") {
+        frameCameraToScene();
+    } else if (sceneCamera.valid) {
+        float cameraAspect = sceneCamera.aspect > 1e-6f ? sceneCamera.aspect : aspect;
+        float fovDeg = horizontalToVerticalFovDeg(sceneCamera.horizontalFovRadians, cameraAspect);
+        m_camera.init(sceneCamera.position, sceneCamera.forward, sceneCamera.up, fovDeg, cameraAspect);
+        m_camera.setClipPlanes(sceneCamera.nearPlane, sceneCamera.farPlane);
+    }
+
+    m_renderer.resetAccumulation();
     return true;
+}
+
+void Application::frameCameraToScene() {
+    const SceneCamera& sceneCamera = m_scene.getCamera();
+    const AABB& bounds = m_scene.getBounds();
+    float aspect = m_height > 0 ? (float)m_width / (float)m_height : 1.0f;
+
+    float3 forward = sceneCamera.valid ? sceneCamera.forward : make_float3(0.0f, 0.0f, -1.0f);
+    float3 up = sceneCamera.valid ? sceneCamera.up : make_float3(0.0f, 1.0f, 0.0f);
+    float verticalFov = computeVerticalFovRadians(sceneCamera, aspect);
+
+    float3 target = bounds.empty() ? make_float3(0.0f, 0.0f, 0.0f) : bounds.center();
+    if (sceneCamera.valid) {
+        float3 toTarget = normalizeOrFallback(target - sceneCamera.position, forward);
+        if (dot(forward, toTarget) < 0.0f) {
+            forward = -forward;
+        }
+    }
+    float distance = computeFitDistance(bounds, forward, up, aspect, verticalFov);
+    float3 position = target - normalizeOrFallback(forward, make_float3(0.0f, 0.0f, -1.0f)) * distance;
+
+    m_camera.init(position, target, verticalFov * 180.0f / 3.14159265358979323846f, aspect);
 }
 
 void Application::processInput() {
@@ -182,6 +313,16 @@ void Application::runGui() {
 
         processInput();
         m_camera.update(dt, m_input);
+
+        if (fabs(m_pendingScrollY) > 1e-6) {
+            float zoomFactor = powf(0.88f, (float)m_pendingScrollY);
+            zoomFactor = clampf(zoomFactor, 0.25f, 4.0f);
+            float newFov = m_camera.getFovDeg() * zoomFactor;
+            m_camera.setFovDeg(newFov);
+            m_pendingScrollY = 0.0;
+            m_renderer.resetAccumulation();
+        }
+
         if (m_camera.hasMoved()) {
             m_renderer.resetAccumulation();
         }

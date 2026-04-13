@@ -24,8 +24,8 @@ inline D float3 fresnelSchlick(float cosTheta, float3 F0) {
 
 // ── Smith-GGX Geometry ───────────────────────────────────────
 inline D float smithG1(float NdotX, float roughness) {
-    float r = roughness + 1.0f;
-    float k = (r * r) / 8.0f;
+    float a = roughness * roughness;
+    float k = a * 0.5f;
     return NdotX / (NdotX * (1.0f - k) + k + 1e-7f);
 }
 

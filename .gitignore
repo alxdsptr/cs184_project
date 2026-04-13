@@ -14,3 +14,6 @@ assets/**/*.png
 assets/**/*.jpg
 .claude
 screenshots/
+Bistro_v5_2/
+dae/
+*.png

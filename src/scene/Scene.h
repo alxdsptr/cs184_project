@@ -1,9 +1,21 @@
 #pragma once
+#include "accel/AABB.h"
 #include "scene/AreaLight.h"
 #include "scene/Mesh.h"
 #include "scene/Material.h"
 #include "scene/Light.h"
 #include <vector>
+
+struct SceneCamera {
+    bool  valid = false;
+    float3 position = make_float3(0.0f, 1.0f, 3.0f);
+    float3 forward = make_float3(0.0f, 0.0f, -1.0f);
+    float3 up = make_float3(0.0f, 1.0f, 0.0f);
+    float  horizontalFovRadians = 60.0f * 3.14159265358979323846f / 180.0f;
+    float  aspect = 0.0f;
+    float  nearPlane = 0.1f;
+    float  farPlane = 1000.0f;
+};
 
 class Scene {
 public:
@@ -16,6 +28,12 @@ public:
     const std::vector<PointLight>&   getLights() const { return m_lights; }
     const std::vector<TriangleAreaLight>& getAreaLights() const { return m_areaLights; }
 
+    AABB& getBounds() { return m_bounds; }
+    const AABB& getBounds() const { return m_bounds; }
+
+    SceneCamera& getCamera() { return m_camera; }
+    const SceneCamera& getCamera() const { return m_camera; }
+
     uint32_t totalTriangles() const;
     uint32_t totalVertices() const;
 
@@ -24,4 +42,6 @@ private:
     std::vector<PBRMaterial>  m_materials;
     std::vector<PointLight>   m_lights;
     std::vector<TriangleAreaLight> m_areaLights;
+    AABB m_bounds;
+    SceneCamera m_camera;
 };

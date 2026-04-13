@@ -64,8 +64,8 @@ __device__ inline float3 fresnelSchlick_local(float cosTheta, float3 F0) {
 }
 
 __device__ inline float smithG1_local(float NdotX, float roughness) {
-    float r = roughness + 1.0f;
-    float k = (r * r) / 8.0f;
+    float a = roughness * roughness;
+    float k = a * 0.5f;
     return NdotX / (NdotX * (1.0f - k) + k + 1e-7f);
 }
 
@@ -99,14 +99,31 @@ __device__ inline float bsdfSpecularPdf(
     return D_val * NdotH / (4.0f * VdotH + 1e-7f);
 }
 
+__device__ inline float computeSpecProb(
+    const float3& N,
+    const float3& V,
+    const float3& albedo,
+    float metallic)
+{
+    float NdotV = fmaxf(dot(N, V), 0.0f);
+    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, metallic);
+    float t = 1.0f - fminf(fmaxf(NdotV, 0.0f), 1.0f);
+    float t5 = t*t*t*t*t;
+    float3 F = F0 + (make_float3(1,1,1) - F0) * t5;
+    float specW = 0.2126f * F.x + 0.7152f * F.y + 0.0722f * F.z;
+    float3 kd = (make_float3(1,1,1) - F) * (1.0f - metallic);
+    float diffW = 0.2126f * (kd.x * albedo.x) + 0.7152f * (kd.y * albedo.y) + 0.0722f * (kd.z * albedo.z);
+    float p = specW / fmaxf(specW + diffW, 1e-7f);
+    return fminf(fmaxf(p, 0.1f), 0.9f);
+}
+
 __device__ inline float bsdfMixturePdf(
     const float3& N,
     const float3& V,
     const float3& L,
     float roughness,
-    float metallic)
+    float specProb)
 {
-    float specProb = 0.5f * (1.0f + metallic);
     float diffusePdf = bsdfDiffusePdf(dot(N, L));
     float specPdf = bsdfSpecularPdf(N, V, L, roughness);
     return specProb * specPdf + (1.0f - specProb) * diffusePdf;
@@ -230,25 +247,40 @@ __global__ void pathTraceKernel(
             mat.emissionStrength = 0.0f;
         }
 
+        // Clamp roughness to avoid singularities in GGX sampling/evaluation
+        mat.roughness = fmaxf(mat.roughness, 0.045f);
+
+        // Fetch vertex indices and barycentric coords for interpolation
+        uint32_t triIdx = (uint32_t)hit.primitiveIndex;
+        uint32_t i0 = scene.d_indices[triIdx * 3 + 0];
+        uint32_t i1 = scene.d_indices[triIdx * 3 + 1];
+        uint32_t i2 = scene.d_indices[triIdx * 3 + 2];
+        float baryU = hit.uv.x, baryV = hit.uv.y;
+        float baryW = 1.0f - baryU - baryV;
+
+        // Interpolate actual texture UVs from vertex data
+        float2 texUV = make_float2(0.0f, 0.0f);
+        if (scene.d_uvs) {
+            float2 uv0 = scene.d_uvs[i0];
+            float2 uv1 = scene.d_uvs[i1];
+            float2 uv2 = scene.d_uvs[i2];
+            texUV = uv0 * baryW + uv1 * baryU + uv2 * baryV;
+        }
+
         // Sample albedo texture if available
         float3 albedo = mat.albedo;
         if (mat.albedoTex != 0) {
-            float4 texColor = tex2D<float4>(mat.albedoTex, hit.uv.x, hit.uv.y);
+            float4 texColor = tex2D<float4>(mat.albedoTex, texUV.x, texUV.y);
             albedo = make_float3(texColor.x, texColor.y, texColor.z);
         }
 
         // Interpolate vertex normals if available
         float3 N = hit.shadingNormal;
         if (scene.d_normals) {
-            uint32_t triIdx = (uint32_t)hit.primitiveIndex;
-            uint32_t i0 = scene.d_indices[triIdx * 3 + 0];
-            uint32_t i1 = scene.d_indices[triIdx * 3 + 1];
-            uint32_t i2 = scene.d_indices[triIdx * 3 + 2];
             float3 n0 = scene.d_normals[i0];
             float3 n1 = scene.d_normals[i1];
             float3 n2 = scene.d_normals[i2];
-            float u = hit.uv.x, v = hit.uv.y;
-            N = normalize(n0 * (1.0f - u - v) + n1 * u + n2 * v);
+            N = normalize(n0 * baryW + n1 * baryU + n2 * baryV);
             if (dot(N, ray.direction) > 0) N = -N;
         }
 
@@ -353,7 +385,8 @@ __global__ void pathTraceKernel(
 
                     float3 V = -ray.direction;
                     float3 brdf = bsdfEvaluate(N, V, Ld, albedo, mat.roughness, mat.metallic);
-                    float pdfBsdf = bsdfMixturePdf(N, V, Ld, mat.roughness, mat.metallic);
+                    float neeSpecProb = computeSpecProb(N, V, albedo, mat.metallic);
+                    float pdfBsdf = bsdfMixturePdf(N, V, Ld, mat.roughness, neeSpecProb);
                     float weight = powerHeuristic(pdfOmega, pdfBsdf);
 
                     radiance += throughput * brdf * light.emission * (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
@@ -405,15 +438,14 @@ __global__ void pathTraceKernel(
             radiance += throughput * direct;
         }
 
-        // BRDF sampling: metallic blend between diffuse and specular
-        float specProb = 0.5f * (1.0f + mat.metallic);
+        // BRDF sampling: Fresnel-weighted blend between diffuse and specular
         float3 V = -ray.direction;
+        float specProb = computeSpecProb(N, V, albedo, mat.metallic);
 
         float3 newDir;
-        float pdf; // TODO: fixing washed out images removed the use of this value, so what was intent?
 
         if (pcg32_float(rng) < specProb) {
-            // GGX importance sampling (simplified: sample around reflection)
+            // GGX importance sampling
             float a = mat.roughness * mat.roughness;
             float u1 = pcg32_float(rng);
             float u2 = pcg32_float(rng);
@@ -428,54 +460,39 @@ __global__ void pathTraceKernel(
 
             newDir = ray.direction - H * (2.0f * dot(ray.direction, H));
             newDir = normalize(newDir);
-
-            float NdotH = fmaxf(dot(N, H), 0.0f);
-            float VdotH = fmaxf(dot(V, H), 0.0f);
-            float D_val = ggxD_local(NdotH, mat.roughness);
-            pdf = D_val * NdotH / (4.0f * VdotH + 1e-7f);
-            pdf *= specProb;
             lastBounceSpecular = true;
         } else {
             // Cosine-weighted hemisphere sampling (diffuse)
             float u1 = pcg32_float(rng);
             float u2 = pcg32_float(rng);
-            float3 localDir = sampleCosineHemisphere(u1, u2, pdf);
+            float dummyPdf;
+            float3 localDir = sampleCosineHemisphere(u1, u2, dummyPdf);
             float3 T, B;
             buildONB(N, T, B);
             newDir = localToWorld(localDir, T, N, B);
-            pdf *= (1.0f - specProb);
             lastBounceSpecular = false;
         }
 
-        float fullPdf = bsdfMixturePdf(N, V, newDir, mat.roughness, mat.metallic);
-        if (fullPdf < 1e-7f || dot(newDir, N) < 0.0f) break;
+        float NdotL_new = dot(N, newDir);
+        if (NdotL_new < 1e-6f) break;
+
+        // Compute full mixture PDF for the sampled direction
+        float pdf = bsdfMixturePdf(N, V, newDir, mat.roughness, specProb);
+        if (pdf < 1e-7f) break;
 
         // Evaluate BRDF
-        float3 H = normalize(V + newDir);
-        float NdotL = fmaxf(dot(N, newDir), 0.0f);
-        float NdotV = fmaxf(dot(N, V), 0.0f);
-        float NdotH = fmaxf(dot(N, H), 0.0f);
-        float LdotH = fmaxf(dot(newDir, H), 0.0f);
+        float3 brdf = bsdfEvaluate(N, V, newDir, albedo, mat.roughness, mat.metallic);
 
-        float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, mat.metallic);
-        float3 F = fresnelSchlick_local(LdotH, F0);
-        float D_val = ggxD_local(NdotH, mat.roughness);
-        float G_val = smithG1_local(NdotL, mat.roughness) * smithG1_local(NdotV, mat.roughness);
-
-        float3 specular = F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
-        float3 kd = (make_float3(1,1,1) - F) * (1.0f - mat.metallic);
-        float3 diffuse = kd * albedo * (1.0f / M_PI_F);
-        float3 brdf = (diffuse + specular) * NdotL;
-
-        throughput = throughput * brdf * (1.0f / (fullPdf + 1e-7f));
+        throughput = throughput * brdf * (NdotL_new / (pdf + 1e-7f));
 
         prevSurfacePos = hit.position;
-        prevBsdfPdf = fullPdf;
+            prevBsdfPdf = pdf;
         havePrevSurface = true;
 
-        // Russian roulette after bounce 3
-        if (bounce >= 3) {
-            float p = fminf(fmaxf(fmaxf(throughput.x, throughput.y), throughput.z), 0.95f);
+        // Russian roulette
+        if (bounce >= 2) {
+            float lum = 0.2126f * throughput.x + 0.7152f * throughput.y + 0.0722f * throughput.z;
+            float p = fminf(fmaxf(lum, 0.05f), 0.95f);
             if (pcg32_float(rng) >= p) break;
             throughput = throughput * (1.0f / p);
         }
@@ -485,6 +502,18 @@ __global__ void pathTraceKernel(
         ray.direction = newDir;
         ray.tmin      = 0.001f;
         ray.tmax      = 1e30f;
+    }
+
+    // Clamp fireflies and reject NaN/inf before accumulation
+    if (isnan(radiance.x) || isnan(radiance.y) || isnan(radiance.z) ||
+        isinf(radiance.x) || isinf(radiance.y) || isinf(radiance.z)) {
+        radiance = make_float3(0.0f, 0.0f, 0.0f);
+    }
+    float luminance = 0.2126f * radiance.x + 0.7152f * radiance.y + 0.0722f * radiance.z;
+    float clampMax = 1000.0f;
+    if (luminance > clampMax) {
+        float scale = clampMax / luminance;
+        radiance = radiance * scale;
     }
 
     // Accumulate

@@ -1,6 +1,7 @@
 #include "backend/CUDABackend.h"
 #include "scene/Scene.h"
 #include "accel/SAH_BVH.h"
+#include "core/Math.h"
 #include "render/PathTraceKernel.h"
 #include "render/Tonemapping.h"
 #include "util/CudaCheck.h"
@@ -34,17 +35,45 @@ void CUDABackend::buildAccelerationStructure(const Scene& scene) {
     SAH_BVH builder;
     BVHData bvhData = builder.build(hostPositions.data(), hostIndices.data(), data.totalTriangles);
 
-    // The BVH reorders primitives. We need to reorder the device index buffer
-    // and material indices to match the BVH's orderedPrimIndices.
+    // The BVH reorders primitives. We need to reorder the device index buffer,
+    // material indices, and area light indices to match the BVH's orderedPrimIndices.
     std::vector<uint32_t> reorderedIndices(data.totalTriangles * 3);
     std::vector<int>      reorderedMatIndices(data.totalTriangles);
+    std::vector<int>      reorderedAreaLightIndices(data.totalTriangles);
 
-    // Build host material index array (same order as DeviceScene)
+    // Build host material index and area light index arrays (same order as DeviceScene)
     std::vector<int> hostMatIndices;
+    std::vector<int> hostAreaLightIndices;
+    const auto& materials = scene.getMaterials();
+    const auto& areaLights = scene.getAreaLights();
+    uint32_t areaLightIdx = 0;
     for (auto& mesh : meshes) {
+        const auto& mat = materials[(size_t)mesh.materialIndex];
+        bool emissiveMesh = mat.emissionStrength > 0.0f &&
+                            (mat.emission.x > 0.0f || mat.emission.y > 0.0f || mat.emission.z > 0.0f);
+
         uint32_t triCount = (uint32_t)mesh.indices.size() / 3;
-        for (uint32_t t = 0; t < triCount; t++)
+        for (uint32_t t = 0; t < triCount; t++) {
             hostMatIndices.push_back(mesh.materialIndex);
+            if (emissiveMesh && areaLightIdx < (uint32_t)areaLights.size()) {
+                uint32_t li0 = mesh.indices[t * 3 + 0];
+                uint32_t li1 = mesh.indices[t * 3 + 1];
+                uint32_t li2 = mesh.indices[t * 3 + 2];
+                float3 lv0 = mesh.positions[li0];
+                float3 lv1 = mesh.positions[li1];
+                float3 lv2 = mesh.positions[li2];
+                float3 le1 = lv1 - lv0;
+                float3 le2 = lv2 - lv0;
+                float triArea = 0.5f * length(cross(le1, le2));
+                if (triArea > 1e-8f) {
+                    hostAreaLightIndices.push_back((int)areaLightIdx++);
+                } else {
+                    hostAreaLightIndices.push_back(-1);
+                }
+            } else {
+                hostAreaLightIndices.push_back(-1);
+            }
+        }
     }
 
     for (uint32_t i = 0; i < (uint32_t)bvhData.orderedPrimIndices.size(); i++) {
@@ -53,13 +82,18 @@ void CUDABackend::buildAccelerationStructure(const Scene& scene) {
         reorderedIndices[i*3+1] = hostIndices[origTri*3+1];
         reorderedIndices[i*3+2] = hostIndices[origTri*3+2];
         reorderedMatIndices[i]  = hostMatIndices[origTri];
+        reorderedAreaLightIndices[i] = hostAreaLightIndices[origTri];
     }
 
-    // Re-upload reordered indices and material indices
+    // Re-upload reordered indices, material indices, and area light indices
     CUDA_CHECK(cudaMemcpy(data.d_indices, reorderedIndices.data(),
                            data.totalTriangles * 3 * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(data.d_materialIndices, reorderedMatIndices.data(),
                            data.totalTriangles * sizeof(int), cudaMemcpyHostToDevice));
+    if (data.d_triangleAreaLightIndex) {
+        CUDA_CHECK(cudaMemcpy(data.d_triangleAreaLightIndex, reorderedAreaLightIndices.data(),
+                               data.totalTriangles * sizeof(int), cudaMemcpyHostToDevice));
+    }
 
     // Upload BVH nodes
     BVHNode* d_nodes = nullptr;

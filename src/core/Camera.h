@@ -35,11 +35,14 @@ struct InputState {
 class Camera {
 public:
     void init(float3 pos, float3 target, float fovDeg, float aspect);
+    void init(float3 pos, float3 forward, float3 up, float fovDeg, float aspect);
     void update(float dt, const InputState& input);
+    void setFovDeg(float fovDeg);
+    void setClipPlanes(float nearPlane, float farPlane);
 
     CameraParams getParams(uint32_t frameIndex) const;
     bool hasMoved() const { return m_moved; }
-    void setAspect(float a) { m_aspect = a; }
+    void setAspect(float a);
 
     float3 getPosition() const { return m_position; }
     float  getFovDeg() const { return m_fovDeg; }

@@ -13,6 +13,20 @@ inline D float pcg32_float(uint32_t& state) {
     return (float)pcg32(state) / 4294967296.0f;
 }
 
+// Jenkins hash for thorough bit mixing
+inline D uint32_t jenkinsHash(uint32_t x) {
+    x += (x << 10u);
+    x ^= (x >> 6u);
+    x += (x << 3u);
+    x ^= (x >> 11u);
+    x += (x << 15u);
+    return x;
+}
+
 inline D uint32_t pcg32_seed(uint32_t pixelIndex, uint32_t frameIndex) {
-    return pixelIndex * 1973u + frameIndex * 9277u + 6133u;
+    uint32_t seed = jenkinsHash(pixelIndex ^ jenkinsHash(frameIndex));
+    // Warm up: advance a few steps so initial states are well-separated
+    pcg32(seed);
+    pcg32(seed);
+    return seed;
 }

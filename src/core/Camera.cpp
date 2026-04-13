@@ -19,6 +19,48 @@ void Camera::init(float3 pos, float3 target, float fovDeg, float aspect) {
     m_prevViewProj = mat4_multiply(m_projMatrix, m_viewMatrix);
 }
 
+void Camera::init(float3 pos, float3 forward, float3 up, float fovDeg, float aspect) {
+    m_position = pos;
+    m_fovDeg = fovDeg;
+    m_aspect = aspect;
+
+    m_forward = normalize(forward);
+    m_right = normalize(cross(m_forward, up));
+    if (length(m_right) <= 1e-6f) {
+        m_right = make_float3(1, 0, 0);
+    }
+    m_up = normalize(cross(m_right, m_forward));
+    if (length(m_up) <= 1e-6f) {
+        m_up = make_float3(0, 1, 0);
+    }
+
+    m_yaw   = atan2f(m_forward.z, m_forward.x) * 180.0f / (float)M_PI;
+    m_pitch = asinf(clampf(m_forward.y, -0.999f, 0.999f)) * 180.0f / (float)M_PI;
+
+    m_viewMatrix = mat4_lookAt(m_position, m_position + m_forward, m_up);
+    m_projMatrix = mat4_perspective(m_fovDeg * (float)M_PI / 180.0f, m_aspect, m_nearPlane, m_farPlane);
+    m_prevViewProj = mat4_multiply(m_projMatrix, m_viewMatrix);
+}
+
+void Camera::setFovDeg(float fovDeg) {
+    m_fovDeg = clampf(fovDeg, 5.0f, 120.0f);
+    rebuildMatrices();
+    m_moved = true;
+}
+
+void Camera::setClipPlanes(float nearPlane, float farPlane) {
+    m_nearPlane = fmaxf(1e-4f, nearPlane);
+    m_farPlane = fmaxf(m_nearPlane + 1e-4f, farPlane);
+    rebuildMatrices();
+    m_moved = true;
+}
+
+void Camera::setAspect(float a) {
+    m_aspect = a;
+    rebuildMatrices();
+    m_moved = true;
+}
+
 void Camera::update(float dt, const InputState& input) {
     m_moved = false;
     float speed = m_moveSpeed * dt;
