@@ -21,6 +21,7 @@ struct DeviceSceneData {
     float*       d_areaLightCDF    = nullptr;
     uint32_t     areaLightCount    = 0;
     float        areaLightTotalWeight = 0.0f;
+    int*         d_triangleAreaLightIndex = nullptr;
     BVHNode*     d_bvhNodes        = nullptr;
     uint32_t     bvhRootIndex      = 0;
 };

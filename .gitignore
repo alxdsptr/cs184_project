@@ -13,3 +13,4 @@ assets/**/*.bin
 assets/**/*.png
 assets/**/*.jpg
 .claude
+screenshots/

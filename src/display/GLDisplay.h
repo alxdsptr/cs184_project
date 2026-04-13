@@ -1,6 +1,7 @@
 #pragma once
 #include "display/DisplayBackend.h"
 #include <cstdint>
+#include <string>
 
 struct cudaGraphicsResource;
 
@@ -11,6 +12,7 @@ public:
     void* mapForCUDA() override;
     void unmapFromCUDA() override;
     void present() override;
+    bool saveToPNG(const std::string& path) const;
     void shutdown() override;
 
 private:

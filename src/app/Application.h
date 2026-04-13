@@ -49,6 +49,7 @@ private:
     double m_lastMouseY = 0.0;
     bool   m_firstMouse = true;
 
-    bool m_enableEnvironment = true;
+    bool m_enableEnvironment = false;
     bool m_invertMouseY = false;
+    bool m_prevF12Down = false;
 };

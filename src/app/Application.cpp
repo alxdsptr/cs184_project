@@ -7,6 +7,10 @@
 #include <GLFW/glfw3.h>
 #include <cuda_runtime.h>
 
+#include <filesystem>
+#include <iomanip>
+#include <sstream>
+
 static void glfwErrorCb(int code, const char* msg) {
     LOG_ERROR("GLFW [%d]: %s", code, msg);
 }
@@ -54,6 +58,8 @@ bool Application::init(uint32_t width, uint32_t height, const std::string& title
         60.0f,
         (float)width / height
     );
+
+    m_enableEnvironment = false;
 
     m_lastFrameTime = (float)glfwGetTime();
     LOG_INFO("Application initialized (%ux%u)", width, height);
@@ -156,6 +162,10 @@ void Application::run() {
         if (glfwGetKey(m_window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
             glfwSetWindowShouldClose(m_window, true);
 
+        bool f12Down = glfwGetKey(m_window, GLFW_KEY_F12) == GLFW_PRESS;
+        bool saveScreenshot = f12Down && !m_prevF12Down;
+        m_prevF12Down = f12Down;
+
         // ── Render ─────────────────────────────────────────
         uchar4* d_pbo = (uchar4*)m_display.mapForCUDA();
 
@@ -173,6 +183,17 @@ void Application::run() {
         // Display
         glClear(GL_COLOR_BUFFER_BIT);
         m_display.present();
+
+        if (saveScreenshot && m_sceneLoaded) {
+            std::filesystem::create_directories("screenshots");
+            std::ostringstream name;
+            name << "screenshots/frame_" << std::setw(6) << std::setfill('0') << m_frameIndex << ".png";
+            if (m_display.saveToPNG(name.str())) {
+                LOG_INFO("Saved screenshot: %s", name.str().c_str());
+            } else {
+                LOG_ERROR("Failed to save screenshot: %s", name.str().c_str());
+            }
+        }
 
         // GUI overlay
         m_gui.beginFrame();

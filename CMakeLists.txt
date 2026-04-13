@@ -67,6 +67,7 @@ target_include_directories(pathtracer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/assimp/include
     ${CMAKE_BINARY_DIR}/assimp/include
     ${CMAKE_CURRENT_SOURCE_DIR}/assimp/contrib/stb
+    ${CMAKE_BINARY_DIR}/_deps/glfw-src/deps
 )
 
 target_link_libraries(pathtracer PRIVATE

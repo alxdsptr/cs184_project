@@ -3,11 +3,16 @@
 #include "util/CudaCheck.h"
 #include "util/Log.h"
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
+
 #include <GL/glew.h>
 #include <cuda_gl_interop.h>
 
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <vector>
 
 // ── Shader compilation helper ────────────────────────────────
 static unsigned int compileShader(unsigned int type, const char* src) {
@@ -101,6 +106,24 @@ void GLDisplay::present() {
     glBindTexture(GL_TEXTURE_2D, m_texture);
     glBindVertexArray(m_vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+bool GLDisplay::saveToPNG(const std::string& path) const {
+    if (m_pbo == 0 || m_width == 0 || m_height == 0) {
+        return false;
+    }
+
+    std::filesystem::path filePath(path);
+    if (filePath.has_parent_path()) {
+        std::filesystem::create_directories(filePath.parent_path());
+    }
+
+    std::vector<unsigned char> pixels((size_t)m_width * m_height * 4);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_pbo);
+    glGetBufferSubData(GL_PIXEL_UNPACK_BUFFER, 0, (GLsizeiptr)pixels.size(), pixels.data());
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+    return stbi_write_png(path.c_str(), (int)m_width, (int)m_height, 4, pixels.data(), (int)m_width * 4) != 0;
 }
 
 void GLDisplay::createShaderProgram() {

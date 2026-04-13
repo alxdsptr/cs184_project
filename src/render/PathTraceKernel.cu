@@ -71,6 +71,78 @@ __device__ inline float smithG1_local(float NdotX, float roughness) {
     return NdotX / (NdotX * (1.0f - k) + k + 1e-7f);
 }
 
+__device__ inline float powerHeuristic(float pdfA, float pdfB) {
+    float a2 = pdfA * pdfA;
+    float b2 = pdfB * pdfB;
+    return a2 / fmaxf(a2 + b2, 1e-7f);
+}
+
+__device__ inline float bsdfDiffusePdf(float NdotL) {
+    return fmaxf(NdotL, 0.0f) * (1.0f / M_PI_F);
+}
+
+__device__ inline float bsdfSpecularPdf(
+    const float3& N,
+    const float3& V,
+    const float3& L,
+    float roughness)
+{
+    float3 H = normalize(V + L);
+    float NdotH = fmaxf(dot(N, H), 0.0f);
+    float VdotH = fmaxf(dot(V, H), 0.0f);
+    if (NdotH <= 0.0f || VdotH <= 0.0f) {
+        return 0.0f;
+    }
+
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float denom = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
+    float D_val = a2 / (M_PI_F * denom * denom + 1e-7f);
+    return D_val * NdotH / (4.0f * VdotH + 1e-7f);
+}
+
+__device__ inline float bsdfMixturePdf(
+    const float3& N,
+    const float3& V,
+    const float3& L,
+    float roughness,
+    float metallic)
+{
+    float specProb = 0.5f * (1.0f + metallic);
+    float diffusePdf = bsdfDiffusePdf(dot(N, L));
+    float specPdf = bsdfSpecularPdf(N, V, L, roughness);
+    return specProb * specPdf + (1.0f - specProb) * diffusePdf;
+}
+
+__device__ inline float3 bsdfEvaluate(
+    const float3& N,
+    const float3& V,
+    const float3& L,
+    const float3& albedo,
+    float roughness,
+    float metallic)
+{
+    float NdotL = fmaxf(dot(N, L), 0.0f);
+    float NdotV = fmaxf(dot(N, V), 0.0f);
+    if (NdotL <= 0.0f || NdotV <= 0.0f) {
+        return make_float3(0.0f, 0.0f, 0.0f);
+    }
+
+    float3 H = normalize(V + L);
+    float NdotH = fmaxf(dot(N, H), 0.0f);
+    float LdotH = fmaxf(dot(L, H), 0.0f);
+
+    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, metallic);
+    float3 F = fresnelSchlick_local(LdotH, F0);
+    float D_val = ggxD_local(NdotH, roughness);
+    float G_val = smithG1_local(NdotL, roughness) * smithG1_local(NdotV, roughness);
+
+    float3 specular = F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
+    float3 kd = (make_float3(1, 1, 1) - F) * (1.0f - metallic);
+    float3 diffuse = kd * albedo * (1.0f / M_PI_F);
+    return diffuse + specular;
+}
+
 __device__ inline uint32_t sampleAreaLightIndex(
     const float* cdf,
     uint32_t count,
@@ -124,6 +196,9 @@ __global__ void pathTraceKernel(
     float3 radiance   = make_float3(0, 0, 0);
     bool firstBounce  = true;
     bool lastBounceSpecular = false;
+    bool havePrevSurface = false;
+    float3 prevSurfacePos = make_float3(0.0f, 0.0f, 0.0f);
+    float prevBsdfPdf = 1.0f;
 
     for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
         HitRecord hit;
@@ -202,9 +277,28 @@ __global__ void pathTraceKernel(
         bool isEmissive = mat.emissionStrength > 0.0f &&
                           (mat.emission.x > 0.0f || mat.emission.y > 0.0f || mat.emission.z > 0.0f);
         if (isEmissive) {
-            if (bounce == 0 || lastBounceSpecular) {
-                radiance += throughput * mat.emission * mat.emissionStrength;
+            float3 Le = mat.emission * mat.emissionStrength;
+            float weight = 1.0f;
+
+            if (bounce > 0 && havePrevSurface && !lastBounceSpecular && scene.d_triangleAreaLightIndex) {
+                int areaLightIndex = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
+                if (areaLightIndex >= 0 && scene.d_areaLights && scene.areaLightCount > 0) {
+                    GPUAreaLight light = scene.d_areaLights[areaLightIndex];
+                    float3 toLight = hit.position - prevSurfacePos;
+                    float dist2 = fmaxf(dot(toLight, toLight), 1e-6f);
+                    float3 wi = normalize(toLight);
+                    float lightNdot = fmaxf(dot(light.normal, -wi), 0.0f);
+                    if (lightNdot > 0.0f) {
+                        float pTri = light.weight / fmaxf(scene.areaLightTotalWeight, 1e-7f);
+                        float pArea = pTri / fmaxf(light.area, 1e-7f);
+                        float pLight = pArea * dist2 / fmaxf(lightNdot, 1e-7f);
+                        float pBsdf = prevBsdfPdf;
+                        weight = powerHeuristic(pBsdf, pLight);
+                    }
+                }
             }
+
+            radiance += throughput * Le * weight;
             break;
         }
 
@@ -259,26 +353,16 @@ __global__ void pathTraceKernel(
                     float pdfOmega = pArea * dist2 / fmaxf(lightNdot, 1e-7f);
 
                     float3 V = -ray.direction;
-                    float3 H = normalize(V + Ld);
-                    float NdotV = fmaxf(dot(N, V), 0.0f);
-                    float NdotH = fmaxf(dot(N, H), 0.0f);
-                    float LdotH = fmaxf(dot(Ld, H), 0.0f);
-                    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, mat.metallic);
-                    float3 F = fresnelSchlick_local(LdotH, F0);
-                    float D_val = ggxD_local(NdotH, mat.roughness);
-                    float G_val = smithG1_local(NdotL, mat.roughness) * smithG1_local(NdotV, mat.roughness);
-                    float3 specular = F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
-                    float3 kd = (make_float3(1,1,1) - F) * (1.0f - mat.metallic);
-                    float3 diffuse = kd * albedo * (1.0f / M_PI_F);
-                    float3 brdf = diffuse + specular;
+                    float3 brdf = bsdfEvaluate(N, V, Ld, albedo, mat.roughness, mat.metallic);
+                    float pdfBsdf = bsdfMixturePdf(N, V, Ld, mat.roughness, mat.metallic);
+                    float weight = powerHeuristic(pdfOmega, pdfBsdf);
 
-                    radiance += throughput * brdf * light.emission * (NdotL / fmaxf(pdfOmega, 1e-7f));
+                    radiance += throughput * brdf * light.emission * (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
                 }
             }
         } else if (scene.d_pointLights && scene.pointLightCount > 0) {
             float3 direct = make_float3(0.0f, 0.0f, 0.0f);
             float3 V = -ray.direction;
-            float3 kdBase = albedo * (1.0f - mat.metallic);
 
             for (uint32_t li = 0; li < scene.pointLightCount; li++) {
                 GPUPointLight light = scene.d_pointLights[li];
@@ -314,19 +398,7 @@ __global__ void pathTraceKernel(
                                + light.quadraticAttenuation * dist2;
                 float attenuation = 1.0f / fmaxf(attenDen, 1e-4f);
                 float3 Li = light.color * (light.intensity * attenuation);
-
-                float3 H = normalize(V + Ld);
-                float NdotV = fmaxf(dot(N, V), 0.0f);
-                float NdotH = fmaxf(dot(N, H), 0.0f);
-                float LdotH = fmaxf(dot(Ld, H), 0.0f);
-                float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, mat.metallic);
-                float3 F = fresnelSchlick_local(LdotH, F0);
-                float D_val = ggxD_local(NdotH, mat.roughness);
-                float G_val = smithG1_local(NdotL, mat.roughness) * smithG1_local(NdotV, mat.roughness);
-                float3 specular = F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
-                float3 kd = (make_float3(1,1,1) - F) * (1.0f - mat.metallic);
-                float3 diffuse = kd * albedo * (1.0f / M_PI_F);
-                float3 brdf = diffuse + specular;
+                float3 brdf = bsdfEvaluate(N, V, Ld, albedo, mat.roughness, mat.metallic);
 
                 direct += brdf * Li * NdotL;
             }
@@ -396,6 +468,10 @@ __global__ void pathTraceKernel(
         float3 brdf = (diffuse + specular) * NdotL;
 
         throughput = throughput * brdf * (1.0f / (pdf + 1e-7f));
+
+        prevSurfacePos = hit.position;
+        prevBsdfPdf = pdf;
+        havePrevSurface = true;
 
         // Russian roulette after bounce 3
         if (bounce >= 3) {

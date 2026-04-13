@@ -30,15 +30,22 @@ void DeviceScene::upload(const Scene& scene) {
     std::vector<float2>   allUVs;
     std::vector<uint32_t> allIndices;
     std::vector<int>      allMatIndices; // per-triangle
+    std::vector<int>      allAreaLightIndices; // per-triangle
 
     allPositions.reserve(totalVerts);
     allNormals.reserve(totalVerts);
     allUVs.reserve(totalVerts);
     allIndices.reserve(totalTris * 3);
     allMatIndices.reserve(totalTris);
+    allAreaLightIndices.reserve(totalTris);
 
     uint32_t vertexOffset = 0;
+    uint32_t areaLightIndex = 0;
     for (auto& mesh : meshes) {
+        const auto& mat = materials[(size_t)mesh.materialIndex];
+        bool emissiveMesh = mat.emissionStrength > 0.0f &&
+                            (mat.emission.x > 0.0f || mat.emission.y > 0.0f || mat.emission.z > 0.0f);
+
         for (auto& p : mesh.positions) allPositions.push_back(p);
 
         if (!mesh.normals.empty()) {
@@ -58,8 +65,14 @@ void DeviceScene::upload(const Scene& scene) {
         uint32_t triCount = (uint32_t)mesh.indices.size() / 3;
         for (auto idx : mesh.indices)
             allIndices.push_back(idx + vertexOffset);
-        for (uint32_t t = 0; t < triCount; t++)
+        for (uint32_t t = 0; t < triCount; t++) {
             allMatIndices.push_back(mesh.materialIndex);
+            if (emissiveMesh && areaLightIndex < areaLights.size()) {
+                allAreaLightIndices.push_back((int)areaLightIndex++);
+            } else {
+                allAreaLightIndices.push_back(-1);
+            }
+        }
 
         vertexOffset += (uint32_t)mesh.positions.size();
     }
@@ -87,6 +100,10 @@ void DeviceScene::upload(const Scene& scene) {
     // Upload per-triangle material indices
     CUDA_CHECK(cudaMalloc(&m_data.d_materialIndices, totalTris * sizeof(int)));
     CUDA_CHECK(cudaMemcpy(m_data.d_materialIndices, allMatIndices.data(),
+                           totalTris * sizeof(int), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMalloc(&m_data.d_triangleAreaLightIndex, totalTris * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(m_data.d_triangleAreaLightIndex, allAreaLightIndices.data(),
                            totalTris * sizeof(int), cudaMemcpyHostToDevice));
 
     // Upload materials (convert PBRMaterial -> GPUMaterial)
@@ -176,6 +193,7 @@ void DeviceScene::free() {
     if (m_data.d_pointLights)     { cudaFree(m_data.d_pointLights); }
     if (m_data.d_areaLights)      { cudaFree(m_data.d_areaLights); }
     if (m_data.d_areaLightCDF)    { cudaFree(m_data.d_areaLightCDF); }
+    if (m_data.d_triangleAreaLightIndex) { cudaFree(m_data.d_triangleAreaLightIndex); }
     if (m_data.d_bvhNodes)        { cudaFree(m_data.d_bvhNodes); }
     m_data = DeviceSceneData{};
 }
