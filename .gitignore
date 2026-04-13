@@ -1,0 +1,14 @@
+build/
+out/
+.vs/
+.vscode/
+*.user
+CMakeSettings.json
+assets/*.glb
+assets/*.gltf
+assets/*.obj
+assets/*.hdr
+assets/**/*.bin
+assets/**/*.png
+assets/**/*.jpg
+.claude
