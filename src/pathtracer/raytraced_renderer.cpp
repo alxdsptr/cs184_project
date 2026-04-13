@@ -668,14 +668,14 @@ void RaytracedRenderer::worker_thread() {
     }
   }
 
-  workerDoneCount++;
-  if (!continueRaytracing && workerDoneCount == numWorkerThreads) {
+  int finished = ++workerDoneCount;
+  if (!continueRaytracing && finished == numWorkerThreads) {
     timer.stop();
     fprintf(stdout, "\n[PathTracer] Rendering canceled!\n");
     state = READY;
   }
 
-  if (continueRaytracing && workerDoneCount == numWorkerThreads) {
+  if (continueRaytracing && finished == numWorkerThreads) {
     timer.stop();
     fprintf(stdout, "\r[PathTracer] Rendering... 100%%! (%.4fs)\n", timer.duration());
     fprintf(stdout, "[PathTracer] BVH traced %llu rays.\n", bvh->total_rays);
