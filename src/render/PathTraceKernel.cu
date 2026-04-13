@@ -64,8 +64,8 @@ __device__ inline float3 fresnelSchlick_local(float cosTheta, float3 F0) {
 }
 
 __device__ inline float smithG1_local(float NdotX, float roughness) {
-    float r = roughness + 1.0f;
-    float k = (r * r) / 8.0f;
+    float a = roughness * roughness;
+    float k = a * 0.5f;
     return NdotX / (NdotX * (1.0f - k) + k + 1e-7f);
 }
 
@@ -99,14 +99,31 @@ __device__ inline float bsdfSpecularPdf(
     return D_val * NdotH / (4.0f * VdotH + 1e-7f);
 }
 
+__device__ inline float computeSpecProb(
+    const float3& N,
+    const float3& V,
+    const float3& albedo,
+    float metallic)
+{
+    float NdotV = fmaxf(dot(N, V), 0.0f);
+    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, metallic);
+    float t = 1.0f - fminf(fmaxf(NdotV, 0.0f), 1.0f);
+    float t5 = t*t*t*t*t;
+    float3 F = F0 + (make_float3(1,1,1) - F0) * t5;
+    float specW = 0.2126f * F.x + 0.7152f * F.y + 0.0722f * F.z;
+    float3 kd = (make_float3(1,1,1) - F) * (1.0f - metallic);
+    float diffW = 0.2126f * (kd.x * albedo.x) + 0.7152f * (kd.y * albedo.y) + 0.0722f * (kd.z * albedo.z);
+    float p = specW / fmaxf(specW + diffW, 1e-7f);
+    return fminf(fmaxf(p, 0.1f), 0.9f);
+}
+
 __device__ inline float bsdfMixturePdf(
     const float3& N,
     const float3& V,
     const float3& L,
     float roughness,
-    float metallic)
+    float specProb)
 {
-    float specProb = 0.5f * (1.0f + metallic);
     float diffusePdf = bsdfDiffusePdf(dot(N, L));
     float specPdf = bsdfSpecularPdf(N, V, L, roughness);
     return specProb * specPdf + (1.0f - specProb) * diffusePdf;
@@ -368,7 +385,8 @@ __global__ void pathTraceKernel(
 
                     float3 V = -ray.direction;
                     float3 brdf = bsdfEvaluate(N, V, Ld, albedo, mat.roughness, mat.metallic);
-                    float pdfBsdf = bsdfMixturePdf(N, V, Ld, mat.roughness, mat.metallic);
+                    float neeSpecProb = computeSpecProb(N, V, albedo, mat.metallic);
+                    float pdfBsdf = bsdfMixturePdf(N, V, Ld, mat.roughness, neeSpecProb);
                     float weight = powerHeuristic(pdfOmega, pdfBsdf);
 
                     radiance += throughput * brdf * light.emission * (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
@@ -420,9 +438,9 @@ __global__ void pathTraceKernel(
             radiance += throughput * direct;
         }
 
-        // BRDF sampling: metallic blend between diffuse and specular
-        float specProb = 0.5f * (1.0f + mat.metallic);
+        // BRDF sampling: Fresnel-weighted blend between diffuse and specular
         float3 V = -ray.direction;
+        float specProb = computeSpecProb(N, V, albedo, mat.metallic);
 
         float3 newDir;
 
@@ -459,7 +477,7 @@ __global__ void pathTraceKernel(
         if (NdotL_new < 1e-6f) break;
 
         // Compute full mixture PDF for the sampled direction
-        float pdf = bsdfMixturePdf(N, V, newDir, mat.roughness, mat.metallic);
+        float pdf = bsdfMixturePdf(N, V, newDir, mat.roughness, specProb);
         if (pdf < 1e-7f) break;
 
         // Evaluate BRDF
@@ -492,7 +510,7 @@ __global__ void pathTraceKernel(
         radiance = make_float3(0.0f, 0.0f, 0.0f);
     }
     float luminance = 0.2126f * radiance.x + 0.7152f * radiance.y + 0.0722f * radiance.z;
-    float clampMax = 100.0f;
+    float clampMax = 1000.0f;
     if (luminance > clampMax) {
         float scale = clampMax / luminance;
         radiance = radiance * scale;
