@@ -53,7 +53,19 @@ void GLDisplay::createPBO() {
     glBufferData(GL_PIXEL_UNPACK_BUFFER, m_width * m_height * 4, nullptr, GL_DYNAMIC_DRAW);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
-    CUDA_CHECK(cudaGraphicsGLRegisterBuffer(&m_cudaResource, m_pbo, cudaGraphicsRegisterFlagsWriteDiscard));
+    // Attempt CUDA Registration
+    cudaError_t err = cudaGraphicsGLRegisterBuffer(&m_cudaResource, m_pbo, cudaGraphicsRegisterFlagsWriteDiscard);
+    
+    if (err == cudaSuccess) {
+        m_usePBO = true;
+    } else {
+        // Fallback: Clear CUDA error and allocate manual buffers.
+        m_usePBO = false;
+        cudaGetLastError(); 
+        cudaMalloc(&m_fallbackDevicePtr, m_width * m_height * 4);
+        cudaMallocHost(&m_fallbackHostPtr, m_width * m_height * 4);
+        LOG_WARN("PBO Interop failed. Using CPU fallback path.");
+    }
 }
 
 void GLDisplay::destroyPBO() {
@@ -65,6 +77,9 @@ void GLDisplay::destroyPBO() {
         glDeleteBuffers(1, &m_pbo);
         m_pbo = 0;
     }
+    // Clean up fallback buffers
+    if (m_fallbackDevicePtr) { cudaFree(m_fallbackDevicePtr); m_fallbackDevicePtr = nullptr; }
+    if (m_fallbackHostPtr) { cudaFreeHost(m_fallbackHostPtr); m_fallbackHostPtr = nullptr; }    
 }
 
 void GLDisplay::resize(uint32_t width, uint32_t height) {
@@ -81,23 +96,36 @@ void GLDisplay::resize(uint32_t width, uint32_t height) {
 }
 
 void* GLDisplay::mapForCUDA() {
-    void* devPtr = nullptr;
-    size_t size  = 0;
-    CUDA_CHECK(cudaGraphicsMapResources(1, &m_cudaResource, 0));
-    CUDA_CHECK(cudaGraphicsResourceGetMappedPointer(&devPtr, &size, m_cudaResource));
-    return devPtr;
+    if (m_usePBO) {
+        void* devPtr = nullptr;
+        size_t size  = 0;
+        CUDA_CHECK(cudaGraphicsMapResources(1, &m_cudaResource, 0));
+        CUDA_CHECK(cudaGraphicsResourceGetMappedPointer(&devPtr, &size, m_cudaResource));
+        return devPtr;
+    } else {
+        return m_fallbackDevicePtr;
+    }
 }
 
 void GLDisplay::unmapFromCUDA() {
-    CUDA_CHECK(cudaGraphicsUnmapResources(1, &m_cudaResource, 0));
+    if (m_usePBO) {
+        CUDA_CHECK(cudaGraphicsUnmapResources(1, &m_cudaResource, 0));
+    }
 }
 
 void GLDisplay::present() {
-    // Copy PBO data into texture
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_pbo);
-    glBindTexture(GL_TEXTURE_2D, m_texture);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_width, m_height, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    if (m_usePBO) {
+        // Copy PBO data into texture
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_pbo);
+        glBindTexture(GL_TEXTURE_2D, m_texture);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_width, m_height, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    } else {
+        // Manual fallback: Device -> Host -> Texture
+        CUDA_CHECK(cudaMemcpy(m_fallbackHostPtr, m_fallbackDevicePtr, m_width * m_height * 4, cudaMemcpyDeviceToHost));
+        glBindTexture(GL_TEXTURE_2D, m_texture);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_width, m_height, GL_RGBA, GL_UNSIGNED_BYTE, m_fallbackHostPtr);
+    }
 
     // Draw fullscreen triangle
     glDisable(GL_DEPTH_TEST);
@@ -109,9 +137,9 @@ void GLDisplay::present() {
 }
 
 bool GLDisplay::saveToPNG(const std::string& path) const {
-    if (m_pbo == 0 || m_width == 0 || m_height == 0) {
+    if (m_width == 0 || m_height == 0) return false;
+    if (m_usePBO ? m_pbo == 0 : m_fallbackDevicePtr == NULL)
         return false;
-    }
 
     std::filesystem::path filePath(path);
     if (filePath.has_parent_path()) {
@@ -119,9 +147,14 @@ bool GLDisplay::saveToPNG(const std::string& path) const {
     }
 
     std::vector<unsigned char> pixels((size_t)m_width * m_height * 4);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_pbo);
-    glGetBufferSubData(GL_PIXEL_UNPACK_BUFFER, 0, (GLsizeiptr)pixels.size(), pixels.data());
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+    if (m_usePBO) {
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_pbo);
+        glGetBufferSubData(GL_PIXEL_UNPACK_BUFFER, 0, (GLsizeiptr)pixels.size(), pixels.data());
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    } else {
+        CUDA_CHECK(cudaMemcpy(pixels.data(), m_fallbackDevicePtr, pixels.size(), cudaMemcpyDeviceToHost));
+    }
 
     return stbi_write_png(path.c_str(), (int)m_width, (int)m_height, 4, pixels.data(), (int)m_width * 4) != 0;
 }

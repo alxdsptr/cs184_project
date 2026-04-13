@@ -31,4 +31,9 @@ private:
 
     // CUDA interop
     cudaGraphicsResource* m_cudaResource = nullptr;
+
+    // Fallback resources for when PBO is not supported
+    bool m_usePBO = false;
+    void* m_fallbackDevicePtr = nullptr;
+    uint32_t* m_fallbackHostPtr = nullptr;
 };

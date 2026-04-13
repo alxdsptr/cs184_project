@@ -486,7 +486,7 @@ __global__ void pathTraceKernel(
         throughput = throughput * brdf * (NdotL_new / (pdf + 1e-7f));
 
         prevSurfacePos = hit.position;
-        prevBsdfPdf = pdf;
+            prevBsdfPdf = pdf;
         havePrevSurface = true;
 
         // Russian roulette
