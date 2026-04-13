@@ -22,6 +22,7 @@ public:
     void setHeadlessOutput(const std::string& outputPath, uint32_t sampleCount);
 
 private:
+    static void glfwScrollCallback(GLFWwindow* window, double xoffset, double yoffset);
     void processInput();
     void runGui();
     void runHeadless();
@@ -60,6 +61,7 @@ private:
     bool m_prevF12Down = false;
     uint32_t m_maxBounces = 8;
     bool m_guiEnabled = true;
+    double m_pendingScrollY = 0.0;
     std::string m_headlessOutputPath;
     uint32_t m_targetSamples = 1;
     double m_headlessRenderMs = 0.0;
