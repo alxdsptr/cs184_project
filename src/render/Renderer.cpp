@@ -47,7 +47,8 @@ void Renderer::renderFrame(
         m_accumBuffer.getOutputBuffer(),
         d_ldrOutput,
         m_width, m_height,
-        m_exposure
+        m_exposure,
+        m_toneMappingMode
     );
 
     m_accumBuffer.incrementSamples();

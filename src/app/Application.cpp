@@ -413,6 +413,8 @@ void Application::runGui() {
         m_gui.beginFrame();
         bool envMapLoadRequested = false;
         float moveSpeed = m_camera.getMoveSpeed();
+        float exposure = m_renderer.getExposure();
+        int toneMappingMode = (int)m_renderer.getToneMappingMode();
         bool envChanged = m_gui.render(
             m_fps,
             m_renderer.getSampleCount(),
@@ -421,11 +423,21 @@ void Application::runGui() {
             m_enableEnvironment,
             m_invertMouseY,
             m_maxBounces,
+            exposure,
+            toneMappingMode,
             moveSpeed,
             m_envMapPathBuf,
             sizeof(m_envMapPathBuf),
             envMapLoadRequested);
         m_camera.setMoveSpeed(moveSpeed);
+        m_renderer.setExposure(exposure);
+        if (toneMappingMode < (int)ToneMappingMode::None) {
+            toneMappingMode = (int)ToneMappingMode::None;
+        }
+        if (toneMappingMode > (int)ToneMappingMode::ACES) {
+            toneMappingMode = (int)ToneMappingMode::ACES;
+        }
+        m_renderer.setToneMappingMode((ToneMappingMode)toneMappingMode);
         if (envMapLoadRequested) {
             loadEnvMap(std::string(m_envMapPathBuf));
             m_renderer.resetAccumulation();

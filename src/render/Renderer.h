@@ -1,6 +1,7 @@
 #pragma once
 #include "render/AccumulationBuffer.h"
 #include "render/AuxBuffers.h"
+#include "render/Tonemapping.h"
 #include "core/Camera.h"
 #include "gpu/DeviceScene.h"
 #include <cstdint>
@@ -24,6 +25,10 @@ public:
     );
 
     uint32_t getSampleCount() const { return m_accumBuffer.getSampleCount(); }
+    float getExposure() const { return m_exposure; }
+    void setExposure(float exposure) { m_exposure = exposure; }
+    ToneMappingMode getToneMappingMode() const { return m_toneMappingMode; }
+    void setToneMappingMode(ToneMappingMode mode) { m_toneMappingMode = mode; }
     void shutdown();
 
 private:
@@ -31,4 +36,5 @@ private:
     AuxBuffers         m_auxBuffers;
     uint32_t m_width = 0, m_height = 0;
     float    m_exposure = 1.0f;
+    ToneMappingMode m_toneMappingMode = ToneMappingMode::ACES;
 };

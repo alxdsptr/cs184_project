@@ -12,6 +12,14 @@ __device__ inline float3 acesTonemap(float3 x) {
     );
 }
 
+__device__ inline float3 reinhardTonemap(float3 x) {
+    return make_float3(
+        x.x / (1.0f + x.x),
+        x.y / (1.0f + x.y),
+        x.z / (1.0f + x.z)
+    );
+}
+
 // Linear to sRGB gamma
 __device__ inline float linearToSRGB(float x) {
     return (x <= 0.0031308f) ? x * 12.92f : 1.055f * powf(x, 1.0f/2.4f) - 0.055f;
@@ -22,7 +30,8 @@ __global__ void tonemapKernel(
     uchar4* d_ldrOutput,
     uint32_t width,
     uint32_t height,
-    float exposure)
+    float exposure,
+    ToneMappingMode mode)
 {
     uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -34,8 +43,11 @@ __global__ void tonemapKernel(
     // Exposure
     float3 color = make_float3(hdr.x, hdr.y, hdr.z) * exposure;
 
-    // ACES tonemap
-    color = acesTonemap(color);
+    if (mode == ToneMappingMode::Reinhard) {
+        color = reinhardTonemap(color);
+    } else if (mode == ToneMappingMode::ACES) {
+        color = acesTonemap(color);
+    }
 
     // sRGB gamma
     unsigned char r = (unsigned char)(linearToSRGB(color.x) * 255.0f + 0.5f);
@@ -50,10 +62,11 @@ void launchTonemapKernel(
     uchar4* d_ldrOutput,
     uint32_t width,
     uint32_t height,
-    float exposure)
+    float exposure,
+    ToneMappingMode mode)
 {
     dim3 block(16, 16);
     dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
-    tonemapKernel<<<grid, block>>>(d_hdrInput, d_ldrOutput, width, height, exposure);
+    tonemapKernel<<<grid, block>>>(d_hdrInput, d_ldrOutput, width, height, exposure, mode);
     CUDA_CHECK(cudaGetLastError());
 }

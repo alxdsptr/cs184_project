@@ -24,6 +24,7 @@ void GUI::beginFrame() {
 
 bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t height,
                  bool& enableEnvironment, bool& invertMouseY, uint32_t& maxBounces,
+                 float& exposure, int& toneMappingMode,
                  float& moveSpeed,
                  char* envMapPathBuf, size_t envMapPathBufSize, bool& loadEnvMapRequested) {
     bool changed = false;
@@ -55,6 +56,12 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
         maxBounces = (uint32_t)bounceValue;
         changed = true;
     }
+
+    ImGui::Separator();
+    ImGui::Text("Tone Mapping");
+    ImGui::SliderFloat("Exposure", &exposure, 0.05f, 8.0f, "%.2f");
+    const char* toneMappingItems[] = {"None", "Reinhard", "ACES"};
+    ImGui::Combo("Mode", &toneMappingMode, toneMappingItems, IM_ARRAYSIZE(toneMappingItems));
 
     // HDR environment map
     ImGui::Separator();

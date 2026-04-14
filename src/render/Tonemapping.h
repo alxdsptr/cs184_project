@@ -2,10 +2,17 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+enum class ToneMappingMode : uint32_t {
+    None = 0,
+    Reinhard = 1,
+    ACES = 2,
+};
+
 void launchTonemapKernel(
     const float4* d_hdrInput,
     uchar4* d_ldrOutput,
     uint32_t width,
     uint32_t height,
-    float exposure
+    float exposure,
+    ToneMappingMode mode
 );
