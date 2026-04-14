@@ -42,6 +42,7 @@ add_executable(pathtracer
     # Scene
     src/scene/Scene.cpp
     src/scene/SceneLoader.cpp
+    src/scene/PbrtLoader.cpp
     src/scene/Texture.cpp
     src/scene/utils.cpp
     # Display

@@ -92,7 +92,7 @@ cudaTextureObject_t TextureManager::loadTexture(const std::string& path) {
 
     if (hasDdsExtension(path)) {
         // Try BC1/BC3 software decompression first (gli::convert can't decompress these)
-        if (!decompressDDS(path, ddsPixels, w, h)) {
+        if (!scene_loader_util::decompressDDS(path, ddsPixels, w, h)) {
             // Fall back to gli convert for uncompressed DDS formats
             if (!loadDDSWithGliRGBA8(path, ddsPixels, w, h)) {
                 LOG_WARN("Failed to load DDS texture: %s", path.c_str());

@@ -1,6 +1,19 @@
-#include "utils.h"
 #include <gli/gli.hpp>
 #include <gli/convert.hpp>
+#include "utils.h"
+#include "SceneLoader.h"
+#include "core/Math.h"
+#include "util/Log.h"
+
+#include <assimp/Importer.hpp>
+#include <assimp/scene.h>
+#include <assimp/postprocess.h>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <unordered_map>
+
+namespace scene_loader_util {
 
 // ── BC1 (DXT1) software decompression ─────────────────────────
 void decompressBC1Block(const uint8_t* block, uint8_t out[4][4][4]) {
@@ -140,4 +153,339 @@ bool decompressDDS(const std::string& path,
         }
     }
     return true;
+}
+
+float3 toFloat3(const aiVector3D& v) { return make_float3(v.x, v.y, v.z); }
+float3 toFloat3(const aiColor3D& c) { return make_float3(c.r, c.g, c.b); }
+
+float3 transformDirection(const aiMatrix4x4& m, const aiVector3D& v) {
+    return make_float3(
+        m.a1 * v.x + m.a2 * v.y + m.a3 * v.z,
+        m.b1 * v.x + m.b2 * v.y + m.b3 * v.z,
+        m.c1 * v.x + m.c2 * v.y + m.c3 * v.z
+    );
+}
+
+float luminance(const float3& c) {
+    return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+}
+
+std::unordered_map<std::string, float3> parseColladaRadiance(const std::string& path) {
+    std::unordered_map<std::string, float3> result;
+
+    std::ifstream in(path);
+    if (!in.is_open()) return result;
+
+    std::string content((std::istreambuf_iterator<char>(in)),
+                        std::istreambuf_iterator<char>());
+    in.close();
+
+    std::unordered_map<std::string, float3> effectRadiance;
+    {
+        size_t pos = 0;
+        while (true) {
+            size_t effectStart = content.find("<effect ", pos);
+            if (effectStart == std::string::npos) break;
+
+            size_t idPos = content.find("id=\"", effectStart);
+            size_t effectEnd = content.find("</effect>", effectStart);
+            if (idPos == std::string::npos || effectEnd == std::string::npos) {
+                pos = effectStart + 1;
+                continue;
+            }
+            if (idPos > effectEnd) {
+                pos = effectEnd;
+                continue;
+            }
+
+            size_t idStart = idPos + 4;
+            size_t idEnd = content.find('"', idStart);
+            if (idEnd == std::string::npos) break;
+            std::string effectId = content.substr(idStart, idEnd - idStart);
+
+            size_t radPos = content.find("<radiance>", effectStart);
+            if (radPos != std::string::npos && radPos < effectEnd) {
+                size_t radStart = radPos + 10;
+                size_t radEnd = content.find("</radiance>", radStart);
+                if (radEnd != std::string::npos && radEnd < effectEnd) {
+                    std::stringstream ss(content.substr(radStart, radEnd - radStart));
+                    float r = 0, g = 0, b = 0;
+                    if (ss >> r >> g >> b) {
+                        effectRadiance[effectId] = make_float3(r, g, b);
+                        LOG_INFO("COLLADA: effect '%s' has radiance (%.1f, %.1f, %.1f)",
+                                 effectId.c_str(), r, g, b);
+                    }
+                }
+            }
+
+            pos = effectEnd;
+        }
+    }
+
+    if (effectRadiance.empty()) return result;
+
+    {
+        size_t pos = 0;
+        while (true) {
+            size_t matStart = content.find("<material ", pos);
+            if (matStart == std::string::npos) break;
+
+            size_t matEnd = content.find("</material>", matStart);
+            if (matEnd == std::string::npos) matEnd = content.find("/>", matStart);
+            if (matEnd == std::string::npos) break;
+
+            size_t namePos = content.find("name=\"", matStart);
+            if (namePos != std::string::npos && namePos < matEnd) {
+                size_t nameStart = namePos + 6;
+                size_t nameEnd = content.find('"', nameStart);
+                if (nameEnd != std::string::npos) {
+                    std::string matName = content.substr(nameStart, nameEnd - nameStart);
+
+                    size_t instPos = content.find("<instance_effect", matStart);
+                    if (instPos != std::string::npos && instPos < matEnd) {
+                        size_t urlPos = content.find("url=\"#", instPos);
+                        if (urlPos != std::string::npos) {
+                            size_t urlStart = urlPos + 6;
+                            size_t urlEnd = content.find('"', urlStart);
+                            if (urlEnd != std::string::npos) {
+                                std::string effectRef = content.substr(urlStart, urlEnd - urlStart);
+                                auto it = effectRadiance.find(effectRef);
+                                if (it != effectRadiance.end()) {
+                                    result[matName] = it->second;
+                                    LOG_INFO("COLLADA: material '%s' -> radiance (%.1f, %.1f, %.1f)",
+                                             matName.c_str(), it->second.x, it->second.y, it->second.z);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            pos = matEnd;
+        }
+    }
+
+    return result;
+}
+
+std::string lowerString(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return (char)std::tolower(c);
+    });
+    return value;
+}
+
+std::string trimString(std::string value) {
+    auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
+    while (!value.empty() && isSpace((unsigned char)value.front())) value.erase(value.begin());
+    while (!value.empty() && isSpace((unsigned char)value.back())) value.pop_back();
+    return value;
+}
+
+std::vector<std::string> extractQuotedStrings(const std::string& line) {
+    std::vector<std::string> values;
+    size_t pos = 0;
+    while (true) {
+        size_t start = line.find('"', pos);
+        if (start == std::string::npos) break;
+        size_t end = line.find('"', start + 1);
+        if (end == std::string::npos) break;
+        values.push_back(line.substr(start + 1, end - start - 1));
+        pos = end + 1;
+    }
+    return values;
+}
+
+std::vector<float> extractBracketFloats(const std::string& line) {
+    std::vector<float> values;
+    size_t left = line.find('[');
+    size_t right = line.find(']', left == std::string::npos ? 0 : left + 1);
+    if (left == std::string::npos || right == std::string::npos || right <= left) {
+        return values;
+    }
+
+    std::stringstream ss(line.substr(left + 1, right - left - 1));
+    float v = 0.0f;
+    while (ss >> v) {
+        values.push_back(v);
+    }
+    return values;
+}
+
+std::filesystem::path resolvePbrtMeshPath(
+    const std::filesystem::path& sceneDir,
+    const std::string& relativeMeshPath) {
+    std::filesystem::path rel(relativeMeshPath);
+    if (rel.is_absolute() && std::filesystem::exists(rel)) {
+        return rel;
+    }
+
+    std::vector<std::filesystem::path> candidates;
+    candidates.push_back(sceneDir / rel);
+    if (!sceneDir.empty() && sceneDir.has_parent_path()) {
+        candidates.push_back(sceneDir.parent_path() / rel);
+    }
+    if (!sceneDir.empty() && sceneDir.has_parent_path() && sceneDir.parent_path().has_parent_path()) {
+        candidates.push_back(sceneDir.parent_path().parent_path() / rel);
+    }
+
+    for (const auto& candidate : candidates) {
+        if (std::filesystem::exists(candidate)) {
+            return candidate;
+        }
+    }
+
+    return {};
+}
+
+const aiNode* findNodeByName(const aiNode* node, const aiString& name) {
+    if (!node) return nullptr;
+    if (node->mName == name) return node;
+    for (unsigned i = 0; i < node->mNumChildren; i++) {
+        const aiNode* found = findNodeByName(node->mChildren[i], name);
+        if (found) return found;
+    }
+    return nullptr;
+}
+
+aiMatrix4x4 computeWorldTransform(const aiNode* node) {
+    aiMatrix4x4 world;
+    if (!node) return world;
+
+    world = node->mTransformation;
+    const aiNode* parent = node->mParent;
+    while (parent) {
+        world = parent->mTransformation * world;
+        parent = parent->mParent;
+    }
+    return world;
+}
+
+void applyUnitScaling(aiScene* aiScn, const std::string& ext) {
+    if (!aiScn) return;
+
+    double unitScale = 1.0;
+    bool applied = false;
+
+    if (ext == ".fbx") {
+        if (aiScn->mMetaData) {
+            double metaScale = 1.0;
+            if (aiScn->mMetaData->Get("UnitScaleFactor", metaScale)) {
+                if (metaScale > 1e-6) {
+                    unitScale = 1.0 / metaScale;
+                    applied = true;
+                    LOG_INFO("FBX UnitScaleFactor metadata: %.6f, applying scale: %.6f", metaScale, unitScale);
+                }
+            }
+        }
+
+        if (!applied) {
+            float maxCoord = 0.0f;
+            float minCoord = 1e10f;
+            float avgCoord = 0.0f;
+            unsigned totalVerts = 0;
+
+            for (unsigned m = 0; m < aiScn->mNumMeshes; m++) {
+                const aiMesh* mesh = aiScn->mMeshes[m];
+                for (unsigned v = 0; v < mesh->mNumVertices; v++) {
+                    const aiVector3D& pos = mesh->mVertices[v];
+                    float mag = std::sqrt(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
+                    maxCoord = std::max(maxCoord, mag);
+                    minCoord = std::min(minCoord, mag);
+                    avgCoord += mag;
+                    totalVerts++;
+                }
+            }
+
+            if (totalVerts > 0) {
+                avgCoord /= totalVerts;
+                LOG_INFO("FBX coordinate analysis: max=%.2f, min=%.2f, avg=%.2f",
+                         maxCoord, minCoord < 1e9f ? minCoord : 0.0f, avgCoord);
+
+                if (maxCoord > 100.0f) {
+                    unitScale = 0.01;
+                    applied = true;
+                    LOG_INFO("Detected large FBX coordinates (max: %.1f). Applying 0.01 scale factor.", maxCoord);
+                }
+            }
+        }
+    }
+
+    if (applied && std::abs(unitScale - 1.0) > 1e-6) {
+        LOG_INFO("Applying unit scale factor: %.6f to %s file", unitScale, ext.c_str());
+
+        for (unsigned m = 0; m < aiScn->mNumMeshes; m++) {
+            aiMesh* mesh = aiScn->mMeshes[m];
+            for (unsigned v = 0; v < mesh->mNumVertices; v++) {
+                mesh->mVertices[v] *= (float)unitScale;
+            }
+        }
+
+        for (unsigned c = 0; c < aiScn->mNumCameras; c++) {
+            aiCamera* cam = aiScn->mCameras[c];
+            if (cam) {
+                cam->mPosition *= (float)unitScale;
+                cam->mLookAt *= (float)unitScale;
+            }
+        }
+
+        for (unsigned l = 0; l < aiScn->mNumLights; l++) {
+            aiLight* light = aiScn->mLights[l];
+            if (light) {
+                light->mPosition *= (float)unitScale;
+                light->mDirection *= (float)unitScale;
+            }
+        }
+    } else if (!applied) {
+        LOG_INFO("No unit scaling applied to %s file (units appear standard)", ext.c_str());
+    }
+}
+
+std::string getTexturePath(const aiMaterial* mat, aiTextureType type, const std::string& baseDir) {
+    if (mat->GetTextureCount(type) > 0) {
+        aiString str;
+        mat->GetTexture(type, 0, &str);
+        std::string texturePath = str.C_Str();
+
+        std::string lowerPath = texturePath;
+        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+
+        if (lowerPath.find(".exr") != std::string::npos) {
+            LOG_WARN("Texture format .exr not supported. Skipping: %s", texturePath.c_str());
+            return "";
+        }
+
+        std::vector<std::filesystem::path> candidates;
+
+        candidates.push_back(texturePath);
+        candidates.push_back(std::filesystem::path(baseDir) / texturePath);
+
+        std::filesystem::path texFile = texturePath;
+        std::string filename = texFile.filename().string();
+        candidates.push_back(std::filesystem::path(baseDir) / filename);
+
+        if (!baseDir.empty()) {
+            auto basePathObj = std::filesystem::path(baseDir);
+
+            for (int i = 0; i < 2 && basePathObj.has_parent_path(); i++) {
+                basePathObj = basePathObj.parent_path();
+                candidates.push_back(basePathObj / filename);
+                candidates.push_back(basePathObj / texturePath);
+            }
+        }
+
+        for (const auto& candidate : candidates) {
+            if (std::filesystem::exists(candidate)) {
+                std::string result = candidate.string();
+                LOG_INFO("Resolved texture: %s -> %s", texturePath.c_str(), result.c_str());
+                return result;
+            }
+        }
+
+        LOG_WARN("Failed to locate texture: %s (tried %zu paths)", texturePath.c_str(), candidates.size());
+        return (std::filesystem::path(baseDir) / texturePath).string();
+    }
+    return "";
+}
 }
