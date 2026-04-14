@@ -43,6 +43,7 @@ add_executable(pathtracer
     src/scene/Scene.cpp
     src/scene/SceneLoader.cpp
     src/scene/Texture.cpp
+    src/scene/utils.cpp
     # Display
     src/display/GLDisplay.cpp
     # GUI

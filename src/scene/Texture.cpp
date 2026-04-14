@@ -10,6 +10,7 @@
 #include "scene/Texture.h"
 #include "util/CudaCheck.h"
 #include "util/Log.h"
+#include "utils.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -90,9 +91,13 @@ cudaTextureObject_t TextureManager::loadTexture(const std::string& path) {
     bool pixelsOwnedByStb = false;
 
     if (hasDdsExtension(path)) {
-        if (!loadDDSWithGliRGBA8(path, ddsPixels, w, h)) {
-            LOG_WARN("Failed to load DDS texture with gli: %s", path.c_str());
-            return 0;
+        // Try BC1/BC3 software decompression first (gli::convert can't decompress these)
+        if (!decompressDDS(path, ddsPixels, w, h)) {
+            // Fall back to gli convert for uncompressed DDS formats
+            if (!loadDDSWithGliRGBA8(path, ddsPixels, w, h)) {
+                LOG_WARN("Failed to load DDS texture: %s", path.c_str());
+                return 0;
+            }
         }
         pixels = ddsPixels.data();
     } else {

@@ -713,15 +713,15 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
         bool hasPbrMetallic = (aiMat->Get(AI_MATKEY_METALLIC_FACTOR, metallic) == aiReturn_SUCCESS);
         aiMat->Get(AI_MATKEY_ROUGHNESS_FACTOR, roughness);
 
-        // FBX specular/shininess workflow: Assimp converts shininess to roughness
-        // but doesn't produce metallic. Use reflectivity to estimate metallic.
+        // For FBX specular/shininess workflow, Assimp does NOT produce a
+        // reliable metallic value. The reflectivity property is also unreliable
+        // as it can be 1.0 for all materials (e.g. Bistro).
+        // Strategy: only trust metallic from Assimp if it was explicitly set
+        // AND is not the suspicious default of exactly 1.0 for a non-PBR format.
+        // Metallic-roughness textures (loaded later) will override this at
+        // render time in the kernel.
         if (!hasPbrMetallic) {
-            float reflectivity = 0.0f;
-            aiMat->Get(AI_MATKEY_REFLECTIVITY, reflectivity);
-
-            if (reflectivity > 0.4f) {
-                metallic = reflectivity;
-            }
+            metallic = 0.0f;
         }
 
         mat.metallic  = metallic;
@@ -770,15 +770,29 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
         mat.metallicRoughTexPath = getTexturePath(aiMat, aiTextureType_METALNESS, baseDir);
         mat.emissiveTexPath      = getTexturePath(aiMat, aiTextureType_EMISSIVE, baseDir);
 
+        // If the material has an emissive texture, it is explicitly meant to emit
+        // light. Enable emission even when the scalar emissive color from Assimp
+        // was zero (common in FBX files where the texture carries all the data).
+        if (!mat.emissiveTexPath.empty() && mat.emissionStrength <= 0.0f) {
+            mat.emission = make_float3(1.0f, 1.0f, 1.0f);
+            mat.emissionStrength = 1.0f;
+        }
+
         scene.getMaterials().push_back(std::move(mat));
     }
 
-    // Lights (currently import point lights)
+    // Lights
     for (unsigned i = 0; i < aiScn->mNumLights; i++) {
         const aiLight* aiL = aiScn->mLights[i];
         if (!aiL) continue;
 
-        if (aiL->mType != aiLightSource_POINT) {
+        LOG_INFO("Light[%u] '%s': type=%d color=(%.2f,%.2f,%.2f) atten=(%.4f,%.4f,%.4f)",
+                 i, aiL->mName.C_Str(), (int)aiL->mType,
+                 aiL->mColorDiffuse.r, aiL->mColorDiffuse.g, aiL->mColorDiffuse.b,
+                 aiL->mAttenuationConstant, aiL->mAttenuationLinear, aiL->mAttenuationQuadratic);
+
+        // Currently only point and spot lights are supported (treat spot as point)
+        if (aiL->mType != aiLightSource_POINT && aiL->mType != aiLightSource_SPOT) {
             LOG_WARN("Skipping unsupported light type %d for %s",
                      (int)aiL->mType, aiL->mName.C_Str());
             continue;
@@ -819,6 +833,13 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
 
         const PBRMaterial& mat = materials[(size_t)mesh.materialIndex];
         if (mat.emissionStrength <= 0.0f) {
+            continue;
+        }
+
+        // Skip materials that rely on emissive textures for area light creation.
+        // We can't know per-triangle emission from a texture at scene-load time,
+        // so these are handled via BSDF path hits in the kernel instead.
+        if (!mat.emissiveTexPath.empty()) {
             continue;
         }
 
