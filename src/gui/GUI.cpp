@@ -22,8 +22,11 @@ void GUI::beginFrame() {
     ImGui::NewFrame();
 }
 
-bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t height, bool& enableEnvironment, bool& invertMouseY, uint32_t& maxBounces) {
+bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t height,
+                 bool& enableEnvironment, bool& invertMouseY, uint32_t& maxBounces,
+                 char* envMapPathBuf, size_t envMapPathBufSize, bool& loadEnvMapRequested) {
     bool changed = false;
+    loadEnvMapRequested = false;
 
     // Overlay window: top-left corner
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
@@ -47,6 +50,17 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
         }
         maxBounces = (uint32_t)bounceValue;
         changed = true;
+    }
+
+    // HDR environment map
+    ImGui::Separator();
+    ImGui::Text("HDR Environment Map");
+    ImGui::PushItemWidth(200);
+    ImGui::InputText("##hdr_path", envMapPathBuf, envMapPathBufSize);
+    ImGui::PopItemWidth();
+    ImGui::SameLine();
+    if (ImGui::Button("Load HDR")) {
+        loadEnvMapRequested = true;
     }
 
     ImGui::End();

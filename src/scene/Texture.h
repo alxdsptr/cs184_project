@@ -12,8 +12,13 @@ struct TextureData {
 
 class TextureManager {
 public:
-    // Load image from disk, create CUDA texture object
+    // Load LDR image (PNG/JPG/DDS) as RGBA8, create CUDA texture object
     cudaTextureObject_t loadTexture(const std::string& path);
+
+    // Load HDR image (.hdr/.exr) as float4, create CUDA texture object
+    // Returns 0 on failure. Also outputs width/height for importance sampling.
+    cudaTextureObject_t loadHDRTexture(const std::string& path, int& outWidth, int& outHeight);
+
     void freeAll();
 
 private:

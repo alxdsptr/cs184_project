@@ -20,6 +20,7 @@ public:
     void shutdown();
     void setMaxBounces(uint32_t maxBounces);
     void setHeadlessOutput(const std::string& outputPath, uint32_t sampleCount);
+    void setEnvMap(const std::string& path);
 
 private:
     static void glfwScrollCallback(GLFWwindow* window, double xoffset, double yoffset);
@@ -58,6 +59,11 @@ private:
 
     bool m_enableEnvironment = false;
     bool m_invertMouseY = false;
+
+    // HDR environment map
+    cudaTextureObject_t m_envMapTex = 0;
+    char m_envMapPathBuf[512] = {};
+    void loadEnvMap(const std::string& path);
     bool m_prevF12Down = false;
     uint32_t m_maxBounces = 8;
     bool m_guiEnabled = true;

@@ -134,6 +134,53 @@ cudaTextureObject_t TextureManager::loadTexture(const std::string& path) {
     return texObj;
 }
 
+cudaTextureObject_t TextureManager::loadHDRTexture(const std::string& path, int& outWidth, int& outHeight) {
+    if (path.empty()) return 0;
+
+    outWidth = 0;
+    outHeight = 0;
+
+    // stb_image can load .hdr (Radiance RGBE) files as float
+    stbi_set_flip_vertically_on_load(0);
+    int w = 0, h = 0, c = 0;
+    float* hdrPixels = stbi_loadf(path.c_str(), &w, &h, &c, 4); // force RGBA float
+    if (!hdrPixels) {
+        LOG_WARN("Failed to load HDR texture: %s", path.c_str());
+        return 0;
+    }
+
+    outWidth = w;
+    outHeight = h;
+
+    // Create CUDA array with float4 channel format
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float4>();
+    cudaArray_t cuArray = nullptr;
+    CUDA_CHECK(cudaMallocArray(&cuArray, &channelDesc, w, h));
+    CUDA_CHECK(cudaMemcpy2DToArray(cuArray, 0, 0, hdrPixels,
+                                    w * sizeof(float4), w * sizeof(float4), h,
+                                    cudaMemcpyHostToDevice));
+    stbi_image_free(hdrPixels);
+
+    // Create texture object with clamp addressing and linear filtering
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+
+    cudaTextureDesc texDesc{};
+    texDesc.addressMode[0] = cudaAddressModeWrap;
+    texDesc.addressMode[1] = cudaAddressModeClamp;
+    texDesc.filterMode = cudaFilterModeLinear;
+    texDesc.readMode = cudaReadModeElementType; // read as float directly
+    texDesc.normalizedCoords = 1;
+
+    cudaTextureObject_t texObj = 0;
+    CUDA_CHECK(cudaCreateTextureObject(&texObj, &resDesc, &texDesc, nullptr));
+
+    m_textures.push_back({cuArray, texObj});
+    LOG_INFO("Loaded HDR texture: %s (%dx%d)", path.c_str(), w, h);
+    return texObj;
+}
+
 void TextureManager::freeAll() {
     for (auto& t : m_textures) {
         if (t.obj)   cudaDestroyTextureObject(t.obj);

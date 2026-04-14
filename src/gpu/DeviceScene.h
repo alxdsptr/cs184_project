@@ -24,6 +24,9 @@ struct DeviceSceneData {
     int*         d_triangleAreaLightIndex = nullptr;
     BVHNode*     d_bvhNodes        = nullptr;
     uint32_t     bvhRootIndex      = 0;
+
+    // HDR environment map (equirectangular, float4 texture)
+    cudaTextureObject_t envMapTex   = 0;
 };
 
 class Scene;

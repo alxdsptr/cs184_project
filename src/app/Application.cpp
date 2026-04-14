@@ -10,6 +10,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
@@ -123,6 +124,17 @@ void Application::setHeadlessOutput(const std::string& outputPath, uint32_t samp
     m_headlessOutputPath = outputPath;
     m_targetSamples = sampleCount < 1 ? 1 : sampleCount;
     m_headlessTotalMs = 0.0;
+}
+
+void Application::setEnvMap(const std::string& path) {
+    loadEnvMap(path);
+    if (m_envMapTex != 0) {
+        m_enableEnvironment = true;
+        // Copy path to GUI buffer for display
+        size_t len = path.size() < sizeof(m_envMapPathBuf) - 1 ? path.size() : sizeof(m_envMapPathBuf) - 1;
+        memcpy(m_envMapPathBuf, path.c_str(), len);
+        m_envMapPathBuf[len] = '\0';
+    }
 }
 
 bool Application::init(uint32_t width, uint32_t height, const std::string& title, bool enableGui) {
@@ -292,10 +304,23 @@ void Application::processInput() {
     }
 }
 
+void Application::loadEnvMap(const std::string& path) {
+    if (path.empty()) return;
+    int w = 0, h = 0;
+    cudaTextureObject_t tex = m_textures.loadHDRTexture(path, w, h);
+    if (tex != 0) {
+        m_envMapTex = tex;
+        LOG_INFO("Environment map loaded: %s (%dx%d)", path.c_str(), w, h);
+    } else {
+        LOG_ERROR("Failed to load environment map: %s", path.c_str());
+    }
+}
+
 void Application::renderSceneSample(uchar4* d_pbo, bool timeHeadless) {
     if (m_sceneLoaded) {
         CameraParams camParams = m_camera.getParams(m_frameIndex);
         DeviceSceneData sceneData = m_backend->getSceneData();
+        sceneData.envMapTex = m_envMapTex;
         m_renderer.renderFrame(camParams, sceneData, m_backend.get(), d_pbo, m_enableEnvironment, m_maxBounces);
     } else {
         CUDA_CHECK(cudaMemset(d_pbo, 40, m_width * m_height * sizeof(uchar4)));
@@ -373,6 +398,7 @@ void Application::runGui() {
         }
 
         m_gui.beginFrame();
+        bool envMapLoadRequested = false;
         bool envChanged = m_gui.render(
             m_fps,
             m_renderer.getSampleCount(),
@@ -380,7 +406,14 @@ void Application::runGui() {
             m_height,
             m_enableEnvironment,
             m_invertMouseY,
-            m_maxBounces);
+            m_maxBounces,
+            m_envMapPathBuf,
+            sizeof(m_envMapPathBuf),
+            envMapLoadRequested);
+        if (envMapLoadRequested) {
+            loadEnvMap(std::string(m_envMapPathBuf));
+            m_renderer.resetAccumulation();
+        }
         if (envChanged) {
             m_renderer.resetAccumulation();
         }

@@ -14,8 +14,17 @@
 #endif
 
 // ── Environment ──────────────────────────────────────────────
-__device__ inline float3 sampleEnvironment(float3 dir) {
-    // Constant sky color with slight gradient
+__device__ inline float3 sampleEnvironment(float3 dir, cudaTextureObject_t envMap) {
+    if (envMap != 0) {
+        // Equirectangular HDR mapping: direction -> (u, v)
+        float theta = acosf(fminf(fmaxf(dir.y, -1.0f), 1.0f)); // [0, pi]
+        float phi   = atan2f(dir.z, dir.x);                      // [-pi, pi]
+        float u = (phi + M_PI_F) * (0.5f / M_PI_F);             // [0, 1]
+        float v = theta / M_PI_F;                                 // [0, 1]
+        float4 texel = tex2D<float4>(envMap, u, v);
+        return make_float3(texel.x, texel.y, texel.z);
+    }
+    // Fallback: procedural sky gradient
     float t = 0.5f * (dir.y + 1.0f);
     float3 skyTop = make_float3(0.5f, 0.7f, 1.0f);
     float3 skyBot = make_float3(1.0f, 1.0f, 1.0f);
@@ -232,7 +241,7 @@ __global__ void pathTraceKernel(
 
         if (!didHit) {
             if (enableEnvironment) {
-                radiance += throughput * sampleEnvironment(ray.direction);
+                radiance += throughput * sampleEnvironment(ray.direction, scene.envMapTex);
             }
             break;
         }

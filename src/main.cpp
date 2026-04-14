@@ -8,6 +8,7 @@
 int main(int argc, char** argv) {
     std::string scenePath;
     std::string outputPath;
+    std::string envMapPath;
     uint32_t width = 1280;
     uint32_t height = 720;
     uint32_t maxBounces = 8;
@@ -15,7 +16,9 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "-m" && i + 1 < argc) {
+        if (arg == "-e" && i + 1 < argc) {
+            envMapPath = argv[++i];
+        } else if (arg == "-m" && i + 1 < argc) {
             int value = std::atoi(argv[++i]);
             if (value > 0) {
                 maxBounces = (uint32_t)value;
@@ -73,6 +76,10 @@ int main(int argc, char** argv) {
     } else {
         LOG_INFO("No scene file specified. Pass a glTF/OBJ file as argument.");
         LOG_INFO("Example: pathtracer assets/DamagedHelmet.glb");
+    }
+
+    if (!envMapPath.empty()) {
+        app.setEnvMap(envMapPath);
     }
 
     app.run();
