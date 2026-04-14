@@ -65,6 +65,8 @@ private:
     char m_envMapPathBuf[512] = {};
     void loadEnvMap(const std::string& path);
     bool m_prevF12Down = false;
+    bool m_prevSpeedDownKey = false;
+    bool m_prevSpeedUpKey = false;
     uint32_t m_maxBounces = 8;
     bool m_guiEnabled = true;
     double m_pendingScrollY = 0.0;

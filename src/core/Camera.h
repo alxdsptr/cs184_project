@@ -46,7 +46,8 @@ public:
 
     float3 getPosition() const { return m_position; }
     float  getFovDeg() const { return m_fovDeg; }
-    void   setMoveSpeed(float s) { m_moveSpeed = s; }
+    float  getMoveSpeed() const { return m_moveSpeed; }
+    void   setMoveSpeed(float s) { m_moveSpeed = clampf(s, 0.05f, 200.0f); }
 
 private:
     void rebuildMatrices();

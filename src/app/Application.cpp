@@ -278,6 +278,9 @@ void Application::processInput() {
         return;
     }
 
+    bool speedDownKey = glfwGetKey(m_window, GLFW_KEY_LEFT_BRACKET) == GLFW_PRESS;
+    bool speedUpKey = glfwGetKey(m_window, GLFW_KEY_RIGHT_BRACKET) == GLFW_PRESS;
+
     if (!m_gui.wantCaptureKeyboard()) {
         m_input.forward  = glfwGetKey(m_window, GLFW_KEY_W) == GLFW_PRESS;
         m_input.backward = glfwGetKey(m_window, GLFW_KEY_S) == GLFW_PRESS;
@@ -285,7 +288,17 @@ void Application::processInput() {
         m_input.right    = glfwGetKey(m_window, GLFW_KEY_D) == GLFW_PRESS;
         m_input.up       = glfwGetKey(m_window, GLFW_KEY_SPACE) == GLFW_PRESS;
         m_input.down     = glfwGetKey(m_window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS;
+
+        if (speedDownKey && !m_prevSpeedDownKey) {
+            m_camera.setMoveSpeed(m_camera.getMoveSpeed() * 0.9f);
+        }
+        if (speedUpKey && !m_prevSpeedUpKey) {
+            m_camera.setMoveSpeed(m_camera.getMoveSpeed() * 1.1f);
+        }
     }
+
+    m_prevSpeedDownKey = speedDownKey;
+    m_prevSpeedUpKey = speedUpKey;
 
     if (!m_gui.wantCaptureMouse()) {
         m_input.mouseHeld = glfwGetMouseButton(m_window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
@@ -399,6 +412,7 @@ void Application::runGui() {
 
         m_gui.beginFrame();
         bool envMapLoadRequested = false;
+        float moveSpeed = m_camera.getMoveSpeed();
         bool envChanged = m_gui.render(
             m_fps,
             m_renderer.getSampleCount(),
@@ -407,9 +421,11 @@ void Application::runGui() {
             m_enableEnvironment,
             m_invertMouseY,
             m_maxBounces,
+            moveSpeed,
             m_envMapPathBuf,
             sizeof(m_envMapPathBuf),
             envMapLoadRequested);
+        m_camera.setMoveSpeed(moveSpeed);
         if (envMapLoadRequested) {
             loadEnvMap(std::string(m_envMapPathBuf));
             m_renderer.resetAccumulation();

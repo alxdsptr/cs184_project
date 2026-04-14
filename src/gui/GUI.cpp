@@ -24,6 +24,7 @@ void GUI::beginFrame() {
 
 bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t height,
                  bool& enableEnvironment, bool& invertMouseY, uint32_t& maxBounces,
+                 float& moveSpeed,
                  char* envMapPathBuf, size_t envMapPathBufSize, bool& loadEnvMapRequested) {
     bool changed = false;
     loadEnvMapRequested = false;
@@ -42,6 +43,9 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
         changed = true;
     }
     ImGui::Checkbox("Invert Mouse Y", &invertMouseY);
+
+    ImGui::SliderFloat("Move Speed", &moveSpeed, 0.05f, 200.0f, "%.2f");
+    ImGui::TextUnformatted("Adjust speed keys: [ / ]");
 
     int bounceValue = (int)maxBounces;
     if (ImGui::SliderInt("Max Bounces", &bounceValue, 1, 16)) {
