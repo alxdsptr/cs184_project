@@ -6,6 +6,7 @@
 #include "gpu/MaterialGPU.h"
 #include "gpu/Random.h"
 #include "gpu/Sampling.h"
+#include "gpu/BRDF.h"
 #include "accel/BVH.h"
 #include "util/CudaCheck.h"
 
@@ -241,7 +242,15 @@ __global__ void pathTraceKernel(
 
         if (!didHit) {
             if (enableEnvironment) {
-                radiance += throughput * sampleEnvironment(ray.direction, scene.envMapTex);
+                float3 envColor = sampleEnvironment(ray.direction, scene.envMapTex);
+                // Clamp extremely bright HDR texels (sun etc.) to prevent
+                // fireflies when a path through glass hits a hot pixel.
+                float envLum = 0.2126f * envColor.x + 0.7152f * envColor.y + 0.0722f * envColor.z;
+                float envClamp = 100.0f;
+                if (envLum > envClamp) {
+                    envColor = envColor * (envClamp / envLum);
+                }
+                radiance += throughput * envColor;
             }
             break;
         }
@@ -307,6 +316,10 @@ __global__ void pathTraceKernel(
             float3 n1 = scene.d_normals[i1];
             float3 n2 = scene.d_normals[i2];
             N = normalize(n0 * baryW + n1 * baryU + n2 * baryV);
+        }
+        // For glass, preserve the original normal orientation (frontFace is the ground truth).
+        // For opaque surfaces, flip to face the ray as before.
+        if (mat.transmission <= 0.0f) {
             if (dot(N, ray.direction) > 0) N = -N;
         }
 
@@ -331,15 +344,89 @@ __global__ void pathTraceKernel(
             firstBounce = false;
         }
 
+        // ── Glass / transmissive material ───────────────────────
+        bool handledAsGlass = false;
+        if (mat.transmission > 0.0f) {
+            // Determine if we're entering or exiting the medium
+            bool entering = hit.frontFace;
+
+            // Nglass: the outward-facing normal (always points to the side the ray came from)
+            // For glass we did NOT flip N above, so use frontFace to orient it.
+            float3 Nglass = entering ? N : -N;
+            // Make sure Nglass faces the incoming ray
+            if (dot(Nglass, ray.direction) > 0.0f) Nglass = -Nglass;
+
+            float etaI = entering ? 1.0f : mat.ior;
+            float etaT = entering ? mat.ior : 1.0f;
+            float eta = etaI / etaT;
+
+            float cosThetaI = fmaxf(dot(-ray.direction, Nglass), 0.0f);
+
+            // Exact Fresnel for dielectrics
+            float Fr = fresnelDielectric(cosThetaI, eta);
+
+            float3 newDirGlass;
+            if (pcg32_float(rng) < Fr) {
+                // Reflection
+                newDirGlass = ray.direction - Nglass * (2.0f * dot(ray.direction, Nglass));
+                newDirGlass = normalize(newDirGlass);
+            } else {
+                // Refraction (Snell's law)
+                if (!refractDir(ray.direction, Nglass, eta, newDirGlass)) {
+                    // Total internal reflection fallback
+                    newDirGlass = ray.direction - Nglass * (2.0f * dot(ray.direction, Nglass));
+                    newDirGlass = normalize(newDirGlass);
+                }
+            }
+
+            // Glass tint: colored glass absorbs light based on albedo.
+            // Only apply tint when exiting the medium AND the color is
+            // intentionally non-white (skip near-white to keep clear glass clear).
+            if (!entering) {
+                float albedoLum = 0.2126f * albedo.x + 0.7152f * albedo.y + 0.0722f * albedo.z;
+                if (albedoLum < 0.9f) {
+                    throughput = throughput * albedo;
+                }
+            }
+
+            // Delta BSDF: throughput unchanged by pdf (delta distribution cancels)
+            // Offset origin in the direction of travel to avoid self-intersection
+            float3 offsetN = (dot(newDirGlass, Nglass) > 0.0f) ? Nglass : -Nglass;
+            ray.origin    = hit.position + offsetN * 0.002f;
+            ray.direction = newDirGlass;
+            ray.tmin      = 0.001f;
+            ray.tmax      = 1e30f;
+
+            lastBounceSpecular = true;
+            prevSurfacePos = hit.position;
+            prevBsdfPdf = 1.0f;
+            havePrevSurface = true;
+            handledAsGlass = true;
+        }
+        if (handledAsGlass) {
+            // For glass, also flip N for aux buffers (ensure outward-facing for denoiser)
+            if (dot(N, ray.direction) > 0) N = -N;
+            // Glass Russian roulette: only terminate after many bounces to
+            // prevent infinite TIR loops, but do NOT boost throughput (delta
+            // BSDF doesn't lose energy so boosting causes fireflies).
+            if (bounce >= 6) {
+                if (pcg32_float(rng) > 0.9f) break;
+            }
+            continue; // Skip NEE and opaque BRDF — glass is a delta BSDF
+        }
+
         bool isEmissive = mat.emissionStrength > 0.0f &&
                           (emissiveColor.x > 0.0f || emissiveColor.y > 0.0f || emissiveColor.z > 0.0f);
         if (isEmissive) {
             float3 Le = emissiveColor * mat.emissionStrength;
             float weight = 1.0f;
 
+            // Check if this triangle is a registered area light (i.e. has NO emissive texture)
+            bool isAreaLight = false;
             if (bounce > 0 && havePrevSurface && !lastBounceSpecular && scene.d_triangleAreaLightIndex) {
                 int areaLightIndex = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
                 if (areaLightIndex >= 0 && scene.d_areaLights && scene.areaLightCount > 0) {
+                    isAreaLight = true;
                     GPUAreaLight light = scene.d_areaLights[areaLightIndex];
                     float3 toLight = hit.position - prevSurfacePos;
                     float dist2 = fmaxf(dot(toLight, toLight), 1e-6f);
@@ -356,7 +443,15 @@ __global__ void pathTraceKernel(
             }
 
             radiance += throughput * Le * weight;
-            break;
+
+            // For textured emissives (e.g. light bulbs): continue the path so the
+            // surface also reflects light and shows specular highlights / depth.
+            // For pure area lights (uniform emission, no texture): terminate as before.
+            if (mat.emissiveTex != 0) {
+                // fall through to BRDF sampling below
+            } else {
+                break;
+            }
         }
 
         // Direct lighting from emissive triangle lights (next-event estimation).
@@ -388,6 +483,8 @@ __global__ void pathTraceKernel(
             float NdotL = fmaxf(dot(N, Ld), 0.0f);
             float lightNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
             if (NdotL > 0.0f && lightNdot > 0.0f) {
+                // Shadow ray with glass transparency
+                float3 shadowTransmittance = make_float3(1.0f, 1.0f, 1.0f);
                 bool occluded = false;
                 if (scene.d_bvhNodes && scene.totalTriangles > 0) {
                     Ray shadowRay;
@@ -396,15 +493,40 @@ __global__ void pathTraceKernel(
                     shadowRay.tmin = 0.001f;
                     shadowRay.tmax = fmaxf(dist - 0.002f, 0.001f);
 
-                    HitRecord shadowHit;
-                    shadowHit.t = shadowRay.tmax;
-                    occluded = bvh_closestHit(
-                        shadowRay, scene.d_bvhNodes, scene.bvhRootIndex,
-                        scene.d_positions, scene.d_indices, scene.d_materialIndices,
-                        shadowHit);
+                    for (int shadowStep = 0; shadowStep < 8; shadowStep++) {
+                        HitRecord shadowHit;
+                        shadowHit.t = shadowRay.tmax;
+                        bool didHitShadow = bvh_closestHit(
+                            shadowRay, scene.d_bvhNodes, scene.bvhRootIndex,
+                            scene.d_positions, scene.d_indices, scene.d_materialIndices,
+                            shadowHit);
+                        if (!didHitShadow) break;
+
+                        // Check if the hit surface is glass
+                        GPUMaterial shadowMat;
+                        if (shadowHit.materialIndex >= 0 && (uint32_t)shadowHit.materialIndex < scene.materialCount)
+                            shadowMat = scene.d_materials[shadowHit.materialIndex];
+                        else { occluded = true; break; }
+
+                        if (shadowMat.transmission > 0.0f) {
+                            // Attenuate by glass color for colored glass;
+                            // near-white glass is treated as fully transparent.
+                            float sAlbLum = 0.2126f * shadowMat.albedo.x + 0.7152f * shadowMat.albedo.y + 0.0722f * shadowMat.albedo.z;
+                            if (sAlbLum < 0.9f) {
+                                shadowTransmittance = shadowTransmittance * shadowMat.albedo;
+                            }
+                            // Continue shadow ray past the glass surface
+                            shadowRay.origin = shadowHit.position + Ld * 0.002f;
+                            shadowRay.tmax = fmaxf(dist - length(shadowRay.origin - (hit.position + N * 0.001f)) - 0.002f, 0.001f);
+                        } else {
+                            occluded = true;
+                            break;
+                        }
+                    }
                 }
 
-                if (!occluded) {
+                float shadowLum = 0.2126f * shadowTransmittance.x + 0.7152f * shadowTransmittance.y + 0.0722f * shadowTransmittance.z;
+                if (!occluded && shadowLum > 1e-6f) {
                     float pTri = light.weight / scene.areaLightTotalWeight;
                     float pArea = pTri / fmaxf(light.area, 1e-7f);
                     float pdfOmega = pArea * dist2 / fmaxf(lightNdot, 1e-7f);
@@ -415,7 +537,7 @@ __global__ void pathTraceKernel(
                     float pdfBsdf = bsdfMixturePdf(N, V, Ld, mat.roughness, neeSpecProb);
                     float weight = powerHeuristic(pdfOmega, pdfBsdf);
 
-                    radiance += throughput * brdf * light.emission * (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
+                    radiance += throughput * shadowTransmittance * brdf * light.emission * (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
                 }
             }
         } else if (scene.d_pointLights && scene.pointLightCount > 0) {
@@ -433,6 +555,8 @@ __global__ void pathTraceKernel(
                 float NdotL = fmaxf(dot(N, Ld), 0.0f);
                 if (NdotL <= 0.0f) continue;
 
+                // Shadow ray with glass transparency
+                float3 shadowTransmittancePL = make_float3(1.0f, 1.0f, 1.0f);
                 bool occluded = false;
                 if (scene.d_bvhNodes && scene.totalTriangles > 0) {
                     Ray shadowRay;
@@ -441,15 +565,36 @@ __global__ void pathTraceKernel(
                     shadowRay.tmin = 0.001f;
                     shadowRay.tmax = fmaxf(dist - 0.002f, 0.001f);
 
-                    HitRecord shadowHit;
-                    shadowHit.t = shadowRay.tmax;
-                    occluded = bvh_closestHit(
-                        shadowRay, scene.d_bvhNodes, scene.bvhRootIndex,
-                        scene.d_positions, scene.d_indices, scene.d_materialIndices,
-                        shadowHit);
+                    for (int shadowStep = 0; shadowStep < 8; shadowStep++) {
+                        HitRecord shadowHit;
+                        shadowHit.t = shadowRay.tmax;
+                        bool didHitShadow = bvh_closestHit(
+                            shadowRay, scene.d_bvhNodes, scene.bvhRootIndex,
+                            scene.d_positions, scene.d_indices, scene.d_materialIndices,
+                            shadowHit);
+                        if (!didHitShadow) break;
+
+                        GPUMaterial shadowMat;
+                        if (shadowHit.materialIndex >= 0 && (uint32_t)shadowHit.materialIndex < scene.materialCount)
+                            shadowMat = scene.d_materials[shadowHit.materialIndex];
+                        else { occluded = true; break; }
+
+                        if (shadowMat.transmission > 0.0f) {
+                            float sAlbLumPL = 0.2126f * shadowMat.albedo.x + 0.7152f * shadowMat.albedo.y + 0.0722f * shadowMat.albedo.z;
+                            if (sAlbLumPL < 0.9f) {
+                                shadowTransmittancePL = shadowTransmittancePL * shadowMat.albedo;
+                            }
+                            shadowRay.origin = shadowHit.position + Ld * 0.002f;
+                            shadowRay.tmax = fmaxf(dist - length(shadowRay.origin - (hit.position + N * 0.001f)) - 0.002f, 0.001f);
+                        } else {
+                            occluded = true;
+                            break;
+                        }
+                    }
                 }
 
-                if (occluded) continue;
+                float shadowLumPL = 0.2126f * shadowTransmittancePL.x + 0.7152f * shadowTransmittancePL.y + 0.0722f * shadowTransmittancePL.z;
+                if (occluded || shadowLumPL < 1e-6f) continue;
 
                 float attenDen = light.constantAttenuation
                                + light.linearAttenuation * dist
@@ -458,7 +603,7 @@ __global__ void pathTraceKernel(
                 float3 Li = light.color * (light.intensity * attenuation);
                 float3 brdf = bsdfEvaluate(N, V, Ld, albedo, mat.roughness, mat.metallic);
 
-                direct += brdf * Li * NdotL;
+                direct += brdf * shadowTransmittancePL * Li * NdotL;
             }
 
             radiance += throughput * direct;
@@ -536,7 +681,7 @@ __global__ void pathTraceKernel(
         radiance = make_float3(0.0f, 0.0f, 0.0f);
     }
     float luminance = 0.2126f * radiance.x + 0.7152f * radiance.y + 0.0722f * radiance.z;
-    float clampMax = 1000.0f;
+    float clampMax = 200.0f;
     if (luminance > clampMax) {
         float scale = clampMax / luminance;
         radiance = radiance * scale;

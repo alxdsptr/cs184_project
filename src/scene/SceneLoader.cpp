@@ -205,6 +205,34 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
         aiMat->Get(AI_MATKEY_REFRACTI, ior);
         mat.ior = ior;
 
+        // Transmission / glass detection
+        // 1. glTF KHR_materials_transmission extension
+        float transmissionFactor = 0.0f;
+        if (aiMat->Get(AI_MATKEY_TRANSMISSION_FACTOR, transmissionFactor) == aiReturn_SUCCESS
+            && transmissionFactor > 0.0f) {
+            mat.transmission = transmissionFactor;
+        }
+        // 2. Opacity < 1 implies partial transmission (common in FBX)
+        float opacity = 1.0f;
+        if (aiMat->Get(AI_MATKEY_OPACITY, opacity) == aiReturn_SUCCESS
+            && opacity < 0.99f && mat.transmission <= 0.0f) {
+            mat.transmission = 1.0f - opacity;
+        }
+        if (mat.transmission > 0.0f) {
+            LOG_INFO("Material '%s': transmission=%.3f ior=%.3f",
+                     materialName.c_str(), mat.transmission, mat.ior);
+        }
+
+        // TransparencyFactor from FBX can appear on many materials including
+        // emissive ones (e.g. light bulbs in Bistro). Log a notice and
+        // disable transmission for emissive materials — they should glow,
+        // not refract.
+        float transparencyFactor = 0.0f;
+        aiMat->Get(AI_MATKEY_TRANSPARENCYFACTOR, transparencyFactor);
+        if (transparencyFactor > 0.0f) {
+            LOG_INFO("Material '%s': transparencyFactor=%.3f", materialName.c_str(), transparencyFactor);
+        }
+
         // Texture paths
         mat.albedoTexPath        = getTexturePath(aiMat, aiTextureType_BASE_COLOR, baseDir);
         if (mat.albedoTexPath.empty())
@@ -219,6 +247,15 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
         if (!mat.emissiveTexPath.empty() && mat.emissionStrength <= 0.0f) {
             mat.emission = make_float3(1.0f, 1.0f, 1.0f);
             mat.emissionStrength = 1.0f;
+        }
+
+        // Emissive materials should not be treated as glass/transmissive.
+        // FBX often sets opacity < 1 on light bulb materials, but they should
+        // glow opaquely, not refract light through them.
+        if (mat.emissionStrength > 0.0f && mat.transmission > 0.0f) {
+            LOG_INFO("Material '%s': disabling transmission (%.3f) for emissive material",
+                     materialName.c_str(), mat.transmission);
+            mat.transmission = 0.0f;
         }
 
         scene.getMaterials().push_back(std::move(mat));

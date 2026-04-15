@@ -33,6 +33,28 @@ inline D float smithG(float NdotL, float NdotV, float roughness) {
     return smithG1(NdotL, roughness) * smithG1(NdotV, roughness);
 }
 
+// ── Dielectric Fresnel (exact, for glass) ────────────────────
+inline D float fresnelDielectric(float cosThetaI, float eta) {
+    // eta = etaI / etaT (ratio of indices of refraction)
+    float sinThetaT2 = eta * eta * (1.0f - cosThetaI * cosThetaI);
+    if (sinThetaT2 >= 1.0f) return 1.0f; // Total internal reflection
+
+    float cosThetaT = sqrtf(fmaxf(0.0f, 1.0f - sinThetaT2));
+    float rs = (cosThetaI - eta * cosThetaT) / (cosThetaI + eta * cosThetaT + 1e-7f);
+    float rp = (eta * cosThetaI - cosThetaT) / (eta * cosThetaI + cosThetaT + 1e-7f);
+    return 0.5f * (rs * rs + rp * rp);
+}
+
+// ── Snell refraction (returns false on TIR) ──────────────────
+inline D bool refractDir(float3 I, float3 N, float eta, float3& refracted) {
+    float NdotI = dot(N, I);
+    float k = 1.0f - eta * eta * (1.0f - NdotI * NdotI);
+    if (k < 0.0f) return false; // Total internal reflection
+    refracted = I * eta - N * (eta * NdotI + sqrtf(k));
+    refracted = normalize(refracted);
+    return true;
+}
+
 // ── Full Cook-Torrance evaluation ────────────────────────────
 inline D float3 evaluateCookTorrance(
     const GPUMaterial& mat, float3 N, float3 V, float3 L, float3 albedo)
