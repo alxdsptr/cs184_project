@@ -68,7 +68,11 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
                  bool& enableEnvironment, bool& invertMouseY, uint32_t& maxBounces,
                  float& exposure, int& toneMappingMode,
                  float& moveSpeed,
-                 char* envMapPathBuf, size_t envMapPathBufSize, bool& loadEnvMapRequested) {
+                 char* envMapPathBuf, size_t envMapPathBufSize, bool& loadEnvMapRequested,
+                 int* renderMode,
+                 int* dlssQuality,
+                 uint32_t renderResW,
+                 uint32_t renderResH) {
     bool changed = false;
     loadEnvMapRequested = false;
 
@@ -101,6 +105,24 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
     ImGui::SliderFloat("Exposure", &exposure, 0.05f, 8.0f, "%.2f");
     const char* toneMappingItems[] = {"None", "Reinhard", "ACES"};
     ImGui::Combo("Mode", &toneMappingMode, toneMappingItems, IM_ARRAYSIZE(toneMappingItems));
+
+    if (renderMode) {
+        ImGui::Separator();
+        ImGui::Text("Render Mode");
+        const char* modes[] = {"Native", "NRD (denoise)", "NRD + DLSS"};
+        if (ImGui::Combo("Pipeline", renderMode, modes, IM_ARRAYSIZE(modes))) {
+            changed = true;
+        }
+        if (*renderMode == 2 && dlssQuality) {
+            const char* q[] = {"Performance", "Balanced", "Quality", "DLAA"};
+            if (ImGui::Combo("DLSS Quality", dlssQuality, q, IM_ARRAYSIZE(q))) {
+                changed = true;
+            }
+        }
+        if (*renderMode != 0 && renderResW && renderResH) {
+            ImGui::Text("Render res: %ux%u", renderResW, renderResH);
+        }
+    }
 
     ImGui::Separator();
     ImGui::Text("HDR Environment Map");

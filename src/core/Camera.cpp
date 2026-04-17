@@ -133,9 +133,14 @@ CameraParams Camera::getParams(uint32_t frameIndex) const {
     // Not applied here (done in kernel via ray offset) -- store for DLSS
     p.viewProjMatrix    = mat4_multiply(m_projMatrix, m_viewMatrix);
     p.prevViewProjMatrix = m_prevViewProj;
+    p.prevViewMatrix     = m_prevViewMatrix;
+    p.prevProjMatrix     = m_prevProjMatrix;
 
     // Update prev for next frame (const_cast needed since we cache prev)
-    const_cast<Camera*>(this)->m_prevViewProj = p.viewProjMatrix;
+    Camera* self = const_cast<Camera*>(this);
+    self->m_prevViewProj    = p.viewProjMatrix;
+    self->m_prevViewMatrix  = m_viewMatrix;
+    self->m_prevProjMatrix  = m_projMatrix;
 
     return p;
 }

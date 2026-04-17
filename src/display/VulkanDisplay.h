@@ -48,6 +48,21 @@ public:
     // data into the active command buffer. Set to nullptr for headless.
     void setImGuiRecorder(void (*fn)(VkCommandBuffer, void*), void* user);
 
+    // Optional per-frame recorder that replaces the default CUDA interop
+    // buffer-to-image copy. When set, the callback is invoked in the middle
+    // of present() — it must, by its end, leave `sampledImage()` in the
+    // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL layout containing the LDR
+    // swapchain-sized output. Used by Renderer in non-Native modes to
+    // redirect the pipeline through NRD + composite + DLSS.
+    void setPrePresentRecorder(void (*fn)(VkCommandBuffer, void*), void* user);
+
+    // Getters used by the pre-present recorder.
+    VkImage     sampledImage()  const { return m_sampledImage; }
+    VkImageView sampledImageView() const { return m_sampledImageView; }
+    VkFormat    sampledImageFormat() const { return VK_FORMAT_R8G8B8A8_UNORM; }
+    uint32_t    width()  const { return m_width; }
+    uint32_t    height() const { return m_height; }
+
     // For GUI init: these getters expose the objects imgui_impl_vulkan needs.
     VkInstance       instance()       const { return m_instance; }
     VkPhysicalDevice physicalDevice() const { return m_physicalDevice; }
@@ -60,6 +75,12 @@ public:
     uint32_t         minImageCount()  const { return m_minImageCount; }
 
     bool saveToPNG(const std::string& path) const;
+
+    // Enabled extensions recorded at instance/device creation. Read by the
+    // NRD/DLSS postfx layer to construct an NRI DeviceCreationVKDesc. Native
+    // mode never touches these; they're inert.
+    const std::vector<const char*>& enabledInstanceExtensions() const { return m_enabledInstanceExts; }
+    const std::vector<const char*>& enabledDeviceExtensions()   const { return m_enabledDeviceExts; }
 
 private:
     // ── Init sub-steps ───────────────────────────────────────────
@@ -161,7 +182,17 @@ private:
     void (*m_imguiRecorder)(VkCommandBuffer, void*) = nullptr;
     void* m_imguiUser = nullptr;
 
+    // Pre-present recorder (replaces buffer-to-image copy when non-null).
+    void (*m_prePresentRecorder)(VkCommandBuffer, void*) = nullptr;
+    void* m_prePresentUser = nullptr;
+
     VkDescriptorPool m_imguiDescriptorPool = VK_NULL_HANDLE;
 
     bool m_validationEnabled = false;
+
+    // Recorded (not populated outside init) — const ptrs borrowed from the
+    // same allocation sites as createInstance/createDevice, safe for the life
+    // of the display backend.
+    std::vector<const char*> m_enabledInstanceExts;
+    std::vector<const char*> m_enabledDeviceExts;
 };

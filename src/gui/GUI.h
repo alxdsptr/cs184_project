@@ -13,11 +13,20 @@ public:
     void init(GLFWwindow* window, VulkanDisplay* display);
 
     void beginFrame();
+    // Optional `renderMode` / `dlssQuality` appear as GUI controls when non-null.
+    // `renderMode`: 0 = Native, 1 = NRD only, 2 = NRD + DLSS.
+    // `dlssQuality`: 0 = Perf, 1 = Balanced, 2 = Quality, 3 = DLAA.
+    // `renderResW/H` are informational readouts (the render resolution DLSS
+    // picked). Callers may pass 0.
     bool render(float fps, uint32_t sampleCount, uint32_t width, uint32_t height,
                 bool& enableEnvironment, bool& invertMouseY, uint32_t& maxBounces,
                 float& exposure, int& toneMappingMode,
                 float& moveSpeed,
-                char* envMapPathBuf, size_t envMapPathBufSize, bool& loadEnvMapRequested);
+                char* envMapPathBuf, size_t envMapPathBufSize, bool& loadEnvMapRequested,
+                int* renderMode = nullptr,
+                int* dlssQuality = nullptr,
+                uint32_t renderResW = 0,
+                uint32_t renderResH = 0);
     void endFrame();
     void shutdown();
 

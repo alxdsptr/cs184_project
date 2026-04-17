@@ -15,6 +15,11 @@ struct CameraParams {
     float4x4 projMatrix;
     float4x4 viewProjMatrix;
     float4x4 prevViewProjMatrix;
+    // Previous-frame view & proj (unjittered), for denoisers (NRD) that want
+    // them split. `prevViewProjMatrix` above remains valid for anyone who
+    // only needs the combined form.
+    float4x4 prevViewMatrix;
+    float4x4 prevProjMatrix;
     float2   jitterOffset;
     uint32_t frameIndex;
     uint32_t _pad;
@@ -68,5 +73,7 @@ private:
     float4x4 m_viewMatrix  = float4x4::identity();
     float4x4 m_projMatrix  = float4x4::identity();
     float4x4 m_prevViewProj = float4x4::identity();
+    float4x4 m_prevViewMatrix = float4x4::identity();
+    float4x4 m_prevProjMatrix = float4x4::identity();
     bool     m_moved = false;
 };

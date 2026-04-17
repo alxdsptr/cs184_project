@@ -69,25 +69,50 @@ if(PATHTRACER_ENABLE_NRD_DLSS)
     set(NRD_EMBEDS_DXBC_SHADERS OFF CACHE BOOL "" FORCE)
     add_subdirectory(external/NRD)
 
-    # DLSS (NGX) — prebuilt SDK, headers + import lib + runtime DLL
+    # DLSS (NGX) — prebuilt SDK, headers + import lib + runtime DLL.
+    # Import libs come in two flavors:
+    #   Release : nvsdk_ngx_d.lib     (MD  + ITERATOR_DEBUG_LEVEL=0)
+    #   Debug   : nvsdk_ngx_d_dbg.lib (MDd + ITERATOR_DEBUG_LEVEL=2)
+    # Picking the wrong one produces LNK2038 mismatches on MSVC.
     find_path(DLSS_INCLUDE_DIR
         NAMES nvsdk_ngx.h nvsdk_ngx_vk.h
         PATHS "${PATHTRACER_DLSS_SDK_DIR}/include"
         NO_DEFAULT_PATH
         REQUIRED)
-    find_library(DLSS_LIBRARY
+    find_library(DLSS_LIBRARY_RELEASE
         NAMES nvsdk_ngx_d
         PATHS "${PATHTRACER_DLSS_SDK_DIR}/lib/Windows_x86_64/x64"
         NO_DEFAULT_PATH
         REQUIRED)
-    set(DLSS_RUNTIME_DLL "${PATHTRACER_DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll"
-        CACHE FILEPATH "")
-    if(NOT EXISTS "${DLSS_RUNTIME_DLL}")
-        message(FATAL_ERROR "DLSS runtime DLL not found at ${DLSS_RUNTIME_DLL}")
+    find_library(DLSS_LIBRARY_DEBUG
+        NAMES nvsdk_ngx_d_dbg
+        PATHS "${PATHTRACER_DLSS_SDK_DIR}/lib/Windows_x86_64/x64"
+        NO_DEFAULT_PATH)
+    if(NOT DLSS_LIBRARY_DEBUG)
+        # Fall back to release lib if debug variant is missing — will break Debug
+        # builds but keeps Release functional.
+        set(DLSS_LIBRARY_DEBUG "${DLSS_LIBRARY_RELEASE}")
     endif()
-    message(STATUS "DLSS include: ${DLSS_INCLUDE_DIR}")
-    message(STATUS "DLSS lib:     ${DLSS_LIBRARY}")
-    message(STATUS "DLSS dll:     ${DLSS_RUNTIME_DLL}")
+    # Generator-expression-friendly path for per-config linkage.
+    set(DLSS_LIBRARY "$<IF:$<CONFIG:Debug>,${DLSS_LIBRARY_DEBUG},${DLSS_LIBRARY_RELEASE}>")
+
+    set(DLSS_RUNTIME_DLL_RELEASE "${PATHTRACER_DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll")
+    set(DLSS_RUNTIME_DLL_DEBUG   "${PATHTRACER_DLSS_SDK_DIR}/lib/Windows_x86_64/dev/nvngx_dlss.dll")
+    if(NOT EXISTS "${DLSS_RUNTIME_DLL_RELEASE}")
+        message(FATAL_ERROR "DLSS runtime DLL not found at ${DLSS_RUNTIME_DLL_RELEASE}")
+    endif()
+    if(NOT EXISTS "${DLSS_RUNTIME_DLL_DEBUG}")
+        # Fall back to release DLL for Debug — NGX will still function, the
+        # only loss is debug symbol visibility.
+        set(DLSS_RUNTIME_DLL_DEBUG "${DLSS_RUNTIME_DLL_RELEASE}")
+    endif()
+    set(DLSS_RUNTIME_DLL "$<IF:$<CONFIG:Debug>,${DLSS_RUNTIME_DLL_DEBUG},${DLSS_RUNTIME_DLL_RELEASE}>")
+
+    message(STATUS "DLSS include:   ${DLSS_INCLUDE_DIR}")
+    message(STATUS "DLSS lib (rel): ${DLSS_LIBRARY_RELEASE}")
+    message(STATUS "DLSS lib (dbg): ${DLSS_LIBRARY_DEBUG}")
+    message(STATUS "DLSS dll (rel): ${DLSS_RUNTIME_DLL_RELEASE}")
+    message(STATUS "DLSS dll (dbg): ${DLSS_RUNTIME_DLL_DEBUG}")
 endif()
 
 # ── SPIR-V shader compilation ────────────────────────────────
@@ -99,8 +124,13 @@ set(SHADER_FILES
     fullscreen_quad_vk.vert
     fullscreen_quad_vk.frag
 )
-# NRD+DLSS shaders (composite_tonemap.frag, composite_linear.frag,
-# tonemap_only.frag) are appended here by Step 6 once they exist.
+if(PATHTRACER_ENABLE_NRD_DLSS)
+    list(APPEND SHADER_FILES
+        composite_tonemap.frag
+        composite_linear.frag
+        tonemap_only.frag
+    )
+endif()
 set(SPV_OUTPUTS)
 foreach(SHADER IN LISTS SHADER_FILES)
     set(IN  ${SHADER_SRC_DIR}/${SHADER})
@@ -173,7 +203,9 @@ if(PATHTRACER_ENABLE_NRD_DLSS)
         src/interop/VulkanImageInterop.cpp
         src/render/VulkanSharedAuxBuffers.cpp
         src/render/PathTraceKernelSplit.cu
-        # Added as they come online (NRDContext.cpp, DLSSContext.cpp, CompositePass.cpp)
+        src/postfx/NRDContext.cpp
+        src/postfx/CompositePass.cpp
+        src/postfx/DLSSContext.cpp
     )
     target_compile_definitions(pathtracer PRIVATE PATHTRACER_NRD_DLSS_ENABLED=1)
     target_include_directories(pathtracer PRIVATE
@@ -211,10 +243,27 @@ add_custom_command(TARGET pathtracer POST_BUILD
     VERBATIM)
 
 # Ship the NGX runtime DLL next to the executable when DLSS is enabled.
-if(PATHTRACER_ENABLE_NRD_DLSS AND EXISTS "${DLSS_RUNTIME_DLL}")
+# DLSS_RUNTIME_DLL is a generator expression that resolves per-config.
+if(PATHTRACER_ENABLE_NRD_DLSS)
     add_custom_command(TARGET pathtracer POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${DLSS_RUNTIME_DLL}"
             $<TARGET_FILE_DIR:pathtracer>/
         VERBATIM)
+
+    # NRD is built as a shared library by default (NRD_STATIC_LIBRARY=OFF),
+    # so ship NRD/NRI runtime DLLs alongside the executable.
+    if(NOT NRD_STATIC_LIBRARY)
+        add_custom_command(TARGET pathtracer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:NRD>"
+                $<TARGET_FILE_DIR:pathtracer>/
+            VERBATIM)
+
+        add_custom_command(TARGET pathtracer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:NRI>"
+                $<TARGET_FILE_DIR:pathtracer>/
+            VERBATIM)
+    endif()
 endif()

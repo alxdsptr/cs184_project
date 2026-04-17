@@ -328,7 +328,9 @@ void Application::renderSceneSample(uchar4* d_pbo, bool timeHeadless) {
         CameraParams camParams = m_camera.getParams(m_frameIndex);
         DeviceSceneData sceneData = m_backend->getSceneData();
         sceneData.envMapTex = m_envMapTex;
-        m_renderer.renderFrame(camParams, sceneData, m_backend.get(), d_pbo, m_enableEnvironment, m_maxBounces);
+        m_renderer.renderFrame(camParams, sceneData, m_backend.get(), d_pbo,
+                               m_enableEnvironment, m_maxBounces,
+                               &m_display, m_frameIndex);
     } else {
         CUDA_CHECK(cudaMemset(d_pbo, 40, m_width * m_height * sizeof(uchar4)));
     }
@@ -405,6 +407,20 @@ void Application::runGui() {
         float moveSpeed = m_camera.getMoveSpeed();
         float exposure = m_renderer.getExposure();
         int toneMappingMode = (int)m_renderer.getToneMappingMode();
+
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+        int guiMode = (int)m_renderer.getMode();
+        int guiDlssQ = (int)m_renderer.getDLSSQuality();
+        uint32_t rrW = m_renderer.getRenderWidth();
+        uint32_t rrH = m_renderer.getRenderHeight();
+        int* modePtr = &guiMode;
+        int* qualityPtr = &guiDlssQ;
+#else
+        int* modePtr = nullptr;
+        int* qualityPtr = nullptr;
+        uint32_t rrW = 0, rrH = 0;
+#endif
+
         bool envChanged = m_gui.render(
             m_fps,
             m_renderer.getSampleCount(),
@@ -418,7 +434,18 @@ void Application::runGui() {
             moveSpeed,
             m_envMapPathBuf,
             sizeof(m_envMapPathBuf),
-            envMapLoadRequested);
+            envMapLoadRequested,
+            modePtr, qualityPtr, rrW, rrH);
+
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+        if (modePtr && *modePtr != (int)m_renderer.getMode()) {
+            m_renderer.setMode((Renderer::Mode)(*modePtr), &m_display);
+        }
+        if (qualityPtr && *qualityPtr != (int)m_renderer.getDLSSQuality()) {
+            m_renderer.setDLSSQuality((Renderer::DLSSQuality)(*qualityPtr));
+        }
+#endif
+
         m_camera.setMoveSpeed(moveSpeed);
         m_renderer.setExposure(exposure);
         if (toneMappingMode < (int)ToneMappingMode::None) {
