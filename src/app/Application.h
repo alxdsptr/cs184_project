@@ -1,6 +1,6 @@
 #pragma once
 #include "core/Camera.h"
-#include "display/GLDisplay.h"
+#include "display/VulkanDisplay.h"
 #include "gui/GUI.h"
 #include "scene/Scene.h"
 #include "scene/Texture.h"
@@ -34,8 +34,8 @@ private:
     uint32_t    m_width  = 1280;
     uint32_t    m_height = 720;
 
-    Camera     m_camera;
-    GLDisplay  m_display;
+    Camera        m_camera;
+    VulkanDisplay m_display;
     GUI        m_gui;
     Scene      m_scene;
     TextureManager m_textures;

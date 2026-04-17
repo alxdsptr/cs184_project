@@ -3,7 +3,7 @@
 #include "util/Log.h"
 #include "util/CudaCheck.h"
 
-#include <GL/glew.h>
+#define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 #include <cuda_runtime.h>
 
@@ -18,6 +18,7 @@
 
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
+#include <imgui_impl_vulkan.h>
 
 static float3 normalizeOrFallback(float3 v, float3 fallback) {
     float len = length(v);
@@ -146,20 +147,12 @@ bool Application::init(uint32_t width, uint32_t height, const std::string& title
     glfwSetErrorCallback(glfwErrorCb);
     if (!glfwInit()) { LOG_ERROR("glfwInit failed"); return false; }
 
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_VISIBLE, m_guiEnabled ? GLFW_TRUE : GLFW_FALSE);
 
     m_window = glfwCreateWindow(width, height, title.c_str(), nullptr, nullptr);
     if (!m_window) { LOG_ERROR("glfwCreateWindow failed"); return false; }
-    glfwMakeContextCurrent(m_window);
-    glfwSwapInterval(0);
     glfwSetWindowUserPointer(m_window, this);
-
-    // GLEW
-    glewExperimental = GL_TRUE;
-    if (glewInit() != GLEW_OK) { LOG_ERROR("glewInit failed"); return false; }
 
     // CUDA device
     int deviceCount = 0;
@@ -171,10 +164,11 @@ bool Application::init(uint32_t width, uint32_t height, const std::string& title
              prop.name, prop.major, prop.minor, prop.totalGlobalMem / (1024*1024));
     CUDA_CHECK(cudaSetDevice(0));
 
-    // Initialize subsystems
+    // Initialize subsystems — CUDA first so Vulkan can match its device UUID
+    m_display.setWindow(m_window);
     m_display.init(width, height);
     if (m_guiEnabled) {
-        m_gui.init(m_window);
+        m_gui.init(m_window, &m_display);
     }
     glfwSetScrollCallback(m_window, glfwScrollCallback);
     m_renderer.init(width, height);
@@ -365,7 +359,6 @@ void Application::runGui() {
             m_renderer.resize(m_width, m_height);
             m_camera.setAspect((float)m_width / m_height);
             m_renderer.resetAccumulation();
-            glViewport(0, 0, fbW, fbH);
         }
 
         processInput();
@@ -395,9 +388,6 @@ void Application::runGui() {
         uchar4* d_pbo = (uchar4*)m_display.mapForCUDA();
         renderSceneSample(d_pbo, false);
         m_display.unmapFromCUDA();
-
-        glClear(GL_COLOR_BUFFER_BIT);
-        m_display.present();
 
         if (saveScreenshot && m_sceneLoaded) {
             std::filesystem::create_directories("screenshots");
@@ -447,7 +437,7 @@ void Application::runGui() {
         }
         m_gui.endFrame();
 
-        glfwSwapBuffers(m_window);
+        m_display.present();
         m_frameIndex++;
     }
 }
@@ -474,7 +464,6 @@ void Application::runHeadless() {
             glfwSetWindowShouldClose(m_window, true);
         }
 
-        glfwSwapBuffers(m_window);
         m_frameIndex++;
     }
 }
@@ -488,6 +477,7 @@ void Application::run() {
 }
 
 void Application::shutdown() {
+    m_display.waitIdle();
     m_renderer.shutdown();
     m_textures.freeAll();
     m_gui.shutdown();

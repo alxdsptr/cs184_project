@@ -14,11 +14,23 @@ endif()
 
 # ── Dependencies ──────────────────────────────────────────────
 find_package(CUDAToolkit REQUIRED)
-find_package(OpenGL REQUIRED)
+
+# Vulkan SDK — honor VULKAN_SDK env var, fall back to machine-local install.
+if(NOT DEFINED ENV{VULKAN_SDK} AND EXISTS "d:/tools/Vulkan")
+    set(ENV{VULKAN_SDK} "d:/tools/Vulkan")
+endif()
+find_package(Vulkan REQUIRED)
+if(NOT Vulkan_GLSLC_EXECUTABLE)
+    # glslc usually ships alongside vulkan-1.lib; Vulkan::Vulkan won't expose
+    # it on older CMake's FindVulkan, so look up manually.
+    find_program(Vulkan_GLSLC_EXECUTABLE NAMES glslc
+        HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin"
+        REQUIRED)
+endif()
+message(STATUS "glslc: ${Vulkan_GLSLC_EXECUTABLE}")
 
 include(cmake/CompilerFlags.cmake)
 include(cmake/FetchGLFW.cmake)
-include(cmake/FetchGLEW.cmake)
 include(cmake/FetchImGui.cmake)
 include(cmake/FetchGLI.cmake)
 
@@ -30,6 +42,28 @@ set(ASSIMP_INSTALL OFF CACHE BOOL "" FORCE)
 set(ASSIMP_NO_EXPORT ON CACHE BOOL "" FORCE)
 set(ASSIMP_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
 add_subdirectory(assimp)
+
+# ── SPIR-V shader compilation ────────────────────────────────
+set(SHADER_SRC_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
+set(SHADER_OUT_DIR  ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
+
+set(SHADER_FILES
+    fullscreen_quad_vk.vert
+    fullscreen_quad_vk.frag
+)
+set(SPV_OUTPUTS)
+foreach(SHADER IN LISTS SHADER_FILES)
+    set(IN  ${SHADER_SRC_DIR}/${SHADER})
+    set(OUT ${SHADER_OUT_DIR}/${SHADER}.spv)
+    add_custom_command(
+        OUTPUT  ${OUT}
+        COMMAND ${Vulkan_GLSLC_EXECUTABLE} ${IN} -o ${OUT}
+        DEPENDS ${IN}
+        VERBATIM)
+    list(APPEND SPV_OUTPUTS ${OUT})
+endforeach()
+add_custom_target(shaders DEPENDS ${SPV_OUTPUTS})
 
 # ── Main executable ──────────────────────────────────────────
 add_executable(pathtracer
@@ -46,7 +80,7 @@ add_executable(pathtracer
     src/scene/Texture.cpp
     src/scene/utils.cpp
     # Display
-    src/display/GLDisplay.cpp
+    src/display/VulkanDisplay.cpp
     # GUI
     src/gui/GUI.cpp
     # Render
@@ -65,6 +99,8 @@ target_sources(pathtracer PRIVATE
     src/render/AuxBuffers.cu
 )
 
+add_dependencies(pathtracer shaders)
+
 target_include_directories(pathtracer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/assimp/include
@@ -74,9 +110,8 @@ target_include_directories(pathtracer PRIVATE
 )
 
 target_link_libraries(pathtracer PRIVATE
-    OpenGL::GL
+    Vulkan::Vulkan
     glfw
-    libglew_static
     imgui
     assimp
     gli_headers
@@ -95,3 +130,11 @@ target_compile_options(pathtracer PRIVATE
         -lineinfo
     >
 )
+
+# Copy SPIR-V alongside the executable so runtime relative lookup works,
+# regardless of whether the working directory is build/ or its subdir.
+add_custom_command(TARGET pathtracer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${SHADER_OUT_DIR}
+        $<TARGET_FILE_DIR:pathtracer>/shaders
+    VERBATIM)
