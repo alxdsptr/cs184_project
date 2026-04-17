@@ -199,7 +199,8 @@ __global__ void pathTraceKernel(
     uint32_t        height,
     uint32_t        sampleIndex,
     bool            enableEnvironment,
-    uint32_t        maxBounces)
+    uint32_t        maxBounces,
+    uint32_t        samplesPerPixel)
 {
     uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -207,8 +208,17 @@ __global__ void pathTraceKernel(
 
     uint32_t pixelIdx = y * width + x;
 
-    // Per-pixel RNG
-    uint32_t rng = pcg32_seed(pixelIdx, sampleIndex);
+    if (samplesPerPixel < 1) samplesPerPixel = 1;
+
+    // Sum of per-sample radiance over this frame's spp. Added to the accum
+    // buffer as one batch; caller advances the sample counter by `spp`.
+    float3 radianceSum = make_float3(0, 0, 0);
+    bool gbufferWritten = false;
+
+    for (uint32_t s = 0; s < samplesPerPixel; s++) {
+    // Unique RNG subseed per (pixel, frame, sample-in-frame).
+    uint32_t rng = pcg32_seed(pixelIdx * 0x9E3779B9u + s,
+                              sampleIndex * 0x85EBCA6Bu + s);
 
     // Sub-pixel jitter
     float jx = pcg32_float(rng) - 0.5f;
@@ -323,23 +333,27 @@ __global__ void pathTraceKernel(
             if (dot(N, ray.direction) > 0) N = -N;
         }
 
-        // Write aux buffers on first bounce
+        // Write aux buffers from the first sample that produces a primary hit.
+        // `firstBounce` guards within a path; `!gbufferWritten` guards across
+        // the samples-per-pixel loop so we don't overwrite on subsequent spp.
         if (firstBounce) {
-            if (auxBuffers.d_linearDepth)
-                auxBuffers.d_linearDepth[pixelIdx] = dot(hit.position - camera.position, camera.forward);
-            if (auxBuffers.d_albedo)
-                auxBuffers.d_albedo[pixelIdx] = albedo;
-            if (auxBuffers.d_normal)
-                auxBuffers.d_normal[pixelIdx] = N;
-            // Motion vectors (simplified: only camera motion)
-            if (auxBuffers.d_motionVectors) {
-                float3 clipCurr = mat4_transformPoint(camera.viewProjMatrix, hit.position);
-                float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hit.position);
-                float2 screenCurr = make_float2((clipCurr.x + 1.0f) * 0.5f * width,
-                                                 (1.0f - clipCurr.y) * 0.5f * height);
-                float2 screenPrev = make_float2((clipPrev.x + 1.0f) * 0.5f * width,
-                                                 (1.0f - clipPrev.y) * 0.5f * height);
-                auxBuffers.d_motionVectors[pixelIdx] = screenCurr - screenPrev;
+            if (!gbufferWritten) {
+                if (auxBuffers.d_linearDepth)
+                    auxBuffers.d_linearDepth[pixelIdx] = dot(hit.position - camera.position, camera.forward);
+                if (auxBuffers.d_albedo)
+                    auxBuffers.d_albedo[pixelIdx] = albedo;
+                if (auxBuffers.d_normal)
+                    auxBuffers.d_normal[pixelIdx] = N;
+                if (auxBuffers.d_motionVectors) {
+                    float3 clipCurr = mat4_transformPoint(camera.viewProjMatrix, hit.position);
+                    float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hit.position);
+                    float2 screenCurr = make_float2((clipCurr.x + 1.0f) * 0.5f * width,
+                                                     (1.0f - clipCurr.y) * 0.5f * height);
+                    float2 screenPrev = make_float2((clipPrev.x + 1.0f) * 0.5f * width,
+                                                     (1.0f - clipPrev.y) * 0.5f * height);
+                    auxBuffers.d_motionVectors[pixelIdx] = screenCurr - screenPrev;
+                }
+                gbufferWritten = true;
             }
             firstBounce = false;
         }
@@ -687,10 +701,14 @@ __global__ void pathTraceKernel(
         radiance = radiance * scale;
     }
 
-    // Accumulate
-    float4 sample = make_float4(radiance.x, radiance.y, radiance.z, 1.0f);
-    d_accumBuffer[pixelIdx] = d_accumBuffer[pixelIdx] + sample;
-    float invN = 1.0f / (float)(sampleIndex + 1);
+        radianceSum = radianceSum + radiance;
+    } // end spp loop
+
+    // Accumulate: add all spp samples at once. The caller advances the sample
+    // counter by `samplesPerPixel`, so the divisor below stays correct.
+    float4 sumTexel = make_float4(radianceSum.x, radianceSum.y, radianceSum.z, (float)samplesPerPixel);
+    d_accumBuffer[pixelIdx] = d_accumBuffer[pixelIdx] + sumTexel;
+    float invN = 1.0f / (float)(sampleIndex + samplesPerPixel);
     d_outputBuffer[pixelIdx] = d_accumBuffer[pixelIdx] * invN;
 }
 
@@ -704,12 +722,14 @@ void launchPathTraceKernel(
     uint32_t height,
     uint32_t sampleIndex,
     bool enableEnvironment,
-    uint32_t maxBounces)
+    uint32_t maxBounces,
+    uint32_t samplesPerPixel)
 {
+    if (samplesPerPixel < 1) samplesPerPixel = 1;
     dim3 block(8, 8);
     dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
     pathTraceKernel<<<grid, block>>>(
         scene, camera, d_accumBuffer, d_outputBuffer, auxBuffers,
-        width, height, sampleIndex, enableEnvironment, maxBounces);
+        width, height, sampleIndex, enableEnvironment, maxBounces, samplesPerPixel);
     CUDA_CHECK(cudaGetLastError());
 }

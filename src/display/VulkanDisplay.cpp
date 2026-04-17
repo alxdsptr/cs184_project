@@ -87,7 +87,15 @@ void VulkanDisplay::createInstance() {
     app.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     app.pEngineName        = "pathtracer";
     app.engineVersion      = VK_MAKE_VERSION(1, 0, 0);
+    // NRI's VK backend always queries promoted-to-core names for KHR
+    // functions (vkCmdCopyBuffer2, vkCmdPipelineBarrier2, etc.) and won't
+    // fall back to the *KHR aliases — those only exist in 1.3 core. So we
+    // request 1.3 whenever NRD/DLSS is compiled in.
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+    app.apiVersion         = VK_API_VERSION_1_3;
+#else
     app.apiVersion         = VK_API_VERSION_1_2;
+#endif
 
     // Extensions required by GLFW + debug + external memory capabilities
     uint32_t glfwExtCount = 0;
@@ -96,6 +104,27 @@ void VulkanDisplay::createInstance() {
     extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
     extensions.push_back(VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME);
     extensions.push_back(VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME);
+
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+    // Merge in NGX's required instance extensions. De-dup naively (O(n²) but
+    // n is tiny). If the query fails, we continue — DLSSContext::init will
+    // later detect the failure and demote to Native / NRDOnly.
+    {
+        std::vector<const char*> ngxInst, ngxDev;  // dev unused here
+        // We need a function-scope include; avoid pulling the NGX header
+        // into this header by using a small extern helper defined in
+        // DLSSContext.cpp.
+        extern bool DLSSContext_QueryRequiredExts(std::vector<const char*>&,
+                                                  std::vector<const char*>&);
+        if (DLSSContext_QueryRequiredExts(ngxInst, ngxDev)) {
+            auto already = [&](const char* s) {
+                for (const char* e : extensions) if (!strcmp(e, s)) return true;
+                return false;
+            };
+            for (const char* e : ngxInst) if (!already(e)) extensions.push_back(e);
+        }
+    }
+#endif
 
     std::vector<const char*> layers;
     if (m_validationEnabled) {
@@ -123,6 +152,9 @@ void VulkanDisplay::createInstance() {
     ci.ppEnabledLayerNames     = layers.data();
 
     VK_CHECK(vkCreateInstance(&ci, nullptr, &m_instance));
+
+    // Record for postfx (NRD/DLSS). Safe because these strings are all static.
+    m_enabledInstanceExts = extensions;
 
     if (m_validationEnabled) {
         VkDebugUtilsMessengerCreateInfoEXT dci{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
@@ -229,6 +261,51 @@ void VulkanDisplay::createDevice() {
 #endif
     };
 
+    // Probe available device extensions once; used by both NRD/DLSS and NRI setup.
+    uint32_t availCnt = 0;
+    vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &availCnt, nullptr);
+    std::vector<VkExtensionProperties> avail(availCnt);
+    vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &availCnt, avail.data());
+    auto isExtSupported = [&](const char* s) {
+        for (auto& p : avail) if (!strcmp(p.extensionName, s)) return true;
+        return false;
+    };
+    auto alreadyEnabled = [&](const char* s) {
+        for (const char* e : exts) if (!strcmp(e, s)) return true;
+        return false;
+    };
+
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+    {
+        std::vector<const char*> ngxInst, ngxDev;
+        extern bool DLSSContext_QueryRequiredExts(std::vector<const char*>&,
+                                                  std::vector<const char*>&);
+        if (DLSSContext_QueryRequiredExts(ngxInst, ngxDev)) {
+            for (const char* e : ngxDev) {
+                if (!alreadyEnabled(e) && isExtSupported(e)) exts.push_back(e);
+            }
+        }
+    }
+
+    // NRI (backing NRD) requires dynamicRendering, synchronization2,
+    // extendedDynamicState and push-descriptor. The first three are core in
+    // Vulkan 1.3 (promoted from these KHR/EXT extensions); we still list
+    // them so drivers/loader don't complain on edge cases, but the real
+    // feature bits come from VkPhysicalDeviceVulkan13Features below. The
+    // last one (push_descriptor) was NOT promoted to 1.3 core, so it must
+    // be enabled as an extension for NRI's `vkCmdPushDescriptorSet` lookup
+    // to succeed.
+    const char* nriRequired[] = {
+        VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
+        VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME,
+        VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+    };
+    for (const char* e : nriRequired) {
+        if (!alreadyEnabled(e) && isExtSupported(e)) exts.push_back(e);
+    }
+#endif
+
     VkPhysicalDeviceFeatures feats{};
     VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     ci.queueCreateInfoCount    = 1;
@@ -237,8 +314,60 @@ void VulkanDisplay::createDevice() {
     ci.ppEnabledExtensionNames = exts.data();
     ci.pEnabledFeatures        = &feats;
 
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+    // NRI's VK backend uses (but doesn't itself enable) several feature bits.
+    // Vulkan validation rightly complains if the bits aren't on, and the
+    // downstream behaviour — `vkGetBufferDeviceAddress` silently returning
+    // 0, partially-bound descriptor sets being malformed — produces exactly
+    // the kind of "silently crashes deep inside DenoiseVK" symptom we just
+    // fought through. Enable everything NRI pokes at.
+    VkPhysicalDeviceDynamicRenderingFeatures dynRenderFeat{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
+    VkPhysicalDeviceSynchronization2Features sync2Feat{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES};
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT edsFeat{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
+    // bufferDeviceAddress: NRI allocates with VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+    //                      and calls vkGetBufferDeviceAddress on the result.
+    // descriptorBindingPartiallyBound: NRD's pipeline layouts use this on every
+    //                      descriptor set layout binding range.
+    VkPhysicalDeviceBufferDeviceAddressFeatures bdaFeat{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+    VkPhysicalDeviceDescriptorIndexingFeatures diFeat{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
+    dynRenderFeat.dynamicRendering       = VK_TRUE;
+    sync2Feat.synchronization2           = VK_TRUE;
+    edsFeat.extendedDynamicState         = VK_TRUE;
+    bdaFeat.bufferDeviceAddress          = VK_TRUE;
+    diFeat.descriptorBindingPartiallyBound = VK_TRUE;
+    // Other descriptor-indexing bits NRI may use under the hood; cheap to turn on.
+    diFeat.shaderSampledImageArrayNonUniformIndexing   = VK_TRUE;
+    diFeat.shaderStorageImageArrayNonUniformIndexing   = VK_TRUE;
+    diFeat.runtimeDescriptorArray                      = VK_TRUE;
+    // UpdateAfterBind + UpdateUnusedWhilePending: without these, NRI creates
+    // its descriptor set layouts with VkDescriptorBindingFlags(0). Then when
+    // NewFrame() calls vkUpdateDescriptorSets on a set still referenced by
+    // an in-flight command buffer, validation fires 03047 and the shader
+    // reads undefined descriptors — which shows up as "all-snow" output from
+    // the denoiser even though it's technically "running".
+    diFeat.descriptorBindingSampledImageUpdateAfterBind  = VK_TRUE;
+    diFeat.descriptorBindingStorageImageUpdateAfterBind  = VK_TRUE;
+    diFeat.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
+    diFeat.descriptorBindingUniformBufferUpdateAfterBind = VK_TRUE;
+    diFeat.descriptorBindingUpdateUnusedWhilePending     = VK_TRUE;
+
+    dynRenderFeat.pNext = &sync2Feat;
+    sync2Feat.pNext     = &edsFeat;
+    edsFeat.pNext       = &bdaFeat;
+    bdaFeat.pNext       = &diFeat;
+    ci.pNext            = &dynRenderFeat;
+#endif
+
     VK_CHECK(vkCreateDevice(m_physicalDevice, &ci, nullptr, &m_device));
     vkGetDeviceQueue(m_device, m_graphicsQueueFamily, 0, &m_graphicsQueue);
+
+    // Record for postfx (NRD/DLSS).
+    m_enabledDeviceExts = exts;
 
 #ifdef _WIN32
     g_vkGetMemoryWin32HandleKHR = (PFN_vkGetMemoryWin32HandleKHR)
@@ -721,7 +850,9 @@ void VulkanDisplay::createSampledImage() {
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling  = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage   = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.usage   = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                | VK_IMAGE_USAGE_SAMPLED_BIT
+                | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;  // post-NRD composite writes here
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VK_CHECK(vkCreateImage(m_device, &ici, nullptr, &m_sampledImage));
@@ -862,26 +993,32 @@ void VulkanDisplay::present() {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &bi);
 
-    // 1. Transition sampled image to TRANSFER_DST
-    transitionImageLayout(cmd, m_sampledImage,
-        m_sampledImageLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        0, VK_ACCESS_TRANSFER_WRITE_BIT,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    if (m_prePresentRecorder) {
+        // Non-Native path: callback is responsible for populating m_sampledImage
+        // and must leave it in SHADER_READ_ONLY_OPTIMAL for the swapchain blit
+        // pipeline below. It gets the command buffer mid-recording.
+        m_prePresentRecorder(cmd, m_prePresentUser);
+        m_sampledImageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    } else {
+        // ── Native path: classic CUDA interop buffer → sampled image copy.
+        transitionImageLayout(cmd, m_sampledImage,
+            m_sampledImageLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            0, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-    // 2. Buffer -> Image copy
-    VkBufferImageCopy region{};
-    region.bufferOffset = 0;
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {m_width, m_height, 1};
-    vkCmdCopyBufferToImage(cmd, m_interopBuffer, m_sampledImage,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        VkBufferImageCopy region{};
+        region.bufferOffset = 0;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {m_width, m_height, 1};
+        vkCmdCopyBufferToImage(cmd, m_interopBuffer, m_sampledImage,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    // 3. Transition to SHADER_READ_ONLY
-    transitionImageLayout(cmd, m_sampledImage,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-    m_sampledImageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        transitionImageLayout(cmd, m_sampledImage,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        m_sampledImageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
 
     // 4. Begin render pass
     VkClearValue clear{};
@@ -976,6 +1113,11 @@ void VulkanDisplay::shutdown() {
 void VulkanDisplay::setImGuiRecorder(void (*fn)(VkCommandBuffer, void*), void* user) {
     m_imguiRecorder = fn;
     m_imguiUser = user;
+}
+
+void VulkanDisplay::setPrePresentRecorder(void (*fn)(VkCommandBuffer, void*), void* user) {
+    m_prePresentRecorder = fn;
+    m_prePresentUser = user;
 }
 
 // ─────────────────────────────────────────────────────────────

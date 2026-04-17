@@ -13,6 +13,7 @@ public:
     float4* getOutputBuffer() const { return m_outputBuffer; }
     uint32_t getSampleCount() const { return m_sampleCount; }
     void incrementSamples() { m_sampleCount++; }
+    void addSamples(uint32_t n) { m_sampleCount += n; }
 
 private:
     float4* m_accumBuffer  = nullptr;

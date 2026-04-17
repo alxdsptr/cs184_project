@@ -121,6 +121,10 @@ void Application::setMaxBounces(uint32_t maxBounces) {
     }
 }
 
+void Application::setSamplesPerFrame(uint32_t spp) {
+    m_samplesPerFrame = spp < 1 ? 1 : spp;
+}
+
 void Application::setHeadlessOutput(const std::string& outputPath, uint32_t sampleCount) {
     m_headlessOutputPath = outputPath;
     m_targetSamples = sampleCount < 1 ? 1 : sampleCount;
@@ -185,6 +189,16 @@ bool Application::init(uint32_t width, uint32_t height, const std::string& title
 
     m_lastFrameTime = (float)glfwGetTime();
     LOG_INFO("Application initialized (%ux%u)", width, height);
+
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+    if (m_initialMode >= 0) {
+        Renderer::Mode rm = Renderer::Mode::Native;
+        if (m_initialMode == 1) rm = Renderer::Mode::NRDOnly;
+        else if (m_initialMode == 2) rm = Renderer::Mode::NRDDLSS;
+        LOG_INFO("Applying initial renderer mode: %d", m_initialMode);
+        m_renderer.setMode(rm, &m_display);
+    }
+#endif
     return true;
 }
 
@@ -328,7 +342,10 @@ void Application::renderSceneSample(uchar4* d_pbo, bool timeHeadless) {
         CameraParams camParams = m_camera.getParams(m_frameIndex);
         DeviceSceneData sceneData = m_backend->getSceneData();
         sceneData.envMapTex = m_envMapTex;
-        m_renderer.renderFrame(camParams, sceneData, m_backend.get(), d_pbo, m_enableEnvironment, m_maxBounces);
+        m_renderer.renderFrame(camParams, sceneData, m_backend.get(), d_pbo,
+                               m_enableEnvironment, m_maxBounces,
+                               m_samplesPerFrame,
+                               &m_display, m_frameIndex);
     } else {
         CUDA_CHECK(cudaMemset(d_pbo, 40, m_width * m_height * sizeof(uchar4)));
     }
@@ -405,6 +422,20 @@ void Application::runGui() {
         float moveSpeed = m_camera.getMoveSpeed();
         float exposure = m_renderer.getExposure();
         int toneMappingMode = (int)m_renderer.getToneMappingMode();
+
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+        int guiMode = (int)m_renderer.getMode();
+        int guiDlssQ = (int)m_renderer.getDLSSQuality();
+        uint32_t rrW = m_renderer.getRenderWidth();
+        uint32_t rrH = m_renderer.getRenderHeight();
+        int* modePtr = &guiMode;
+        int* qualityPtr = &guiDlssQ;
+#else
+        int* modePtr = nullptr;
+        int* qualityPtr = nullptr;
+        uint32_t rrW = 0, rrH = 0;
+#endif
+
         bool envChanged = m_gui.render(
             m_fps,
             m_renderer.getSampleCount(),
@@ -418,7 +449,18 @@ void Application::runGui() {
             moveSpeed,
             m_envMapPathBuf,
             sizeof(m_envMapPathBuf),
-            envMapLoadRequested);
+            envMapLoadRequested,
+            modePtr, qualityPtr, rrW, rrH);
+
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+        if (modePtr && *modePtr != (int)m_renderer.getMode()) {
+            m_renderer.setMode((Renderer::Mode)(*modePtr), &m_display);
+        }
+        if (qualityPtr && *qualityPtr != (int)m_renderer.getDLSSQuality()) {
+            m_renderer.setDLSSQuality((Renderer::DLSSQuality)(*qualityPtr));
+        }
+#endif
+
         m_camera.setMoveSpeed(moveSpeed);
         m_renderer.setExposure(exposure);
         if (toneMappingMode < (int)ToneMappingMode::None) {

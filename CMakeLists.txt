@@ -6,11 +6,21 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_ARCHITECTURES 75 89)
+set(CMAKE_CUDA_ARCHITECTURES 75 86 89)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
+
+# ── NRD + DLSS master switch ─────────────────────────────────
+# Default OFF: binary must stay byte-identical to the pre-feature baseline.
+option(PATHTRACER_ENABLE_NRD_DLSS
+    "Enable NRD denoiser + DLSS-SR super-resolution (requires external/NRD submodule and DLSS SDK)"
+    OFF)
+
+# Location of the prebuilt DLSS SDK (only consulted when the option is ON).
+set(PATHTRACER_DLSS_SDK_DIR "D:/examples/DLSS" CACHE PATH
+    "Path to the NVIDIA DLSS (NGX) SDK root (contains include/ and lib/Windows_x86_64/)")
 
 # ── Dependencies ──────────────────────────────────────────────
 find_package(CUDAToolkit REQUIRED)
@@ -43,6 +53,75 @@ set(ASSIMP_NO_EXPORT ON CACHE BOOL "" FORCE)
 set(ASSIMP_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
 add_subdirectory(assimp)
 
+# ── NRD / NRI / DLSS (conditional) ───────────────────────────
+if(PATHTRACER_ENABLE_NRD_DLSS)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/NRD/CMakeLists.txt")
+        message(FATAL_ERROR
+            "PATHTRACER_ENABLE_NRD_DLSS=ON but external/NRD submodule is missing. "
+            "Run: git submodule update --init --recursive")
+    endif()
+
+    # NRD's own CMake will FetchContent NRI + MathLib + ShaderMake when NRD_NRI=ON.
+    set(NRD_NRI ON CACHE BOOL "" FORCE)
+    set(NRD_EMBEDS_SPIRV_SHADERS ON CACHE BOOL "" FORCE)
+    # We don't need D3D shaders for a Vulkan-only pathtracer.
+    set(NRD_EMBEDS_DXIL_SHADERS OFF CACHE BOOL "" FORCE)
+    set(NRD_EMBEDS_DXBC_SHADERS OFF CACHE BOOL "" FORCE)
+    # Match our aux-buffer format (VK_FORMAT_R8G8B8A8_UNORM). Encoding 0 stores
+    # normal as plain XYZ in RGB + linear roughness in A, which is what the
+    # CUDA path-trace kernel writes. The NRD default (2 = R10G10B10A2_UNORM
+    # with 10-bit oct packing) would make NRD decode garbage from an 8-bit
+    # image and silently destroy denoising quality.
+    set(NRD_NORMAL_ENCODING "0" CACHE STRING "" FORCE)
+    set(NRD_ROUGHNESS_ENCODING "1" CACHE STRING "" FORCE)
+    add_subdirectory(external/NRD)
+
+    # DLSS (NGX) — prebuilt SDK, headers + import lib + runtime DLL.
+    # Import libs come in two flavors:
+    #   Release : nvsdk_ngx_d.lib     (MD  + ITERATOR_DEBUG_LEVEL=0)
+    #   Debug   : nvsdk_ngx_d_dbg.lib (MDd + ITERATOR_DEBUG_LEVEL=2)
+    # Picking the wrong one produces LNK2038 mismatches on MSVC.
+    find_path(DLSS_INCLUDE_DIR
+        NAMES nvsdk_ngx.h nvsdk_ngx_vk.h
+        PATHS "${PATHTRACER_DLSS_SDK_DIR}/include"
+        NO_DEFAULT_PATH
+        REQUIRED)
+    find_library(DLSS_LIBRARY_RELEASE
+        NAMES nvsdk_ngx_d
+        PATHS "${PATHTRACER_DLSS_SDK_DIR}/lib/Windows_x86_64/x64"
+        NO_DEFAULT_PATH
+        REQUIRED)
+    find_library(DLSS_LIBRARY_DEBUG
+        NAMES nvsdk_ngx_d_dbg
+        PATHS "${PATHTRACER_DLSS_SDK_DIR}/lib/Windows_x86_64/x64"
+        NO_DEFAULT_PATH)
+    if(NOT DLSS_LIBRARY_DEBUG)
+        # Fall back to release lib if debug variant is missing — will break Debug
+        # builds but keeps Release functional.
+        set(DLSS_LIBRARY_DEBUG "${DLSS_LIBRARY_RELEASE}")
+    endif()
+    # Generator-expression-friendly path for per-config linkage.
+    set(DLSS_LIBRARY "$<IF:$<CONFIG:Debug>,${DLSS_LIBRARY_DEBUG},${DLSS_LIBRARY_RELEASE}>")
+
+    set(DLSS_RUNTIME_DLL_RELEASE "${PATHTRACER_DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll")
+    set(DLSS_RUNTIME_DLL_DEBUG   "${PATHTRACER_DLSS_SDK_DIR}/lib/Windows_x86_64/dev/nvngx_dlss.dll")
+    if(NOT EXISTS "${DLSS_RUNTIME_DLL_RELEASE}")
+        message(FATAL_ERROR "DLSS runtime DLL not found at ${DLSS_RUNTIME_DLL_RELEASE}")
+    endif()
+    if(NOT EXISTS "${DLSS_RUNTIME_DLL_DEBUG}")
+        # Fall back to release DLL for Debug — NGX will still function, the
+        # only loss is debug symbol visibility.
+        set(DLSS_RUNTIME_DLL_DEBUG "${DLSS_RUNTIME_DLL_RELEASE}")
+    endif()
+    set(DLSS_RUNTIME_DLL "$<IF:$<CONFIG:Debug>,${DLSS_RUNTIME_DLL_DEBUG},${DLSS_RUNTIME_DLL_RELEASE}>")
+
+    message(STATUS "DLSS include:   ${DLSS_INCLUDE_DIR}")
+    message(STATUS "DLSS lib (rel): ${DLSS_LIBRARY_RELEASE}")
+    message(STATUS "DLSS lib (dbg): ${DLSS_LIBRARY_DEBUG}")
+    message(STATUS "DLSS dll (rel): ${DLSS_RUNTIME_DLL_RELEASE}")
+    message(STATUS "DLSS dll (dbg): ${DLSS_RUNTIME_DLL_DEBUG}")
+endif()
+
 # ── SPIR-V shader compilation ────────────────────────────────
 set(SHADER_SRC_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
 set(SHADER_OUT_DIR  ${CMAKE_CURRENT_BINARY_DIR}/shaders)
@@ -52,6 +131,13 @@ set(SHADER_FILES
     fullscreen_quad_vk.vert
     fullscreen_quad_vk.frag
 )
+if(PATHTRACER_ENABLE_NRD_DLSS)
+    list(APPEND SHADER_FILES
+        composite_tonemap.frag
+        composite_linear.frag
+        tonemap_only.frag
+    )
+endif()
 set(SPV_OUTPUTS)
 foreach(SHADER IN LISTS SHADER_FILES)
     set(IN  ${SHADER_SRC_DIR}/${SHADER})
@@ -118,6 +204,30 @@ target_link_libraries(pathtracer PRIVATE
     CUDA::cudart
 )
 
+# ── Conditional NRD + DLSS sources / links ───────────────────
+if(PATHTRACER_ENABLE_NRD_DLSS)
+    target_sources(pathtracer PRIVATE
+        src/interop/VulkanImageInterop.cpp
+        src/render/VulkanSharedAuxBuffers.cpp
+        src/render/PathTraceKernelSplit.cu
+        src/postfx/NRDContext.cpp
+        src/postfx/CompositePass.cpp
+        src/postfx/DLSSContext.cpp
+    )
+    target_compile_definitions(pathtracer PRIVATE PATHTRACER_NRD_DLSS_ENABLED=1)
+    target_include_directories(pathtracer PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/NRD/Include
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/NRD/Integration
+        ${DLSS_INCLUDE_DIR}
+    )
+    # NRD's FetchContent pulls NRI into the build tree; it exposes a NRI CMake target.
+    target_link_libraries(pathtracer PRIVATE
+        NRD
+        NRI
+        "${DLSS_LIBRARY}"
+    )
+endif()
+
 set_target_properties(pathtracer PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -138,3 +248,29 @@ add_custom_command(TARGET pathtracer POST_BUILD
         ${SHADER_OUT_DIR}
         $<TARGET_FILE_DIR:pathtracer>/shaders
     VERBATIM)
+
+# Ship the NGX runtime DLL next to the executable when DLSS is enabled.
+# DLSS_RUNTIME_DLL is a generator expression that resolves per-config.
+if(PATHTRACER_ENABLE_NRD_DLSS)
+    add_custom_command(TARGET pathtracer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${DLSS_RUNTIME_DLL}"
+            $<TARGET_FILE_DIR:pathtracer>/
+        VERBATIM)
+
+    # NRD is built as a shared library by default (NRD_STATIC_LIBRARY=OFF),
+    # so ship NRD/NRI runtime DLLs alongside the executable.
+    if(NOT NRD_STATIC_LIBRARY)
+        add_custom_command(TARGET pathtracer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:NRD>"
+                $<TARGET_FILE_DIR:pathtracer>/
+            VERBATIM)
+
+        add_custom_command(TARGET pathtracer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:NRI>"
+                $<TARGET_FILE_DIR:pathtracer>/
+            VERBATIM)
+    endif()
+endif()

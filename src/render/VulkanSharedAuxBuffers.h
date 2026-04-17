@@ -1,0 +1,66 @@
+#pragma once
+
+// Vulkan-side aux buffers consumed by NRD (RELAX_DIFFUSE_SPECULAR) and later
+// by the composite/DLSS passes. Each image is backed by exported memory so
+// the path-trace kernel can write it directly via cudaSurfaceObject_t.
+//
+// Distinct from the CUDA-only `AuxBuffers` used by the Native fallback path.
+// Only present when PATHTRACER_NRD_DLSS_ENABLED.
+
+#include "interop/VulkanImageInterop.h"
+#include <cstdint>
+
+// Packed handles passed down to split path-trace kernel.
+struct SharedAuxSurfaces {
+    cudaSurfaceObject_t diffuseRadianceHitDist = 0; // RGBA16F, YCoCg+hitT packed (NRD frontend)
+    cudaSurfaceObject_t specularRadianceHitDist = 0; // RGBA16F
+    cudaSurfaceObject_t normalRoughness         = 0; // RGBA8_UNORM, NRD encoding 2 / roughness encoding 1
+    cudaSurfaceObject_t viewZ                   = 0; // R32F (signed view-space Z, linear)
+    cudaSurfaceObject_t motionVectors           = 0; // RG16F, screen-space pixel deltas
+    cudaSurfaceObject_t albedo                  = 0; // RGBA8_UNORM, diffuse reflectance (demodulation factor)
+    cudaSurfaceObject_t emissive                = 0; // RGBA16F, linear HDR
+};
+
+class VulkanSharedAuxBuffers {
+public:
+    VulkanSharedAuxBuffers() = default;
+    ~VulkanSharedAuxBuffers() = default;
+    VulkanSharedAuxBuffers(const VulkanSharedAuxBuffers&) = delete;
+    VulkanSharedAuxBuffers& operator=(const VulkanSharedAuxBuffers&) = delete;
+
+    // Returns false on any allocation failure — caller may fall back to Native mode.
+    bool create(VkDevice device, VkPhysicalDevice phys,
+                uint32_t width, uint32_t height);
+
+    // Safe to call multiple times / in any state.
+    void destroy();
+
+    bool resize(VkDevice device, VkPhysicalDevice phys,
+                uint32_t width, uint32_t height);
+
+    SharedAuxSurfaces surfaces() const;
+
+    // Accessors for Vulkan compute (NRD) and composite pass.
+    const SharedVulkanImage& diffuseRadianceHitDist() const { return m_diffRadHitDist; }
+    const SharedVulkanImage& specularRadianceHitDist() const { return m_specRadHitDist; }
+    const SharedVulkanImage& normalRoughness()         const { return m_normalRoughness; }
+    const SharedVulkanImage& viewZ()                   const { return m_viewZ; }
+    const SharedVulkanImage& motionVectors()           const { return m_motionVectors; }
+    const SharedVulkanImage& albedo()                  const { return m_albedo; }
+    const SharedVulkanImage& emissive()                const { return m_emissive; }
+
+    uint32_t width()  const { return m_width; }
+    uint32_t height() const { return m_height; }
+    bool valid()      const { return m_width != 0; }
+
+private:
+    SharedVulkanImage m_diffRadHitDist;
+    SharedVulkanImage m_specRadHitDist;
+    SharedVulkanImage m_normalRoughness;
+    SharedVulkanImage m_viewZ;
+    SharedVulkanImage m_motionVectors;
+    SharedVulkanImage m_albedo;
+    SharedVulkanImage m_emissive;
+    uint32_t m_width  = 0;
+    uint32_t m_height = 0;
+};
