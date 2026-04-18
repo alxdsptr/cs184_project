@@ -13,13 +13,55 @@
 
 // Path classification policy at the primary hit:
 //   - Roll one random number r against specProb to pick a bucket (diff or spec).
-//   - ALL subsequent radiance on this path (emissive, NEE, indirect) goes to
-//     the chosen bucket.
-//   - To keep the estimator unbiased, divide the full path contribution by
-//     the selected probability (Russian roulette at the level of the bucket).
+//   - At the PRIMARY hit only, NEE and BSDF sampling are restricted to the
+//     chosen lobe (diffuse-only BRDF / cosine PDF, or specular-only BRDF /
+//     GGX PDF). Throughput is scaled by 1/pickedP to keep the estimator
+//     unbiased at the bucket level.
+//   - Indirect bounces beyond the primary use the full mixture BRDF, since by
+//     then the bucket assignment is already fixed and we just need correct
+//     unbiased path integration from that point on.
 //
-// This is a pragmatic single-path-per-pixel approximation — NRD's two-bucket
-// output then gets remodulated by albedo in the composite pass.
+// Rationale: if we put the full (diffuse + specular) BRDF into a single bucket
+// each frame, NRD's temporal mean of each bucket approaches the full radiance,
+// and the composite ends up double-counting (diff*alb + spec ~ 2x). Routing
+// only the diffuse-lobe contribution through the diffuse bucket (and vice
+// versa) makes diff*alb + spec recover the true primary-hit radiance.
+
+// Primary-hit lobe-only BRDF evaluators. These are the diffuse/specular halves
+// of `bsdfEvaluate` in PathTraceHelpers.cuh — keep them in sync.
+__device__ inline float3 bsdfDiffuseLobe(
+    const float3& N, const float3& V, const float3& L,
+    const float3& albedo, float roughness, float metallic)
+{
+    (void)roughness;
+    float NdotL = fmaxf(dot(N, L), 0.0f);
+    float NdotV = fmaxf(dot(N, V), 0.0f);
+    if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0,0,0);
+    float3 H = normalize(V + L);
+    float LdotH = fmaxf(dot(L, H), 0.0f);
+    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, metallic);
+    float3 F  = fresnelSchlick_local(LdotH, F0);
+    float3 kd = (make_float3(1,1,1) - F) * (1.0f - metallic);
+    return kd * albedo * (1.0f / M_PI_F);
+}
+
+__device__ inline float3 bsdfSpecularLobe(
+    const float3& N, const float3& V, const float3& L,
+    const float3& albedo, float roughness, float metallic)
+{
+    float NdotL = fmaxf(dot(N, L), 0.0f);
+    float NdotV = fmaxf(dot(N, V), 0.0f);
+    if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0,0,0);
+    float3 H = normalize(V + L);
+    float NdotH = fmaxf(dot(N, H), 0.0f);
+    float LdotH = fmaxf(dot(L, H), 0.0f);
+    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, metallic);
+    float3 F  = fresnelSchlick_local(LdotH, F0);
+    float D_val = ggxD_local(NdotH, roughness);
+    float alpha = roughness * roughness;
+    float G_val = smithG1_GGX(NdotL, alpha) * smithG1_GGX(NdotV, alpha);
+    return F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
+}
 
 __global__ void pathTraceKernelSplit(
     DeviceSceneData       scene,
@@ -68,6 +110,12 @@ __global__ void pathTraceKernelSplit(
     float prevBsdfPdf = 1.0f;
 
     for (uint32_t bounce = 0; bounce < maxBounces; bounce++) {
+        // True only during the iteration where the primary opaque hit is
+        // classified into a bucket. Used to restrict NEE and BSDF sampling
+        // at the primary surface to the chosen lobe so that diff+spec
+        // buckets partition the primary-hit radiance rather than duplicate it.
+        bool primaryLobeOverride = false;
+
         HitRecord hit; hit.t = ray.tmax;
         bool didHit = false;
         if (scene.d_bvhNodes && scene.totalTriangles > 0) {
@@ -147,13 +195,16 @@ __global__ void pathTraceKernelSplit(
             float3 V = -ray.direction;
             float specProb = computeSpecProb(N, V, albedo, mat.metallic);
             pickedBucket = (pcg32_float(rng) < specProb) ? 1 : 0;
-            // Correct for the bucket pick: divide downstream contribution by
-            // the selected probability so both buckets remain unbiased.
+            // Correct for the bucket pick: divide the lobe-only contribution
+            // by the selected probability. Combined with forcing NEE/BSDF at
+            // the primary hit to the chosen lobe, this makes
+            // E[demodDiff*alb + demodSpec] = primary-hit radiance (unbiased).
             float pickedP = (pickedBucket == 1) ? specProb : (1.0f - specProb);
             throughput = throughput * (1.0f / fmaxf(pickedP, 1e-4f));
 
             haveGbuffer = true;
             firstBounce = false;
+            primaryLobeOverride = true;
         }
 
         // Glass (delta BSDF) — skipped for classification, treated as specular.
@@ -265,9 +316,21 @@ __global__ void pathTraceKernelSplit(
                     float pArea = pTri / fmaxf(light.area, 1e-7f);
                     float pdfOmega = pArea * d2 / fmaxf(lNdot, 1e-7f);
                     float3 V = -ray.direction;
-                    float3 brdf = bsdfEvaluate(N, V, Ld, albedo, mat.roughness, mat.metallic);
-                    float spProb = computeSpecProb(N, V, albedo, mat.metallic);
-                    float pdfBs = bsdfMixturePdf(N, V, Ld, mat.roughness, spProb);
+                    float3 brdf;
+                    float pdfBs;
+                    if (primaryLobeOverride) {
+                        if (pickedBucket == 0) {
+                            brdf  = bsdfDiffuseLobe(N, V, Ld, albedo, mat.roughness, mat.metallic);
+                            pdfBs = bsdfDiffusePdf(NdotL);
+                        } else {
+                            brdf  = bsdfSpecularLobe(N, V, Ld, albedo, mat.roughness, mat.metallic);
+                            pdfBs = bsdfSpecularPdf(N, V, Ld, mat.roughness);
+                        }
+                    } else {
+                        brdf = bsdfEvaluate(N, V, Ld, albedo, mat.roughness, mat.metallic);
+                        float spProb = computeSpecProb(N, V, albedo, mat.metallic);
+                        pdfBs = bsdfMixturePdf(N, V, Ld, mat.roughness, spProb);
+                    }
                     float w = powerHeuristic(pdfOmega, pdfBs);
                     pathRadiance += throughput * st * brdf * light.emission * (NdotL / fmaxf(pdfOmega, 1e-7f)) * w;
                 }
@@ -309,17 +372,32 @@ __global__ void pathTraceKernelSplit(
                 float attenDen = light.constantAttenuation + light.linearAttenuation*d + light.quadraticAttenuation*d2;
                 float atten = 1.0f / fmaxf(attenDen, 1e-4f);
                 float3 Li = light.color * (light.intensity * atten);
-                float3 brdf = bsdfEvaluate(N, V, Ld, albedo, mat.roughness, mat.metallic);
+                float3 brdf;
+                if (primaryLobeOverride) {
+                    brdf = (pickedBucket == 0)
+                        ? bsdfDiffuseLobe(N, V, Ld, albedo, mat.roughness, mat.metallic)
+                        : bsdfSpecularLobe(N, V, Ld, albedo, mat.roughness, mat.metallic);
+                } else {
+                    brdf = bsdfEvaluate(N, V, Ld, albedo, mat.roughness, mat.metallic);
+                }
                 direct += brdf * st * Li * NdotL;
             }
             pathRadiance += throughput * direct;
         }
 
-        // BRDF sampling for the next bounce.
+        // BRDF sampling for the next bounce. At the primary hit the lobe is
+        // forced to match `pickedBucket`; at subsequent hits we use the full
+        // mixture since the bucket is already locked in.
         float3 V = -ray.direction;
         float specProb = computeSpecProb(N, V, albedo, mat.metallic);
         float3 newDir;
-        if (pcg32_float(rng) < specProb) {
+        bool sampleSpecularLobe;
+        if (primaryLobeOverride) {
+            sampleSpecularLobe = (pickedBucket == 1);
+        } else {
+            sampleSpecularLobe = (pcg32_float(rng) < specProb);
+        }
+        if (sampleSpecularLobe) {
             float a = mat.roughness * mat.roughness;
             float u1 = pcg32_float(rng), u2 = pcg32_float(rng);
             float cosT = sqrtf((1.0f - u1) / (1.0f + (a*a - 1.0f)*u1 + 1e-7f));
@@ -340,9 +418,21 @@ __global__ void pathTraceKernelSplit(
         }
         float NdotLn = dot(N, newDir);
         if (NdotLn < 1e-6f) break;
-        float pdf = bsdfMixturePdf(N, V, newDir, mat.roughness, specProb);
+        float pdf;
+        float3 brdf;
+        if (primaryLobeOverride) {
+            if (pickedBucket == 0) {
+                pdf  = bsdfDiffusePdf(NdotLn);
+                brdf = bsdfDiffuseLobe(N, V, newDir, albedo, mat.roughness, mat.metallic);
+            } else {
+                pdf  = bsdfSpecularPdf(N, V, newDir, mat.roughness);
+                brdf = bsdfSpecularLobe(N, V, newDir, albedo, mat.roughness, mat.metallic);
+            }
+        } else {
+            pdf  = bsdfMixturePdf(N, V, newDir, mat.roughness, specProb);
+            brdf = bsdfEvaluate(N, V, newDir, albedo, mat.roughness, mat.metallic);
+        }
         if (pdf < 1e-7f) break;
-        float3 brdf = bsdfEvaluate(N, V, newDir, albedo, mat.roughness, mat.metallic);
         throughput = throughput * brdf * (NdotLn / (pdf + 1e-7f));
         prevSurfacePos = hit.position; prevBsdfPdf = pdf; havePrevSurface = true;
         if (bounce >= 2) {
@@ -389,7 +479,6 @@ __global__ void pathTraceKernelSplit(
     float4 diffTexel = nrd_helpers::packRadianceHitDist(demodDiff, diffHit);
     float4 specTexel = nrd_helpers::packRadianceHitDist(demodSpec, specHit);
     float4 normTexel = nrd_helpers::packNormalRoughness(primaryNormal, primaryRoughness);
-    // RGBA8_UNORM albedo: clamp and write.
     float4 albTexel  = make_float4(
         fminf(fmaxf(primaryAlbedo.x, 0.0f), 1.0f),
         fminf(fmaxf(primaryAlbedo.y, 0.0f), 1.0f),
@@ -397,24 +486,44 @@ __global__ void pathTraceKernelSplit(
         1.0f);
     float4 emTexel = make_float4(emissiveContrib.x, emissiveContrib.y, emissiveContrib.z, 1.0f);
 
-    // Surface writes: byte offsets for surf2Dwrite × element size.
-    if (surfaces.diffuseRadianceHitDist)
-        surf2Dwrite<float4>(diffTexel, surfaces.diffuseRadianceHitDist, x * 8, y); // RGBA16F = 8 bytes
-    if (surfaces.specularRadianceHitDist)
-        surf2Dwrite<float4>(specTexel, surfaces.specularRadianceHitDist, x * 8, y);
+    // surf2Dwrite writes sizeof(T) bytes at the given BYTE offset. For
+    // RGBA16F textures (8 bytes/texel) we must NOT write `float4` (16 bytes)
+    // at `x * 8` — that spills into the next pixel and silently corrupts the
+    // NRD inputs (which looks exactly like "the denoiser has no effect").
+    // Pack to a ushort4 carrying four __half bit patterns instead.
+    auto packHalf4 = [](float4 v) -> ushort4 {
+        __half hx = __float2half(v.x);
+        __half hy = __float2half(v.y);
+        __half hz = __float2half(v.z);
+        __half hw = __float2half(v.w);
+        ushort4 r;
+        r.x = *reinterpret_cast<unsigned short*>(&hx);
+        r.y = *reinterpret_cast<unsigned short*>(&hy);
+        r.z = *reinterpret_cast<unsigned short*>(&hz);
+        r.w = *reinterpret_cast<unsigned short*>(&hw);
+        return r;
+    };
+
+    if (surfaces.diffuseRadianceHitDist) {
+        ushort4 p = packHalf4(diffTexel);
+        surf2Dwrite<ushort4>(p, surfaces.diffuseRadianceHitDist, x * 8, y); // RGBA16F = 8B
+    }
+    if (surfaces.specularRadianceHitDist) {
+        ushort4 p = packHalf4(specTexel);
+        surf2Dwrite<ushort4>(p, surfaces.specularRadianceHitDist, x * 8, y);
+    }
     if (surfaces.normalRoughness) {
-        // RGBA8_UNORM = 4 bytes. Convert to uchar4.
         uchar4 nr;
         nr.x = (unsigned char)(normTexel.x * 255.0f + 0.5f);
         nr.y = (unsigned char)(normTexel.y * 255.0f + 0.5f);
         nr.z = (unsigned char)(normTexel.z * 255.0f + 0.5f);
         nr.w = (unsigned char)(normTexel.w * 255.0f + 0.5f);
-        surf2Dwrite<uchar4>(nr, surfaces.normalRoughness, x * 4, y);
+        surf2Dwrite<uchar4>(nr, surfaces.normalRoughness, x * 4, y); // RGBA8 = 4B
     }
     if (surfaces.viewZ)
-        surf2Dwrite<float>(primaryViewZ, surfaces.viewZ, x * 4, y); // R32F = 4 bytes
+        surf2Dwrite<float>(primaryViewZ, surfaces.viewZ, x * 4, y); // R32F = 4B
     if (surfaces.motionVectors) {
-        // RG16F = 4 bytes. surf2Dwrite doesn't expose an __half2 overload — write
+        // RG16F = 4B. surf2Dwrite doesn't expose an __half2 overload — write
         // as a ushort2 whose bit pattern is a pair of halves.
         __half hx = __float2half(primaryMvPx.x);
         __half hy = __float2half(primaryMvPx.y);
@@ -431,8 +540,10 @@ __global__ void pathTraceKernelSplit(
         a4.w = 255;
         surf2Dwrite<uchar4>(a4, surfaces.albedo, x * 4, y);
     }
-    if (surfaces.emissive)
-        surf2Dwrite<float4>(emTexel, surfaces.emissive, x * 8, y);
+    if (surfaces.emissive) {
+        ushort4 p = packHalf4(emTexel);
+        surf2Dwrite<ushort4>(p, surfaces.emissive, x * 8, y); // RGBA16F = 8B
+    }
 }
 
 void launchPathTraceKernelSplit(

@@ -124,7 +124,16 @@ private:
     VkImageView    m_hdrOutputView  = VK_NULL_HANDLE;
 
     // Cached for the pre-present recorder; set by renderFrame() each call.
-    const CameraParams* m_lastCamera = nullptr;
+    // MUST be a full copy, not a pointer: the CameraParams fed into
+    // renderFrame() is a stack local in Application::renderSceneSample(),
+    // which goes out of scope before present() runs the pre-present hook.
+    // Holding a pointer was dangling-read territory — NRD then saw garbage
+    // matrices/jitter and produced pure noise.
+    CameraParams m_lastCamera{};
+    bool m_lastCameraValid = false;
     bool m_lastCameraMoved = false;
+    // Previous-frame jitter, in pixel units. NRD needs `cameraJitterPrev` to
+    // correctly align sub-pixel positions when reprojecting history.
+    float m_prevJitter[2] = {0.0f, 0.0f};
 #endif
 };

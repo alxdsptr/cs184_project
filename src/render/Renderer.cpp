@@ -112,8 +112,11 @@ void Renderer::renderFrame(
         enableEnvironment, maxBounces);
     m_accumBuffer.incrementSamples();
 
-    // Cache what the pre-present recorder needs; it runs inside present().
-    m_lastCamera = &camera;
+    // Cache what the pre-present recorder needs; it runs inside present(),
+    // long after the `camera` argument (a stack local in the caller) has
+    // gone out of scope — so take a deep copy, don't stash a pointer.
+    m_lastCamera = camera;
+    m_lastCameraValid = true;
     m_frameIndex = frameIndex;
     // Register the pre-present hook idempotently.
     if (display && display != m_display) {
@@ -552,10 +555,17 @@ void Renderer::prePresentTrampoline(VkCommandBuffer cmd, void* user) {
 }
 
 void Renderer::recordPrePresent(VkCommandBuffer cmd) {
-    if (!m_display || !m_nrd || !m_sharedAux || !m_lastCamera) return;
+    if (!m_display || !m_nrd || !m_sharedAux || !m_lastCameraValid) return;
 
     const uint32_t rw = m_renderWidth;
     const uint32_t rh = m_renderHeight;
+
+    // Temporary crash-triage checkpoints. Remove once NRD is stable.
+    static uint32_t s_ppFrame = 0;
+    if (s_ppFrame < 3) {
+        LOG_INFO("recordPrePresent[%u]: enter rw=%u rh=%u mode=%d",
+                 s_ppFrame, rw, rh, (int)m_mode);
+    }
 
     // Transition every shared aux image: UNDEFINED → GENERAL so NRD can
     // access them as STORAGE. They were written by CUDA surface writes, and
@@ -575,33 +585,61 @@ void Renderer::recordPrePresent(VkCommandBuffer cmd) {
     toGeneral(m_sharedAux->motionVectors().image());
     toGeneral(m_sharedAux->albedo().image());
     toGeneral(m_sharedAux->emissive().image());
+    // NRD outputs: previous frame's toRead() left these in SHADER_READ_ONLY,
+    // but we declared their initial state to NRI as GENERAL. NRI's generated
+    // barrier at the top of Denoise() therefore uses an oldLayout that
+    // doesn't match reality → validation warns and the driver may skip the
+    // real layout transition, so NRD writes land in an image that samplers
+    // downstream still see as SHADER_READ_ONLY content → output looks like
+    // pure noise. Push them back to GENERAL ourselves (contents are
+    // immediately overwritten by NRD anyway, so UNDEFINED→GENERAL is fine).
+    toGeneral(m_nrd->outDiffuseImage());
+    toGeneral(m_nrd->outSpecularImage());
+    if (s_ppFrame < 3) LOG_INFO("recordPrePresent[%u]: aux→GENERAL done", s_ppFrame);
 
     // Build NRD common settings from the camera matrices.
     //
-    // NRD wants column-major, row-vector convention. Our float4x4 is row-major
-    // ("p.m[row][col]" with p*v convention). mat4_transformPoint does
-    // p' = M * p (column-vector, row-major storage). Feeding NRD raw here
-    // works because NRD's matrix math is agnostic to layout if both prev and
-    // curr are consistent; float[16] is read in the same order NRD dispatches
-    // its multiplies. If a transposed result shows up we'll transpose here.
+    // NRD requires COLUMN-MAJOR matrices (NRDSettings.h: "layout - column-major").
+    // Our float4x4 stores rows contiguously (m[row][col]), so a raw memcpy
+    // would hand NRD the transpose. Transpose here so world→clip reprojection
+    // inside NRD matches the path-traced motion vectors, otherwise history
+    // reprojection fails and temporal accumulation silently degrades to
+    // "pass-through" — which looks exactly like "the denoiser is off".
+    auto toColumnMajor = [](const float4x4& src, float dst[16]) {
+        for (int c = 0; c < 4; ++c)
+            for (int r = 0; r < 4; ++r)
+                dst[c * 4 + r] = src.m[r][c];
+    };
     float viewToClip[16], viewToClipPrev[16], worldToView[16], worldToViewPrev[16];
-    std::memcpy(viewToClip,      &m_lastCamera->projMatrix,      sizeof(float)*16);
-    std::memcpy(viewToClipPrev,  &m_lastCamera->prevProjMatrix,  sizeof(float)*16);
-    std::memcpy(worldToView,     &m_lastCamera->viewMatrix,      sizeof(float)*16);
-    std::memcpy(worldToViewPrev, &m_lastCamera->prevViewMatrix,  sizeof(float)*16);
+    toColumnMajor(m_lastCamera.projMatrix,     viewToClip);
+    toColumnMajor(m_lastCamera.prevProjMatrix, viewToClipPrev);
+    toColumnMajor(m_lastCamera.viewMatrix,     worldToView);
+    toColumnMajor(m_lastCamera.prevViewMatrix, worldToViewPrev);
 
-    float jitter[2]     = { m_lastCamera->jitterOffset.x, m_lastCamera->jitterOffset.y };
-    float jitterPrev[2] = { 0.0f, 0.0f };
+    float jitter[2]     = { m_lastCamera.jitterOffset.x, m_lastCamera.jitterOffset.y };
+    float jitterPrev[2] = { m_prevJitter[0], m_prevJitter[1] };
     // MVs are stored in pixel space; NRD wants UV-space post-scale → {1/w, 1/h}.
     float mvScale[2] = { 1.0f / (float)rw, 1.0f / (float)rh };
+
+    // Temporal water-wave artifact hunt: the first ~6 frames should show
+    // prev jitter equal to the previous frame's value (NOT zero, NOT the
+    // current frame's value, NOT negated). If prev is 0 the denoiser thinks
+    // the camera jittered by a full cameraJitter between frames, which causes
+    // a sub-pixel reprojection bias that manifests as ripples.
+    if (s_ppFrame < 6) {
+        LOG_INFO("recordPrePresent[%u]: jitter curr=(%.4f,%.4f) prev=(%.4f,%.4f)",
+                 s_ppFrame, jitter[0], jitter[1], jitterPrev[0], jitterPrev[1]);
+    }
 
     const bool reset = (m_accumBuffer.getSampleCount() == 1);
     m_nrd->setCommonSettings(
         viewToClip, viewToClipPrev, worldToView, worldToViewPrev,
         jitter, jitterPrev, mvScale, rw, rh, m_frameIndex, reset);
 
+    if (s_ppFrame < 3) LOG_INFO("recordPrePresent[%u]: about to NRD denoise", s_ppFrame);
     // Dispatch the denoiser (NRD may leave its output images in GENERAL).
     m_nrd->denoise(cmd, *m_sharedAux);
+    if (s_ppFrame < 3) LOG_INFO("recordPrePresent[%u]: NRD denoise recorded", s_ppFrame);
 
     // Transition NRD outputs + albedo + emissive to SHADER_READ_ONLY for sampling.
     auto toRead = [&](VkImage img) {
@@ -695,7 +733,7 @@ void Renderer::recordPrePresent(VkCommandBuffer cmd) {
             VK_FORMAT_R32_SFLOAT,               // depth (linear viewZ)
             m_renderWidth, m_renderHeight,
             m_width, m_height,
-            m_lastCamera->jitterOffset.x, m_lastCamera->jitterOffset.y,
+            m_lastCamera.jitterOffset.x, m_lastCamera.jitterOffset.y,
             /*reset=*/m_accumBuffer.getSampleCount() == 1);
 
         // (3) Tonemap @ output res → sampledImage.
@@ -718,6 +756,11 @@ void Renderer::recordPrePresent(VkCommandBuffer cmd) {
     }
 
     m_lastCameraMoved = false;
+    // Stash this frame's jitter for NRD's `cameraJitterPrev` next frame.
+    m_prevJitter[0] = m_lastCamera.jitterOffset.x;
+    m_prevJitter[1] = m_lastCamera.jitterOffset.y;
+    if (s_ppFrame < 3) LOG_INFO("recordPrePresent[%u]: done", s_ppFrame);
+    ++s_ppFrame;
 }
 
 #endif // PATHTRACER_NRD_DLSS_ENABLED

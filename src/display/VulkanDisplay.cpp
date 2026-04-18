@@ -87,7 +87,15 @@ void VulkanDisplay::createInstance() {
     app.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     app.pEngineName        = "pathtracer";
     app.engineVersion      = VK_MAKE_VERSION(1, 0, 0);
+    // NRI's VK backend always queries promoted-to-core names for KHR
+    // functions (vkCmdCopyBuffer2, vkCmdPipelineBarrier2, etc.) and won't
+    // fall back to the *KHR aliases — those only exist in 1.3 core. So we
+    // request 1.3 whenever NRD/DLSS is compiled in.
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+    app.apiVersion         = VK_API_VERSION_1_3;
+#else
     app.apiVersion         = VK_API_VERSION_1_2;
+#endif
 
     // Extensions required by GLFW + debug + external memory capabilities
     uint32_t glfwExtCount = 0;
@@ -253,29 +261,48 @@ void VulkanDisplay::createDevice() {
 #endif
     };
 
+    // Probe available device extensions once; used by both NRD/DLSS and NRI setup.
+    uint32_t availCnt = 0;
+    vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &availCnt, nullptr);
+    std::vector<VkExtensionProperties> avail(availCnt);
+    vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &availCnt, avail.data());
+    auto isExtSupported = [&](const char* s) {
+        for (auto& p : avail) if (!strcmp(p.extensionName, s)) return true;
+        return false;
+    };
+    auto alreadyEnabled = [&](const char* s) {
+        for (const char* e : exts) if (!strcmp(e, s)) return true;
+        return false;
+    };
+
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
     {
         std::vector<const char*> ngxInst, ngxDev;
         extern bool DLSSContext_QueryRequiredExts(std::vector<const char*>&,
                                                   std::vector<const char*>&);
         if (DLSSContext_QueryRequiredExts(ngxInst, ngxDev)) {
-            // Probe actually-available device extensions once.
-            uint32_t availCnt = 0;
-            vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &availCnt, nullptr);
-            std::vector<VkExtensionProperties> avail(availCnt);
-            vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &availCnt, avail.data());
-            auto isSupported = [&](const char* s) {
-                for (auto& p : avail) if (!strcmp(p.extensionName, s)) return true;
-                return false;
-            };
-            auto already = [&](const char* s) {
-                for (const char* e : exts) if (!strcmp(e, s)) return true;
-                return false;
-            };
             for (const char* e : ngxDev) {
-                if (!already(e) && isSupported(e)) exts.push_back(e);
+                if (!alreadyEnabled(e) && isExtSupported(e)) exts.push_back(e);
             }
         }
+    }
+
+    // NRI (backing NRD) requires dynamicRendering, synchronization2,
+    // extendedDynamicState and push-descriptor. The first three are core in
+    // Vulkan 1.3 (promoted from these KHR/EXT extensions); we still list
+    // them so drivers/loader don't complain on edge cases, but the real
+    // feature bits come from VkPhysicalDeviceVulkan13Features below. The
+    // last one (push_descriptor) was NOT promoted to 1.3 core, so it must
+    // be enabled as an extension for NRI's `vkCmdPushDescriptorSet` lookup
+    // to succeed.
+    const char* nriRequired[] = {
+        VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
+        VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME,
+        VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+    };
+    for (const char* e : nriRequired) {
+        if (!alreadyEnabled(e) && isExtSupported(e)) exts.push_back(e);
     }
 #endif
 
@@ -286,6 +313,55 @@ void VulkanDisplay::createDevice() {
     ci.enabledExtensionCount   = (uint32_t)exts.size();
     ci.ppEnabledExtensionNames = exts.data();
     ci.pEnabledFeatures        = &feats;
+
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+    // NRI's VK backend uses (but doesn't itself enable) several feature bits.
+    // Vulkan validation rightly complains if the bits aren't on, and the
+    // downstream behaviour — `vkGetBufferDeviceAddress` silently returning
+    // 0, partially-bound descriptor sets being malformed — produces exactly
+    // the kind of "silently crashes deep inside DenoiseVK" symptom we just
+    // fought through. Enable everything NRI pokes at.
+    VkPhysicalDeviceDynamicRenderingFeatures dynRenderFeat{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
+    VkPhysicalDeviceSynchronization2Features sync2Feat{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES};
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT edsFeat{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
+    // bufferDeviceAddress: NRI allocates with VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+    //                      and calls vkGetBufferDeviceAddress on the result.
+    // descriptorBindingPartiallyBound: NRD's pipeline layouts use this on every
+    //                      descriptor set layout binding range.
+    VkPhysicalDeviceBufferDeviceAddressFeatures bdaFeat{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+    VkPhysicalDeviceDescriptorIndexingFeatures diFeat{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
+    dynRenderFeat.dynamicRendering       = VK_TRUE;
+    sync2Feat.synchronization2           = VK_TRUE;
+    edsFeat.extendedDynamicState         = VK_TRUE;
+    bdaFeat.bufferDeviceAddress          = VK_TRUE;
+    diFeat.descriptorBindingPartiallyBound = VK_TRUE;
+    // Other descriptor-indexing bits NRI may use under the hood; cheap to turn on.
+    diFeat.shaderSampledImageArrayNonUniformIndexing   = VK_TRUE;
+    diFeat.shaderStorageImageArrayNonUniformIndexing   = VK_TRUE;
+    diFeat.runtimeDescriptorArray                      = VK_TRUE;
+    // UpdateAfterBind + UpdateUnusedWhilePending: without these, NRI creates
+    // its descriptor set layouts with VkDescriptorBindingFlags(0). Then when
+    // NewFrame() calls vkUpdateDescriptorSets on a set still referenced by
+    // an in-flight command buffer, validation fires 03047 and the shader
+    // reads undefined descriptors — which shows up as "all-snow" output from
+    // the denoiser even though it's technically "running".
+    diFeat.descriptorBindingSampledImageUpdateAfterBind  = VK_TRUE;
+    diFeat.descriptorBindingStorageImageUpdateAfterBind  = VK_TRUE;
+    diFeat.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
+    diFeat.descriptorBindingUniformBufferUpdateAfterBind = VK_TRUE;
+    diFeat.descriptorBindingUpdateUnusedWhilePending     = VK_TRUE;
+
+    dynRenderFeat.pNext = &sync2Feat;
+    sync2Feat.pNext     = &edsFeat;
+    edsFeat.pNext       = &bdaFeat;
+    bdaFeat.pNext       = &diFeat;
+    ci.pNext            = &dynRenderFeat;
+#endif
 
     VK_CHECK(vkCreateDevice(m_physicalDevice, &ci, nullptr, &m_device));
     vkGetDeviceQueue(m_device, m_graphicsQueueFamily, 0, &m_graphicsQueue);

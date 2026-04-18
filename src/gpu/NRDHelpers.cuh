@@ -2,9 +2,15 @@
 
 // NRD front-end helpers ported from NRD.hlsli / REBLUR_Config.hlsli.
 //
-// NRD options compiled into our build (see external/NRD CMake at the top):
-//   NRD_NORMAL_ENCODING    = 2  (R8G8B8A8_UNORM, oct-encoded normals)
+// NRD options compiled into our build (overridden in top-level CMakeLists.txt):
+//   NRD_NORMAL_ENCODING    = 0  (R8G8B8A8_UNORM, plain XYZ normal in RGB)
 //   NRD_ROUGHNESS_ENCODING = 1  (linear roughness, alpha channel)
+//
+// These MUST match the VkFormat used for the normal-roughness aux image
+// (VulkanSharedAuxBuffers::m_normalRoughness, currently R8G8B8A8_UNORM). If
+// the encoding or image format changes, update both sides together — NRD's
+// front-end unpacker reads the texel according to NRD_NORMAL_ENCODING and
+// silently returns garbage otherwise.
 //
 // Keep this header self-contained so the path-trace kernel can include it
 // without dragging in Vulkan or SDK headers.
@@ -19,30 +25,17 @@
 
 namespace nrd_helpers {
 
-// ── Normal encoding 2: oct-wrap into 2×[0,1] then scale+bias to UNORM ───
-__device__ __forceinline__ float2 octWrap(float2 v) {
-    float2 s = { v.x >= 0.0f ? 1.0f : -1.0f,
-                 v.y >= 0.0f ? 1.0f : -1.0f };
-    return make_float2((1.0f - fabsf(v.y)) * s.x,
-                       (1.0f - fabsf(v.x)) * s.y);
-}
-
-__device__ __forceinline__ float2 encodeOctNormal(float3 n) {
-    float absSum = fabsf(n.x) + fabsf(n.y) + fabsf(n.z);
-    float inv = 1.0f / fmaxf(absSum, 1e-6f);
-    float2 p = make_float2(n.x * inv, n.y * inv);
-    if (n.z < 0.0f) p = octWrap(p);
-    // Map [-1,1] → [0,1] for UNORM storage.
-    return make_float2(p.x * 0.5f + 0.5f, p.y * 0.5f + 0.5f);
-}
-
-// Pack (normal, roughness) into an RGBA8 UNORM texel. Layout:
-//   RG = oct-encoded normal (2×8 bit)
-//   B  = material ID / unused → 0
-//   A  = linear roughness
+// Pack (normal, roughness) into an RGBA8 UNORM texel.
+// Layout matches NRD's NRD_NORMAL_ENCODING_RGBA8_UNORM (= 0) front-end
+// unpacker, which does `p.xyz * 2 - 1` and then normalizes:
+//   RGB = (normal * 0.5 + 0.5)    — plain XYZ remapped to [0,1]
+//   A   = linear roughness         — matches NRD_ROUGHNESS_ENCODING_LINEAR
 __device__ __forceinline__ float4 packNormalRoughness(float3 normal, float roughness) {
-    float2 oct = encodeOctNormal(normal);
-    return make_float4(oct.x, oct.y, 0.0f, fminf(fmaxf(roughness, 0.0f), 1.0f));
+    return make_float4(
+        normal.x * 0.5f + 0.5f,
+        normal.y * 0.5f + 0.5f,
+        normal.z * 0.5f + 0.5f,
+        fminf(fmaxf(roughness, 0.0f), 1.0f));
 }
 
 // NRD "YCoCg" radiance packing is optional; RELAX accepts straight RGB in

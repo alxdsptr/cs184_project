@@ -178,7 +178,34 @@ struct NRDContext::Impl {
         d.vkInstance       = (VKHandle)vkInstance;
         d.vkDevice         = (VKHandle)vkDevice;
         d.vkPhysicalDevice = (VKHandle)vkPhys;
-        d.minorVersion     = 2;   // VK 1.2
+        // NRI always queries core-name Vulkan 1.3 entry points (e.g.
+        // vkCmdCopyBuffer2), so the underlying VkInstance/VkDevice *must*
+        // be at least 1.3 — see VulkanDisplay::createInstance(). Passing 2
+        // here makes NRI assume 1.2, its dispatch-table lookup fails
+        // immediately with "Failed to get device function: 'vkCmdCopyBuffer2'".
+        d.minorVersion     = 3;   // VK 1.3
+
+        // Surface NRI's internal warnings/errors through our log — otherwise any
+        // failure inside `DenoiseVK` is completely silent in Release builds.
+        // We also MUST override AbortExecution: NRI's default implementation is
+        // `DebugBreak()`, which terminates a Release process (no debugger attached)
+        // *before* our MessageCallback output reaches disk. Replacing it with a
+        // no-op (combined with fflush below) lets us actually read the error.
+        d.callbackInterface.MessageCallback = [](nri::Message msgType, const char* file,
+                                                 uint32_t line, const char* message, void*) {
+            const char* tag = (msgType == nri::Message::ERROR)   ? "NRI-ERR"
+                            : (msgType == nri::Message::WARNING) ? "NRI-WARN"
+                                                                 : "NRI-INFO";
+            LOG_INFO("[%s] %s:%u %s", tag, file ? file : "?", line, message ? message : "(null)");
+            std::fflush(stdout);
+            std::fflush(stderr);
+        };
+        d.callbackInterface.AbortExecution = [](void*) { /* swallow: don't DebugBreak */ };
+
+        // Turn on NRI's embedded validation. If the SDK's layer is available,
+        // also turn on Vulkan-level validation — that's what surfaces things like
+        // "image used in layout X but expected Y" or "descriptor bound to wrong type".
+        d.enableNRIValidation = true;
 
         // Exposed extensions (NRI needs to know which are actually enabled).
         d.vkExtensions.instanceExtensions    = instExts.data();
@@ -339,10 +366,15 @@ void NRDContext::setCommonSettings(
     std::memcpy(c.viewToClipMatrixPrev,  viewToClipPrev,  sizeof(float)*16);
     std::memcpy(c.worldToViewMatrix,     worldToView,     sizeof(float)*16);
     std::memcpy(c.worldToViewMatrixPrev, worldToViewPrev, sizeof(float)*16);
-    c.cameraJitter[0]     = cameraJitter[0];
-    c.cameraJitter[1]     = cameraJitter[1];
-    c.cameraJitterPrev[0] = cameraJitterPrev[0];
-    c.cameraJitterPrev[1] = cameraJitterPrev[1];
+
+    // NRD asserts that jitter is in [-0.5, 0.5]. Our Halton sequence is
+    // theoretically inside that range, but clamp defensively in case a caller
+    // passes jitter already scaled to e.g. pixel/UV units by mistake.
+    auto clamp05 = [](float v) { return v < -0.5f ? -0.5f : (v > 0.5f ? 0.5f : v); };
+    c.cameraJitter[0]     = clamp05(cameraJitter[0]);
+    c.cameraJitter[1]     = clamp05(cameraJitter[1]);
+    c.cameraJitterPrev[0] = clamp05(cameraJitterPrev[0]);
+    c.cameraJitterPrev[1] = clamp05(cameraJitterPrev[1]);
     c.motionVectorScale[0] = motionVectorScalePx[0];
     c.motionVectorScale[1] = motionVectorScalePx[1];
     c.motionVectorScale[2] = 0.0f;
@@ -358,29 +390,51 @@ void NRDContext::setCommonSettings(
     c.accumulationMode    = reset ? nrd::AccumulationMode::RESTART
                                   : nrd::AccumulationMode::CONTINUE;
     c.isMotionVectorInWorldSpace = false;
+
+    // One-shot snapshot of every field NRD validates, so the next failure
+    // (if any) is instantly diagnosable from log.txt.
+    static uint32_t s_dumped = 0;
+    if (s_dumped < 2) {
+        LOG_INFO("NRD.setCommonSettings[%u]: jitter=(%.4f,%.4f) prev=(%.4f,%.4f)",
+                 s_dumped, c.cameraJitter[0], c.cameraJitter[1],
+                 c.cameraJitterPrev[0], c.cameraJitterPrev[1]);
+        LOG_INFO("  mvScale=(%.6f,%.6f,%.6f) rw/rh=(%u,%u) frame=%u accum=%d",
+                 c.motionVectorScale[0], c.motionVectorScale[1], c.motionVectorScale[2],
+                 (unsigned)c.resourceSize[0], (unsigned)c.resourceSize[1],
+                 c.frameIndex, (int)c.accumulationMode);
+        LOG_INFO("  viewZScale=%.4f denoisingRange=%.1f disoccT=%.4f",
+                 c.viewZScale, c.denoisingRange, c.disocclusionThreshold);
+        ++s_dumped;
+    }
 }
 
 void NRDContext::denoise(VkCommandBuffer cmd, const VulkanSharedAuxBuffers& aux) {
     if (!m_impl->integrationAlive) return;
-    if (!m_impl->ensureInputWraps(aux)) return;
 
-    // Frame start bookkeeping.
+    const bool trace = m_impl->frameCounter < 3;
+    if (trace) LOG_INFO("NRD.denoise[%u]: NewFrame", m_impl->frameCounter);
     m_impl->nrd.NewFrame();
+    if (trace) LOG_INFO("NRD.denoise[%u]: SetCommonSettings", m_impl->frameCounter);
     m_impl->nrd.SetCommonSettings(m_impl->common);
 
-    // RELAX defaults are fine; we leave settings at their defaults for now.
+    // We own the NRI device (initNri), so we go through the plain `Denoise()`
+    // path with NRI-wrapped textures — NOT `DenoiseVK`, which is reserved for
+    // the `RecreateVK`-owned-device flow and asserts on `m_Wrapped == VK`.
+    if (trace) LOG_INFO("NRD.denoise[%u]: ensureInputWraps", m_impl->frameCounter);
+    if (!m_impl->ensureInputWraps(aux)) {
+        LOG_ERROR("NRD.denoise[%u]: ensureInputWraps failed", m_impl->frameCounter);
+        return;
+    }
 
-    // Build snapshot. NRI's AccessLayoutStage defaults are fine for resources
-    // in GENERAL layout with full R/W access.
     nri::AccessLayoutStage inputState{};
     inputState.access = nri::AccessBits::SHADER_RESOURCE_STORAGE;
     inputState.layout = nri::Layout::GENERAL;
     inputState.stages = nri::StageBits::COMPUTE_SHADER;
 
-    auto makeRes = [&](nri::Texture* t) {
+    auto makeRes = [&](nri::Texture* tex) {
         nrd::Resource r{};
-        r.nri.texture = t;
-        r.state = inputState;
+        r.nri.texture = tex;
+        r.state       = inputState;
         return r;
     };
     nrd::Resource rDiff  = makeRes(m_impl->inputs.diffNri);
@@ -401,13 +455,27 @@ void NRDContext::denoise(VkCommandBuffer cmd, const VulkanSharedAuxBuffers& aux)
     snap.SetResource(nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST, rOSpec);
     snap.restoreInitialState = true;
 
-    // Wrap the VkCommandBuffer into NRI.
+    // Wrap the raw VkCommandBuffer into an NRI CommandBuffer object so
+    // `Denoise()` can record into it. Must be destroyed after the call —
+    // the wrapper is non-owning and cheap to create.
     nri::CommandBufferVKDesc cbDesc{};
     cbDesc.vkCommandBuffer = (VKHandle)cmd;
     cbDesc.queueType       = nri::QueueType::GRAPHICS;
+    nri::CommandBuffer* nriCmd = nullptr;
+    nri::Result cbRes = m_impl->nriWrapVk.CreateCommandBufferVK(
+        *m_impl->nriDevice, cbDesc, nriCmd);
+    if (cbRes != nri::Result::SUCCESS || !nriCmd) {
+        LOG_ERROR("NRD.denoise[%u]: CreateCommandBufferVK failed (%d)",
+                  m_impl->frameCounter, (int)cbRes);
+        return;
+    }
 
     const nrd::Identifier denoisers[] = { kRelaxId };
-    m_impl->nrd.DenoiseVK(denoisers, 1, cbDesc, snap);
+    if (trace) { LOG_INFO("NRD.denoise[%u]: calling Denoise", m_impl->frameCounter); std::fflush(stdout); }
+    m_impl->nrd.Denoise(denoisers, 1, *nriCmd, snap);
+    if (trace) { LOG_INFO("NRD.denoise[%u]: Denoise returned", m_impl->frameCounter); std::fflush(stdout); }
+
+    m_impl->nriCore.DestroyCommandBuffer(nriCmd);
 
     m_impl->frameCounter++;
 }

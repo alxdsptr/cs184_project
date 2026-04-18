@@ -67,6 +67,13 @@ if(PATHTRACER_ENABLE_NRD_DLSS)
     # We don't need D3D shaders for a Vulkan-only pathtracer.
     set(NRD_EMBEDS_DXIL_SHADERS OFF CACHE BOOL "" FORCE)
     set(NRD_EMBEDS_DXBC_SHADERS OFF CACHE BOOL "" FORCE)
+    # Match our aux-buffer format (VK_FORMAT_R8G8B8A8_UNORM). Encoding 0 stores
+    # normal as plain XYZ in RGB + linear roughness in A, which is what the
+    # CUDA path-trace kernel writes. The NRD default (2 = R10G10B10A2_UNORM
+    # with 10-bit oct packing) would make NRD decode garbage from an 8-bit
+    # image and silently destroy denoising quality.
+    set(NRD_NORMAL_ENCODING "0" CACHE STRING "" FORCE)
+    set(NRD_ROUGHNESS_ENCODING "1" CACHE STRING "" FORCE)
     add_subdirectory(external/NRD)
 
     # DLSS (NGX) — prebuilt SDK, headers + import lib + runtime DLL.
