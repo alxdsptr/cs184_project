@@ -5,6 +5,7 @@
 #include "scene/Scene.h"
 #include "scene/Texture.h"
 #include "render/Renderer.h"
+#include "backend/RayTracingBackend.h"
 #include "backend/CUDABackend.h"
 #include <cstdint>
 #include <string>
@@ -22,6 +23,8 @@ public:
     void setSamplesPerFrame(uint32_t spp);
     // 0 = Native, 1 = NRDOnly, 2 = NRDDLSS. Applied after init().
     void setInitialMode(int mode) { m_initialMode = mode; }
+    // 0 = CUDA (default), 1 = OptiX. Applied during init().
+    void setBackendKind(int kind) { m_backendKind = kind; }
     void setHeadlessOutput(const std::string& outputPath, uint32_t sampleCount);
     void setEnvMap(const std::string& path);
 
@@ -43,7 +46,8 @@ private:
     Scene      m_scene;
     TextureManager m_textures;
     Renderer   m_renderer;
-    std::unique_ptr<CUDABackend> m_backend;
+    std::unique_ptr<RayTracingBackend> m_backend;
+    int m_backendKind = 0;  // 0 = CUDA, 1 = OptiX
 
     bool       m_sceneLoaded = false;
     InputState m_input;
