@@ -22,6 +22,14 @@ option(PATHTRACER_ENABLE_NRD_DLSS
 set(PATHTRACER_DLSS_SDK_DIR "D:/examples/DLSS" CACHE PATH
     "Path to the NVIDIA DLSS (NGX) SDK root (contains include/ and lib/Windows_x86_64/)")
 
+# ── OptiX master switch ──────────────────────────────────────
+option(PATHTRACER_ENABLE_OPTIX
+    "Enable OptiX ray tracing backend (requires OptiX 7+ SDK)"
+    OFF)
+
+set(PATHTRACER_OPTIX_SDK_DIR "D:/tools/Optix" CACHE PATH
+    "Path to the NVIDIA OptiX 7+ SDK root (contains include/)")
+
 # ── Dependencies ──────────────────────────────────────────────
 find_package(CUDAToolkit REQUIRED)
 
@@ -203,6 +211,58 @@ target_link_libraries(pathtracer PRIVATE
     gli_headers
     CUDA::cudart
 )
+
+# ── Conditional OptiX sources / build rules ──────────────────
+if(PATHTRACER_ENABLE_OPTIX)
+    if(NOT EXISTS "${PATHTRACER_OPTIX_SDK_DIR}/include/optix.h")
+        message(FATAL_ERROR
+            "PATHTRACER_ENABLE_OPTIX=ON but ${PATHTRACER_OPTIX_SDK_DIR}/include/optix.h is missing. "
+            "Install the OptiX SDK or set -DPATHTRACER_OPTIX_SDK_DIR=<path>.")
+    endif()
+
+    target_sources(pathtracer PRIVATE
+        src/backend/OptiXBackend.cpp
+        src/backend/OptiXBackend.h
+        src/backend/OptiXLaunchParams.h
+        src/backend/OptiXSBTRecords.h
+    )
+    target_compile_definitions(pathtracer PRIVATE PATHTRACER_OPTIX_ENABLED=1)
+    target_include_directories(pathtracer PRIVATE
+        ${PATHTRACER_OPTIX_SDK_DIR}/include
+    )
+    # Driver API needed for CUdeviceptr + CUstream (OptiX types).
+    target_link_libraries(pathtracer PRIVATE CUDA::cuda_driver)
+
+    # Compile OptiX device programs to OptiX-IR.
+    set(OPTIX_PROGRAMS_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/OptiXPrograms.cu)
+    set(OPTIX_PROGRAMS_IR  ${CMAKE_CURRENT_BINARY_DIR}/optix_programs.optixir)
+    add_custom_command(
+        OUTPUT  ${OPTIX_PROGRAMS_IR}
+        COMMAND ${CMAKE_CUDA_COMPILER}
+                --optix-ir
+                -arch=compute_75
+                -rdc=true
+                -std=c++17
+                --use_fast_math
+                --expt-relaxed-constexpr
+                -I${CMAKE_CURRENT_SOURCE_DIR}/src
+                -I${PATHTRACER_OPTIX_SDK_DIR}/include
+                -I${CUDAToolkit_INCLUDE_DIRS}
+                -o ${OPTIX_PROGRAMS_IR}
+                ${OPTIX_PROGRAMS_SRC}
+        DEPENDS ${OPTIX_PROGRAMS_SRC}
+        COMMENT "Compiling OptiX device programs to OptiX-IR"
+        VERBATIM)
+    add_custom_target(optix_programs_ir DEPENDS ${OPTIX_PROGRAMS_IR})
+    add_dependencies(pathtracer optix_programs_ir)
+
+    # Ship the .optixir next to the exe so the runtime can find it.
+    add_custom_command(TARGET pathtracer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${OPTIX_PROGRAMS_IR}
+            $<TARGET_FILE_DIR:pathtracer>/optix_programs.optixir
+        VERBATIM)
+endif()
 
 # ── Conditional NRD + DLSS sources / links ───────────────────
 if(PATHTRACER_ENABLE_NRD_DLSS)

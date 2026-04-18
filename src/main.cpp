@@ -15,6 +15,7 @@ int main(int argc, char** argv) {
     uint32_t samples = 1;
     uint32_t samplesPerFrame = 1;  // spp per realtime frame (independent of `-s`)
     int initialMode = -1;  // -1=default, 0=Native, 1=NRDOnly, 2=NRDDLSS
+    int backendKind = 0;   // 0=CUDA, 1=OptiX
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -40,6 +41,11 @@ int main(int argc, char** argv) {
             else if (m == "nrd" || m == "nrdonly") initialMode = 1;
             else if (m == "dlss" || m == "nrddlss") initialMode = 2;
             else LOG_WARN("Invalid --mode value: %s (use native|nrd|dlss)", m.c_str());
+        } else if (arg == "--backend" && i + 1 < argc) {
+            std::string b = argv[++i];
+            if (b == "cuda") backendKind = 0;
+            else if (b == "optix") backendKind = 1;
+            else LOG_WARN("Invalid --backend value: %s (use cuda|optix)", b.c_str());
         } else if ((arg == "--spp" || arg == "-p") && i + 1 < argc) {
             int value = std::atoi(argv[++i]);
             if (value > 0) {
@@ -78,6 +84,7 @@ int main(int argc, char** argv) {
     app.setMaxBounces(maxBounces);
     app.setSamplesPerFrame(samplesPerFrame);
     app.setInitialMode(initialMode);
+    app.setBackendKind(backendKind);
     if (!outputPath.empty()) {
         app.setHeadlessOutput(outputPath, samples);
     }

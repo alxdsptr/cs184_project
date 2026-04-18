@@ -2,6 +2,9 @@
 #include "scene/SceneLoader.h"
 #include "util/Log.h"
 #include "util/CudaCheck.h"
+#ifdef PATHTRACER_OPTIX_ENABLED
+#include "backend/OptiXBackend.h"
+#endif
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -176,7 +179,33 @@ bool Application::init(uint32_t width, uint32_t height, const std::string& title
     }
     glfwSetScrollCallback(m_window, glfwScrollCallback);
     m_renderer.init(width, height);
-    m_backend = std::make_unique<CUDABackend>();
+
+    bool backendReady = false;
+#ifdef PATHTRACER_OPTIX_ENABLED
+    if (m_backendKind == 1) {
+        auto optix = std::make_unique<OptiXBackend>();
+        std::filesystem::path exeDir = std::filesystem::current_path();
+        std::filesystem::path irPath = exeDir / "optix_programs.optixir";
+        if (!std::filesystem::exists(irPath)) {
+            // Fall back: some IDEs set CWD to project root, not exe dir.
+            irPath = std::filesystem::path("optix_programs.optixir");
+        }
+        if (optix->init(irPath.string())) {
+            m_backend = std::move(optix);
+            backendReady = true;
+            LOG_INFO("Application: using OptiX backend");
+        } else {
+            LOG_ERROR("Application: OptiX init failed, falling back to CUDA");
+        }
+    }
+#else
+    if (m_backendKind == 1) {
+        LOG_ERROR("Application: --backend optix requested but built without PATHTRACER_ENABLE_OPTIX; falling back to CUDA");
+    }
+#endif
+    if (!backendReady) {
+        m_backend = std::make_unique<CUDABackend>();
+    }
 
     m_camera.init(
         make_float3(0, 1, 3),

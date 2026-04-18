@@ -11,5 +11,4 @@ Bistro_v5_2/
 dae/
 *.png
 build1
-build-native
-build-NRD
+build-*/
