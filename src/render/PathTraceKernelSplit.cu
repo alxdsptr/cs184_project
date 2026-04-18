@@ -63,6 +63,17 @@ __device__ inline float3 bsdfSpecularLobe(
     return F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
 }
 
+// Per-contribution firefly clamp. RELAX is very sensitive to single-sample
+// spikes: one 100x outlier survives the temporal filter for many frames and
+// shows up as a shimmering bright speck (water-ripple look). We clamp each
+// NEE / emissive contribution by luminance before adding it to the running
+// path radiance, rather than only clamping the sum once at the end.
+__device__ inline float3 clampFirefly(float3 c, float maxLum) {
+    float lum = 0.2126f*c.x + 0.7152f*c.y + 0.0722f*c.z;
+    if (lum > maxLum && lum > 1e-7f) c = c * (maxLum / lum);
+    return c;
+}
+
 __global__ void pathTraceKernelSplit(
     DeviceSceneData       scene,
     CameraParams          camera,
@@ -71,7 +82,8 @@ __global__ void pathTraceKernelSplit(
     uint32_t              height,
     uint32_t              sampleIndex,
     bool                  enableEnvironment,
-    uint32_t              maxBounces)
+    uint32_t              maxBounces,
+    uint32_t              samplesPerPixel)
 {
     uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -79,7 +91,31 @@ __global__ void pathTraceKernelSplit(
 
     const uint32_t pixelIdx = y * width + x;
 
-    uint32_t rng = pcg32_seed(pixelIdx, sampleIndex);
+    // Accumulators averaged across samplesPerPixel (spp). NRD sees the mean,
+    // so averaging N samples in-kernel reduces per-frame variance by ~N and
+    // substantially cuts the single-sample bucket spikes that read as water
+    // ripples after temporal filtering.
+    float3 demodDiffSum = make_float3(0, 0, 0);
+    float3 demodSpecSum = make_float3(0, 0, 0);
+    float3 emissiveSum  = make_float3(0, 0, 0);
+    float  diffHitSum = 0.0f; uint32_t diffHitCount = 0;
+    float  specHitSum = 0.0f; uint32_t specHitCount = 0;
+
+    // G-buffer captured from the first sample that produces a primary opaque
+    // hit. NRD only consumes one g-buffer per pixel, not an average.
+    bool   gbufferWritten = false;
+    float3 outPrimaryAlbedo   = make_float3(0, 0, 0);
+    float3 outPrimaryNormal   = make_float3(0, 1, 0);
+    float  outPrimaryRoughness = 1.0f;
+    float  outPrimaryViewZ     = 0.0f;
+    float2 outPrimaryMvPx      = make_float2(0.0f, 0.0f);
+
+    if (samplesPerPixel < 1) samplesPerPixel = 1;
+
+    for (uint32_t s = 0; s < samplesPerPixel; s++) {
+        // Unique RNG subseed per (pixel, frame, sample-in-frame).
+        uint32_t rng = pcg32_seed(pixelIdx * 0x9E3779B9u + s,
+                                  sampleIndex * 0x85EBCA6Bu + s);
 
     float jx = pcg32_float(rng) - 0.5f;
     float jy = pcg32_float(rng) - 0.5f;
@@ -129,8 +165,8 @@ __global__ void pathTraceKernelSplit(
             if (enableEnvironment) {
                 float3 envColor = sampleEnvironment(ray.direction, scene.envMapTex);
                 float envLum = 0.2126f*envColor.x + 0.7152f*envColor.y + 0.0722f*envColor.z;
-                if (envLum > 100.0f) envColor = envColor * (100.0f / envLum);
-                pathRadiance += throughput * envColor;
+                if (envLum > 20.0f) envColor = envColor * (20.0f / envLum);
+                pathRadiance += clampFirefly(throughput * envColor, 10.0f);
             }
             break;
         }
@@ -235,9 +271,13 @@ __global__ void pathTraceKernelSplit(
             continue;
         }
 
-        // Record hit distance to the first non-primary, non-specular surface
-        // for the picked bucket — drives RELAX's spatial filter radius.
-        if (!bucketHitDistSet && bounce > 0) {
+        // RELAX's spatial filter radius is driven by the distance from the
+        // primary surface to the first secondary hit of the chosen lobe.
+        // Using `bounce == 1` (the iteration immediately after primary hit)
+        // keeps this stable across frames — any later / lobe-dependent choice
+        // makes hitT jitter with the BSDF sample, which RELAX misreads as a
+        // depth change and the filter radius swims (→ water ripples).
+        if (!bucketHitDistSet && bounce == 1) {
             bucketHitDist = hit.t;
             bucketHitDistSet = true;
         }
@@ -266,7 +306,7 @@ __global__ void pathTraceKernelSplit(
             if (bounce == 0) {
                 emissiveContrib = Le * weight;    // Primary emissive — separate image.
             } else {
-                pathRadiance += throughput * Le * weight;
+                pathRadiance += clampFirefly(throughput * Le * weight, 10.0f);
             }
             if (mat.emissiveTex == 0) break;
         }
@@ -332,7 +372,8 @@ __global__ void pathTraceKernelSplit(
                         pdfBs = bsdfMixturePdf(N, V, Ld, mat.roughness, spProb);
                     }
                     float w = powerHeuristic(pdfOmega, pdfBs);
-                    pathRadiance += throughput * st * brdf * light.emission * (NdotL / fmaxf(pdfOmega, 1e-7f)) * w;
+                    float3 neeContrib = throughput * st * brdf * light.emission * (NdotL / fmaxf(pdfOmega, 1e-7f)) * w;
+                    pathRadiance += clampFirefly(neeContrib, 10.0f);
                 }
             }
         } else if (scene.d_pointLights && scene.pointLightCount > 0) {
@@ -380,7 +421,7 @@ __global__ void pathTraceKernelSplit(
                 } else {
                     brdf = bsdfEvaluate(N, V, Ld, albedo, mat.roughness, mat.metallic);
                 }
-                direct += brdf * st * Li * NdotL;
+                direct += clampFirefly(brdf * st * Li * NdotL, 10.0f);
             }
             pathRadiance += throughput * direct;
         }
@@ -451,10 +492,12 @@ __global__ void pathTraceKernelSplit(
         isinf(pathRadiance.x) || isinf(pathRadiance.y) || isinf(pathRadiance.z)) {
         pathRadiance = make_float3(0,0,0);
     }
-    {
-        float lum = 0.2126f*pathRadiance.x + 0.7152f*pathRadiance.y + 0.0722f*pathRadiance.z;
-        if (lum > 200.0f) pathRadiance = pathRadiance * (200.0f / lum);
-    }
+    // Per-channel clamp. A luminance-only clamp at 200 lets a single saturated
+    // green firefly through at ~280 (since g-weight is 0.72); RELAX then takes
+    // ~30 frames to fade it. A per-channel cap at 15 kills those spikes hard.
+    pathRadiance.x = fminf(fmaxf(pathRadiance.x, 0.0f), 15.0f);
+    pathRadiance.y = fminf(fmaxf(pathRadiance.y, 0.0f), 15.0f);
+    pathRadiance.z = fminf(fmaxf(pathRadiance.z, 0.0f), 15.0f);
 
     // Demodulate by albedo so NRD sees the irradiance component; composite
     // remultiplies. Guard against zero albedo (pure metallic → specular bucket).
@@ -472,19 +515,47 @@ __global__ void pathTraceKernelSplit(
         }
     }
 
-    // Write outputs.
-    float diffHit = (pickedBucket == 0 && bucketHitDistSet) ? bucketHitDist : 0.0f;
-    float specHit = (pickedBucket == 1 && bucketHitDistSet) ? bucketHitDist : 0.0f;
+        // Accumulate this sample's contribution.
+        demodDiffSum = demodDiffSum + demodDiff;
+        demodSpecSum = demodSpecSum + demodSpec;
+        emissiveSum  = emissiveSum  + emissiveContrib;
+        if (haveGbuffer && bucketHitDistSet) {
+            if (pickedBucket == 0) { diffHitSum += bucketHitDist; diffHitCount++; }
+            else                    { specHitSum += bucketHitDist; specHitCount++; }
+        }
+        // G-buffer: first sample that produced a primary hit wins. Averaging
+        // normals / viewZ across samples would soften silhouettes and break
+        // NRD's disocclusion test, so we don't.
+        if (!gbufferWritten && haveGbuffer) {
+            outPrimaryAlbedo    = primaryAlbedo;
+            outPrimaryNormal    = primaryNormal;
+            outPrimaryRoughness = primaryRoughness;
+            outPrimaryViewZ     = primaryViewZ;
+            outPrimaryMvPx      = primaryMvPx;
+            gbufferWritten = true;
+        }
+    } // end spp loop
 
-    float4 diffTexel = nrd_helpers::packRadianceHitDist(demodDiff, diffHit);
-    float4 specTexel = nrd_helpers::packRadianceHitDist(demodSpec, specHit);
-    float4 normTexel = nrd_helpers::packNormalRoughness(primaryNormal, primaryRoughness);
+    // Average per-pixel radiance over the samples taken.
+    float invSpp = 1.0f / (float)samplesPerPixel;
+    float3 demodDiffAvg = demodDiffSum * invSpp;
+    float3 demodSpecAvg = demodSpecSum * invSpp;
+    float3 emissiveAvg  = emissiveSum  * invSpp;
+    // HitDist: average only over samples that actually filled the bucket, so
+    // pixels where one sample went diffuse and the others specular don't bias
+    // the diff-bucket hitT toward zero.
+    float diffHitAvg = diffHitCount > 0 ? (diffHitSum / (float)diffHitCount) : 0.0f;
+    float specHitAvg = specHitCount > 0 ? (specHitSum / (float)specHitCount) : 0.0f;
+
+    float4 diffTexel = nrd_helpers::packRadianceHitDist(demodDiffAvg, diffHitAvg);
+    float4 specTexel = nrd_helpers::packRadianceHitDist(demodSpecAvg, specHitAvg);
+    float4 normTexel = nrd_helpers::packNormalRoughness(outPrimaryNormal, outPrimaryRoughness);
     float4 albTexel  = make_float4(
-        fminf(fmaxf(primaryAlbedo.x, 0.0f), 1.0f),
-        fminf(fmaxf(primaryAlbedo.y, 0.0f), 1.0f),
-        fminf(fmaxf(primaryAlbedo.z, 0.0f), 1.0f),
+        fminf(fmaxf(outPrimaryAlbedo.x, 0.0f), 1.0f),
+        fminf(fmaxf(outPrimaryAlbedo.y, 0.0f), 1.0f),
+        fminf(fmaxf(outPrimaryAlbedo.z, 0.0f), 1.0f),
         1.0f);
-    float4 emTexel = make_float4(emissiveContrib.x, emissiveContrib.y, emissiveContrib.z, 1.0f);
+    float4 emTexel = make_float4(emissiveAvg.x, emissiveAvg.y, emissiveAvg.z, 1.0f);
 
     // surf2Dwrite writes sizeof(T) bytes at the given BYTE offset. For
     // RGBA16F textures (8 bytes/texel) we must NOT write `float4` (16 bytes)
@@ -521,12 +592,12 @@ __global__ void pathTraceKernelSplit(
         surf2Dwrite<uchar4>(nr, surfaces.normalRoughness, x * 4, y); // RGBA8 = 4B
     }
     if (surfaces.viewZ)
-        surf2Dwrite<float>(primaryViewZ, surfaces.viewZ, x * 4, y); // R32F = 4B
+        surf2Dwrite<float>(outPrimaryViewZ, surfaces.viewZ, x * 4, y); // R32F = 4B
     if (surfaces.motionVectors) {
         // RG16F = 4B. surf2Dwrite doesn't expose an __half2 overload — write
         // as a ushort2 whose bit pattern is a pair of halves.
-        __half hx = __float2half(primaryMvPx.x);
-        __half hy = __float2half(primaryMvPx.y);
+        __half hx = __float2half(outPrimaryMvPx.x);
+        __half hy = __float2half(outPrimaryMvPx.y);
         ushort2 packed;
         packed.x = *reinterpret_cast<unsigned short*>(&hx);
         packed.y = *reinterpret_cast<unsigned short*>(&hy);
@@ -553,12 +624,15 @@ void launchPathTraceKernelSplit(
     uint32_t width, uint32_t height,
     uint32_t sampleIndex,
     bool enableEnvironment,
-    uint32_t maxBounces)
+    uint32_t maxBounces,
+    uint32_t samplesPerPixel)
 {
+    if (samplesPerPixel < 1) samplesPerPixel = 1;
     dim3 block(8, 8);
     dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
     pathTraceKernelSplit<<<grid, block>>>(
-        scene, camera, surfaces, width, height, sampleIndex, enableEnvironment, maxBounces);
+        scene, camera, surfaces, width, height, sampleIndex,
+        enableEnvironment, maxBounces, samplesPerPixel);
     CUDA_CHECK(cudaGetLastError());
 }
 

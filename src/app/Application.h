@@ -19,6 +19,9 @@ public:
     void run();
     void shutdown();
     void setMaxBounces(uint32_t maxBounces);
+    void setSamplesPerFrame(uint32_t spp);
+    // 0 = Native, 1 = NRDOnly, 2 = NRDDLSS. Applied after init().
+    void setInitialMode(int mode) { m_initialMode = mode; }
     void setHeadlessOutput(const std::string& outputPath, uint32_t sampleCount);
     void setEnvMap(const std::string& path);
 
@@ -68,6 +71,8 @@ private:
     bool m_prevSpeedDownKey = false;
     bool m_prevSpeedUpKey = false;
     uint32_t m_maxBounces = 8;
+    uint32_t m_samplesPerFrame = 1;
+    int m_initialMode = -1;  // -1 = leave as default (Native)
     bool m_guiEnabled = true;
     double m_pendingScrollY = 0.0;
     std::string m_headlessOutputPath;

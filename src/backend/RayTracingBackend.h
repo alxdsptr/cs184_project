@@ -19,7 +19,8 @@ public:
         uint32_t width, uint32_t height,
         uint32_t sampleIndex,
         bool enableEnvironment,
-        uint32_t maxBounces
+        uint32_t maxBounces,
+        uint32_t samplesPerPixel = 1
     ) = 0;
 
     // BDPT-ready: visibility test for connection strategies

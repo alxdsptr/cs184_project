@@ -14,7 +14,8 @@ void launchPathTraceKernel(
     uint32_t height,
     uint32_t sampleIndex,
     bool enableEnvironment,
-    uint32_t maxBounces
+    uint32_t maxBounces,
+    uint32_t samplesPerPixel = 1  // spp per kernel invocation
 );
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
@@ -54,6 +55,7 @@ void launchPathTraceKernelSplit(
     uint32_t height,
     uint32_t sampleIndex,
     bool enableEnvironment,
-    uint32_t maxBounces
+    uint32_t maxBounces,
+    uint32_t samplesPerPixel = 1  // spp per kernel invocation; averages inside the kernel
 );
 #endif // PATHTRACER_NRD_DLSS_ENABLED

@@ -13,6 +13,8 @@ int main(int argc, char** argv) {
     uint32_t height = 720;
     uint32_t maxBounces = 8;
     uint32_t samples = 1;
+    uint32_t samplesPerFrame = 1;  // spp per realtime frame (independent of `-s`)
+    int initialMode = -1;  // -1=default, 0=Native, 1=NRDOnly, 2=NRDDLSS
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -31,6 +33,19 @@ int main(int argc, char** argv) {
                 samples = (uint32_t)value;
             } else {
                 LOG_WARN("Invalid sample count value: %s", argv[i]);
+            }
+        } else if (arg == "--mode" && i + 1 < argc) {
+            std::string m = argv[++i];
+            if (m == "native") initialMode = 0;
+            else if (m == "nrd" || m == "nrdonly") initialMode = 1;
+            else if (m == "dlss" || m == "nrddlss") initialMode = 2;
+            else LOG_WARN("Invalid --mode value: %s (use native|nrd|dlss)", m.c_str());
+        } else if ((arg == "--spp" || arg == "-p") && i + 1 < argc) {
+            int value = std::atoi(argv[++i]);
+            if (value > 0) {
+                samplesPerFrame = (uint32_t)value;
+            } else {
+                LOG_WARN("Invalid spp value: %s", argv[i]);
             }
         } else if (arg == "-f" && i + 1 < argc) {
             outputPath = argv[++i];
@@ -61,6 +76,8 @@ int main(int argc, char** argv) {
 
     Application app;
     app.setMaxBounces(maxBounces);
+    app.setSamplesPerFrame(samplesPerFrame);
+    app.setInitialMode(initialMode);
     if (!outputPath.empty()) {
         app.setHeadlessOutput(outputPath, samples);
     }

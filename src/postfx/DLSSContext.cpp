@@ -10,13 +10,19 @@
 
 #include <cstring>
 #include <cstdlib>
+#include <string>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#endif
 
 namespace {
 
-// NVDA requires a project ID. For non-production apps the SDK accepts an
-// arbitrary UUID. Keep it stable across runs so NGX caches per-project
-// telemetry consistently.
-constexpr const char* kProjectId = "pathtracer-cs184-0f8dbc24";
+// NGX requires a GUID-formatted project ID (8-4-4-4-12 hex digits). An
+// arbitrary "pretty" string fails init with
+// NVSDK_NGX_Result_FAIL_InvalidParameter (0xBAD00005). Generated once,
+// stable across runs so NGX telemetry / caches stay consistent.
+constexpr const char* kProjectId = "0f8dbc24-c5c8-4f9b-9e4a-2d1b3a7c6e5f";
 
 NVSDK_NGX_PerfQuality_Value toNgxQuality(DLSSContext::QualityMode q) {
     switch (q) {
@@ -84,13 +90,32 @@ bool DLSSContext::init(VkInstance instance, VkPhysicalDevice phys, VkDevice devi
     m_impl->phys     = phys;
     m_impl->device   = device;
 
-    // nvngx_dlss.dll is shipped next to the exe by our CMake POST_BUILD step.
-    // Leave application data path null → NGX writes logs next to the DLL.
+    // NGX needs a writable application data path for its logs / telemetry /
+    // shader caches. Passing nullptr makes NGX pick a default (typically
+    // %LOCALAPPDATA%\NVIDIA\NGX), which has bitten us in the past with
+    // NVSDK_NGX_Result_FAIL_UnableToWriteToAppDataPath (0xBAD0000F) when the
+    // default path isn't accessible (locked by OneDrive sync, on a network
+    // share, policy-restricted, etc.). Point NGX at the directory containing
+    // our executable — that directory must exist, since the exe is running
+    // from it, and we just shipped nvngx_dlss.dll next to it.
+    std::wstring appDataPath;
+#ifdef _WIN32
+    wchar_t exePath[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        // Strip the filename — NGX wants a directory.
+        std::wstring p(exePath, n);
+        auto slash = p.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) appDataPath = p.substr(0, slash);
+    }
+#endif
+    const wchar_t* appDataArg = appDataPath.empty() ? nullptr : appDataPath.c_str();
+
     NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_Init_with_ProjectID(
         kProjectId,
         NVSDK_NGX_ENGINE_TYPE_CUSTOM,
         "1.0",
-        nullptr,      // application data path
+        appDataArg,
         instance, phys, device);
     if (NVSDK_NGX_FAILED(r)) {
         LOG_WARN("DLSS: VULKAN_Init_with_ProjectID failed (0x%x)", (unsigned)r);

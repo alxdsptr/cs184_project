@@ -46,6 +46,7 @@ public:
         uchar4* d_ldrOutput,
         bool enableEnvironment,
         uint32_t maxBounces,
+        uint32_t samplesPerFrame,
         VulkanDisplay* display,
         uint32_t frameIndex
     );

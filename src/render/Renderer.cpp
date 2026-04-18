@@ -66,13 +66,17 @@ void Renderer::renderFrame(
     uchar4* d_ldrOutput,
     bool enableEnvironment,
     uint32_t maxBounces,
+    uint32_t samplesPerFrame,
     VulkanDisplay* display,
     uint32_t frameIndex)
 {
     uint32_t sampleIndex = m_accumBuffer.getSampleCount();
+    if (samplesPerFrame < 1) samplesPerFrame = 1;
 
     if (m_mode == Mode::Native) {
-        // Native fallback: original, unchanged pipeline.
+        // Native fallback: the kernel now accumulates `samplesPerFrame`
+        // samples into the accum buffer internally, and divides by
+        // (sampleIndex + samplesPerFrame). Advance our counter by the same.
         backend->launchPathTrace(
             scene, camera,
             m_accumBuffer.getAccumBuffer(),
@@ -80,7 +84,8 @@ void Renderer::renderFrame(
             m_auxBuffers.getPtrs(),
             m_width, m_height, sampleIndex,
             enableEnvironment,
-            maxBounces
+            maxBounces,
+            samplesPerFrame
         );
         launchTonemapKernel(
             m_accumBuffer.getOutputBuffer(),
@@ -89,7 +94,7 @@ void Renderer::renderFrame(
             m_exposure,
             m_toneMappingMode
         );
-        m_accumBuffer.incrementSamples();
+        m_accumBuffer.addSamples(samplesPerFrame);
         return;
     }
 
@@ -109,7 +114,7 @@ void Renderer::renderFrame(
     launchPathTraceKernelSplit(
         scene, camera, surf,
         m_renderWidth, m_renderHeight, sampleIndex,
-        enableEnvironment, maxBounces);
+        enableEnvironment, maxBounces, samplesPerFrame);
     m_accumBuffer.incrementSamples();
 
     // Cache what the pre-present recorder needs; it runs inside present(),
