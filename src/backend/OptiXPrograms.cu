@@ -184,6 +184,41 @@ static __forceinline__ __device__ float3 bsdfEvaluate(
     float3 diffuse = kd * albedo * (1.0f / M_PI_F);
     return diffuse + specular;
 }
+
+// Material-aware wrappers — pureDiffuse materials bypass the Cook-Torrance
+// specular lobe entirely and behave as a pure Lambertian BRDF. Used for
+// legacy Collada Phong materials that only carry a <diffuse> term.
+static __forceinline__ __device__ float materialSpecProb(
+    const GPUMaterial& mat,
+    const float3& N, const float3& V, const float3& albedo)
+{
+    if (mat.pureDiffuse) return 0.0f;
+    return computeSpecProb(N, V, albedo, mat.metallic);
+}
+
+static __forceinline__ __device__ float materialMixturePdf(
+    const GPUMaterial& mat,
+    const float3& N, const float3& V, const float3& L,
+    float specProb)
+{
+    if (mat.pureDiffuse) return bsdfDiffusePdf(dot(N, L));
+    return bsdfMixturePdf(N, V, L, mat.roughness, specProb);
+}
+
+static __forceinline__ __device__ float3 materialBsdfEvaluate(
+    const GPUMaterial& mat,
+    const float3& N, const float3& V, const float3& L,
+    const float3& albedo)
+{
+    if (mat.pureDiffuse) {
+        float NdotL = fmaxf(dot(N, L), 0.0f);
+        float NdotV = fmaxf(dot(N, V), 0.0f);
+        if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0, 0, 0);
+        return albedo * (1.0f / M_PI_F);
+    }
+    return bsdfEvaluate(N, V, L, albedo, mat.roughness, mat.metallic);
+}
+
 static __forceinline__ __device__ uint32_t sampleAreaLightIndex(
     const float* cdf, uint32_t count, float target)
 {
@@ -498,9 +533,9 @@ extern "C" __global__ void __raygen__path_trace()
                         float pdfOmega = pArea * dist2 / fmaxf(lightNdot, 1e-7f);
 
                         float3 V = -ray.direction;
-                        float3 brdf = bsdfEvaluate(N, V, Ld, albedo, mat.roughness, mat.metallic);
-                        float neeSpecProb = computeSpecProb(N, V, albedo, mat.metallic);
-                        float pdfBsdf = bsdfMixturePdf(N, V, Ld, mat.roughness, neeSpecProb);
+                        float3 brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
+                        float neeSpecProb = materialSpecProb(mat, N, V, albedo);
+                        float pdfBsdf = materialMixturePdf(mat, N, V, Ld, neeSpecProb);
                         float weight = powerHeuristic(pdfOmega, pdfBsdf);
 
                         radiance += throughput * shadowTransmittance * brdf *
@@ -534,7 +569,7 @@ extern "C" __global__ void __raygen__path_trace()
                                    + light.quadraticAttenuation * dist2;
                     float attenuation = 1.0f / fmaxf(attenDen, 1e-4f);
                     float3 Li = light.color * (light.intensity * attenuation);
-                    float3 brdf = bsdfEvaluate(N, V, Ld, albedo, mat.roughness, mat.metallic);
+                    float3 brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
                     direct += brdf * shadowTransmittancePL * Li * NdotL;
                 }
                 radiance += throughput * direct;
@@ -542,7 +577,7 @@ extern "C" __global__ void __raygen__path_trace()
 
             // BRDF sampling
             float3 V = -ray.direction;
-            float specProb = computeSpecProb(N, V, albedo, mat.metallic);
+            float specProb = materialSpecProb(mat, N, V, albedo);
             float3 newDir;
 
             if (pcg32_float(rng) < specProb) {
@@ -573,10 +608,10 @@ extern "C" __global__ void __raygen__path_trace()
             float NdotL_new = dot(N, newDir);
             if (NdotL_new < 1e-6f) break;
 
-            float pdf = bsdfMixturePdf(N, V, newDir, mat.roughness, specProb);
+            float pdf = materialMixturePdf(mat, N, V, newDir, specProb);
             if (pdf < 1e-7f) break;
 
-            float3 brdf = bsdfEvaluate(N, V, newDir, albedo, mat.roughness, mat.metallic);
+            float3 brdf = materialBsdfEvaluate(mat, N, V, newDir, albedo);
             throughput = throughput * brdf * (NdotL_new / (pdf + 1e-7f));
 
             prevSurfacePos = hit.position;

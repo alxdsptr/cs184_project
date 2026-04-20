@@ -63,6 +63,29 @@ __device__ inline float3 bsdfSpecularLobe(
     return F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
 }
 
+// Material-aware lobe wrappers — pureDiffuse materials have no specular lobe,
+// and the diffuse lobe is pure albedo/π (no F0 dielectric scaling).
+__device__ inline float3 materialDiffuseLobe(
+    const GPUMaterial& mat,
+    const float3& N, const float3& V, const float3& L, const float3& albedo)
+{
+    if (mat.pureDiffuse) {
+        float NdotL = fmaxf(dot(N, L), 0.0f);
+        float NdotV = fmaxf(dot(N, V), 0.0f);
+        if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0, 0, 0);
+        return albedo * (1.0f / M_PI_F);
+    }
+    return bsdfDiffuseLobe(N, V, L, albedo, mat.roughness, mat.metallic);
+}
+
+__device__ inline float3 materialSpecularLobe(
+    const GPUMaterial& mat,
+    const float3& N, const float3& V, const float3& L, const float3& albedo)
+{
+    if (mat.pureDiffuse) return make_float3(0, 0, 0);
+    return bsdfSpecularLobe(N, V, L, albedo, mat.roughness, mat.metallic);
+}
+
 // Per-contribution firefly clamp. RELAX is very sensitive to single-sample
 // spikes: one 100x outlier survives the temporal filter for many frames and
 // shows up as a shimmering bright speck (water-ripple look). We clamp each
@@ -229,7 +252,7 @@ __global__ void pathTraceKernelSplit(
                 hit.position, camera.viewProjMatrix, camera.prevViewProjMatrix, width, height);
 
             float3 V = -ray.direction;
-            float specProb = computeSpecProb(N, V, albedo, mat.metallic);
+            float specProb = materialSpecProb(mat, N, V, albedo);
             pickedBucket = (pcg32_float(rng) < specProb) ? 1 : 0;
             // Correct for the bucket pick: divide the lobe-only contribution
             // by the selected probability. Combined with forcing NEE/BSDF at
@@ -360,16 +383,16 @@ __global__ void pathTraceKernelSplit(
                     float pdfBs;
                     if (primaryLobeOverride) {
                         if (pickedBucket == 0) {
-                            brdf  = bsdfDiffuseLobe(N, V, Ld, albedo, mat.roughness, mat.metallic);
+                            brdf  = materialDiffuseLobe(mat, N, V, Ld, albedo);
                             pdfBs = bsdfDiffusePdf(NdotL);
                         } else {
-                            brdf  = bsdfSpecularLobe(N, V, Ld, albedo, mat.roughness, mat.metallic);
+                            brdf  = materialSpecularLobe(mat, N, V, Ld, albedo);
                             pdfBs = bsdfSpecularPdf(N, V, Ld, mat.roughness);
                         }
                     } else {
-                        brdf = bsdfEvaluate(N, V, Ld, albedo, mat.roughness, mat.metallic);
-                        float spProb = computeSpecProb(N, V, albedo, mat.metallic);
-                        pdfBs = bsdfMixturePdf(N, V, Ld, mat.roughness, spProb);
+                        brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
+                        float spProb = materialSpecProb(mat, N, V, albedo);
+                        pdfBs = materialMixturePdf(mat, N, V, Ld, spProb);
                     }
                     float w = powerHeuristic(pdfOmega, pdfBs);
                     float3 neeContrib = throughput * st * brdf * light.emission * (NdotL / fmaxf(pdfOmega, 1e-7f)) * w;
@@ -416,10 +439,10 @@ __global__ void pathTraceKernelSplit(
                 float3 brdf;
                 if (primaryLobeOverride) {
                     brdf = (pickedBucket == 0)
-                        ? bsdfDiffuseLobe(N, V, Ld, albedo, mat.roughness, mat.metallic)
-                        : bsdfSpecularLobe(N, V, Ld, albedo, mat.roughness, mat.metallic);
+                        ? materialDiffuseLobe(mat, N, V, Ld, albedo)
+                        : materialSpecularLobe(mat, N, V, Ld, albedo);
                 } else {
-                    brdf = bsdfEvaluate(N, V, Ld, albedo, mat.roughness, mat.metallic);
+                    brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
                 }
                 direct += clampFirefly(brdf * st * Li * NdotL, 10.0f);
             }
@@ -430,7 +453,7 @@ __global__ void pathTraceKernelSplit(
         // forced to match `pickedBucket`; at subsequent hits we use the full
         // mixture since the bucket is already locked in.
         float3 V = -ray.direction;
-        float specProb = computeSpecProb(N, V, albedo, mat.metallic);
+        float specProb = materialSpecProb(mat, N, V, albedo);
         float3 newDir;
         bool sampleSpecularLobe;
         if (primaryLobeOverride) {
@@ -464,14 +487,14 @@ __global__ void pathTraceKernelSplit(
         if (primaryLobeOverride) {
             if (pickedBucket == 0) {
                 pdf  = bsdfDiffusePdf(NdotLn);
-                brdf = bsdfDiffuseLobe(N, V, newDir, albedo, mat.roughness, mat.metallic);
+                brdf = materialDiffuseLobe(mat, N, V, newDir, albedo);
             } else {
                 pdf  = bsdfSpecularPdf(N, V, newDir, mat.roughness);
-                brdf = bsdfSpecularLobe(N, V, newDir, albedo, mat.roughness, mat.metallic);
+                brdf = materialSpecularLobe(mat, N, V, newDir, albedo);
             }
         } else {
-            pdf  = bsdfMixturePdf(N, V, newDir, mat.roughness, specProb);
-            brdf = bsdfEvaluate(N, V, newDir, albedo, mat.roughness, mat.metallic);
+            pdf  = materialMixturePdf(mat, N, V, newDir, specProb);
+            brdf = materialBsdfEvaluate(mat, N, V, newDir, albedo);
         }
         if (pdf < 1e-7f) break;
         throughput = throughput * brdf * (NdotLn / (pdf + 1e-7f));

@@ -154,6 +154,43 @@ __device__ inline float3 bsdfEvaluate(
     return diffuse + specular;
 }
 
+// ── Material-aware wrappers ─────────────────────────────────
+// These respect GPUMaterial::pureDiffuse: when set, they bypass the
+// Cook-Torrance specular lobe entirely and behave as a pure Lambertian BRDF
+// (albedo/π, cosine-weighted sampling). Used for legacy Collada Phong
+// materials that only carry a <diffuse> term.
+
+__device__ inline float materialSpecProb(
+    const GPUMaterial& mat,
+    const float3& N, const float3& V, const float3& albedo)
+{
+    if (mat.pureDiffuse) return 0.0f;
+    return computeSpecProb(N, V, albedo, mat.metallic);
+}
+
+__device__ inline float materialMixturePdf(
+    const GPUMaterial& mat,
+    const float3& N, const float3& V, const float3& L,
+    float specProb)
+{
+    if (mat.pureDiffuse) return bsdfDiffusePdf(dot(N, L));
+    return bsdfMixturePdf(N, V, L, mat.roughness, specProb);
+}
+
+__device__ inline float3 materialBsdfEvaluate(
+    const GPUMaterial& mat,
+    const float3& N, const float3& V, const float3& L,
+    const float3& albedo)
+{
+    if (mat.pureDiffuse) {
+        float NdotL = fmaxf(dot(N, L), 0.0f);
+        float NdotV = fmaxf(dot(N, V), 0.0f);
+        if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0, 0, 0);
+        return albedo * (1.0f / M_PI_F);
+    }
+    return bsdfEvaluate(N, V, L, albedo, mat.roughness, mat.metallic);
+}
+
 __device__ inline uint32_t sampleAreaLightIndex(
     const float* cdf, uint32_t count, float target)
 {

@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace scene_loader_util {
@@ -23,6 +24,11 @@ float3 transformDirection(const aiMatrix4x4& m, const aiVector3D& v);
 float luminance(const float3& c);
 
 std::unordered_map<std::string, float3> parseColladaRadiance(const std::string& path);
+
+// Names of <light> nodes whose <extra><technique profile="CGL"><area> extension
+// is present — these should be treated as area lights (provided by an emissive
+// mesh elsewhere in the scene) rather than as point/spot lights.
+std::unordered_set<std::string> parseColladaCGLAreaLights(const std::string& path);
 
 std::string lowerString(std::string value);
 std::string trimString(std::string value);

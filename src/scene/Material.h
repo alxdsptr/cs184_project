@@ -11,6 +11,13 @@ struct PBRMaterial {
     float  ior         = 1.5f;
     float  transmission = 0.0f;
 
+    // Set for materials that should be rendered as a pure Lambertian diffuse
+    // BRDF — bypasses the Cook-Torrance specular lobe entirely (including the
+    // F0 = 0.04 dielectric term). Used for legacy Collada Phong materials with
+    // negligible specular, to match classic path tracers that only read the
+    // <diffuse> term.
+    bool   pureDiffuse = false;
+
     std::string albedoTexPath;
     std::string normalTexPath;
     std::string metallicRoughTexPath;

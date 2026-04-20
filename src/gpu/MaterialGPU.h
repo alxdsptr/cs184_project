@@ -11,7 +11,7 @@ struct GPUMaterial {
     float  emissionStrength;
     float  ior;
     float  transmission;
-    float  _pad1;
+    int    pureDiffuse;   // nonzero = bypass Cook-Torrance specular lobe
     float  _pad2;
     cudaTextureObject_t albedoTex;
     cudaTextureObject_t normalTex;

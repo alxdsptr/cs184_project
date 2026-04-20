@@ -170,6 +170,39 @@ __device__ inline float3 bsdfEvaluate(
     return diffuse + specular;
 }
 
+// Material-aware wrappers — respect GPUMaterial::pureDiffuse to render legacy
+// Collada Phong materials as a pure Lambertian BRDF (no dielectric F0 lobe).
+__device__ inline float materialSpecProb(
+    const GPUMaterial& mat,
+    const float3& N, const float3& V, const float3& albedo)
+{
+    if (mat.pureDiffuse) return 0.0f;
+    return computeSpecProb(N, V, albedo, mat.metallic);
+}
+
+__device__ inline float materialMixturePdf(
+    const GPUMaterial& mat,
+    const float3& N, const float3& V, const float3& L,
+    float specProb)
+{
+    if (mat.pureDiffuse) return bsdfDiffusePdf(dot(N, L));
+    return bsdfMixturePdf(N, V, L, mat.roughness, specProb);
+}
+
+__device__ inline float3 materialBsdfEvaluate(
+    const GPUMaterial& mat,
+    const float3& N, const float3& V, const float3& L,
+    const float3& albedo)
+{
+    if (mat.pureDiffuse) {
+        float NdotL = fmaxf(dot(N, L), 0.0f);
+        float NdotV = fmaxf(dot(N, V), 0.0f);
+        if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0, 0, 0);
+        return albedo * (1.0f / M_PI_F);
+    }
+    return bsdfEvaluate(N, V, L, albedo, mat.roughness, mat.metallic);
+}
+
 __device__ inline uint32_t sampleAreaLightIndex(
     const float* cdf,
     uint32_t count,
@@ -546,9 +579,9 @@ __global__ void pathTraceKernel(
                     float pdfOmega = pArea * dist2 / fmaxf(lightNdot, 1e-7f);
 
                     float3 V = -ray.direction;
-                    float3 brdf = bsdfEvaluate(N, V, Ld, albedo, mat.roughness, mat.metallic);
-                    float neeSpecProb = computeSpecProb(N, V, albedo, mat.metallic);
-                    float pdfBsdf = bsdfMixturePdf(N, V, Ld, mat.roughness, neeSpecProb);
+                    float3 brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
+                    float neeSpecProb = materialSpecProb(mat, N, V, albedo);
+                    float pdfBsdf = materialMixturePdf(mat, N, V, Ld, neeSpecProb);
                     float weight = powerHeuristic(pdfOmega, pdfBsdf);
 
                     radiance += throughput * shadowTransmittance * brdf * light.emission * (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
@@ -615,7 +648,7 @@ __global__ void pathTraceKernel(
                                + light.quadraticAttenuation * dist2;
                 float attenuation = 1.0f / fmaxf(attenDen, 1e-4f);
                 float3 Li = light.color * (light.intensity * attenuation);
-                float3 brdf = bsdfEvaluate(N, V, Ld, albedo, mat.roughness, mat.metallic);
+                float3 brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
 
                 direct += brdf * shadowTransmittancePL * Li * NdotL;
             }
@@ -625,7 +658,7 @@ __global__ void pathTraceKernel(
 
         // BRDF sampling: Fresnel-weighted blend between diffuse and specular
         float3 V = -ray.direction;
-        float specProb = computeSpecProb(N, V, albedo, mat.metallic);
+        float specProb = materialSpecProb(mat, N, V, albedo);
 
         float3 newDir;
 
@@ -662,11 +695,11 @@ __global__ void pathTraceKernel(
         if (NdotL_new < 1e-6f) break;
 
         // Compute full mixture PDF for the sampled direction
-        float pdf = bsdfMixturePdf(N, V, newDir, mat.roughness, specProb);
+        float pdf = materialMixturePdf(mat, N, V, newDir, specProb);
         if (pdf < 1e-7f) break;
 
         // Evaluate BRDF
-        float3 brdf = bsdfEvaluate(N, V, newDir, albedo, mat.roughness, mat.metallic);
+        float3 brdf = materialBsdfEvaluate(mat, N, V, newDir, albedo);
 
         throughput = throughput * brdf * (NdotL_new / (pdf + 1e-7f));
 

@@ -134,6 +134,7 @@ void DeviceScene::upload(const Scene& scene) {
         dst.emissionStrength = src.emissionStrength;
         dst.ior              = src.ior;
         dst.transmission     = src.transmission;
+        dst.pureDiffuse      = src.pureDiffuse ? 1 : 0;
         dst.albedoTex        = src.albedoTexObj;
         dst.normalTex        = src.normalTexObj;
         dst.metallicRoughTex = src.metallicRoughTexObj;

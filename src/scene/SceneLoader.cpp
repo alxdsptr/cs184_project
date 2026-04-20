@@ -133,8 +133,10 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
 
     // Parse COLLADA radiance extensions (Assimp ignores <extra> radiance data)
     std::unordered_map<std::string, float3> colladaRadiance;
+    std::unordered_set<std::string> colladaCGLAreaLights;
     if (ext == ".dae") {
         colladaRadiance = parseColladaRadiance(path);
+        colladaCGLAreaLights = parseColladaCGLAreaLights(path);
     }
 
     // Materials
@@ -249,6 +251,23 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
             mat.emissionStrength = 1.0f;
         }
 
+        // Detect legacy Collada Phong materials that should render as pure
+        // Lambertian diffuse (matching classic CPU path tracers that ignore the
+        // tiny <specular> and high <shininess> from Phong). Only kick in for
+        // .dae files and only when there is no PBR metallic factor, no
+        // metallic-roughness texture, and the <specular> color is negligible.
+        if (ext == ".dae" && !hasPbrMetallic && mat.metallicRoughTexPath.empty()) {
+            aiColor3D specularColor(0.0f, 0.0f, 0.0f);
+            aiMat->Get(AI_MATKEY_COLOR_SPECULAR, specularColor);
+            float specLum = luminance(toFloat3(specularColor));
+            if (specLum < 0.01f && mat.transmission <= 0.0f && mat.emissionStrength <= 0.0f) {
+                mat.pureDiffuse = true;
+                mat.metallic = 0.0f;
+                LOG_INFO("Material '%s': treating as pure Lambertian (Collada Phong, specular=%.4f)",
+                         materialName.c_str(), specLum);
+            }
+        }
+
         // Emissive materials should not be treated as glass/transmissive.
         // FBX often sets opacity < 1 on light bulb materials, but they should
         // glow opaquely, not refract light through them.
@@ -275,6 +294,16 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
         if (aiL->mType != aiLightSource_POINT && aiL->mType != aiLightSource_SPOT) {
             LOG_WARN("Skipping unsupported light type %d for %s",
                      (int)aiL->mType, aiL->mName.C_Str());
+            continue;
+        }
+
+        // Skip lights that the COLLADA file marks as area lights via the CGL
+        // <extra> extension — those are provided by an emissive mesh elsewhere
+        // in the scene, and loading them here would double-count the emitter.
+        if (!colladaCGLAreaLights.empty() &&
+            colladaCGLAreaLights.count(aiL->mName.C_Str()) > 0) {
+            LOG_INFO("Skipping point light '%s': COLLADA marks it as CGL area light",
+                     aiL->mName.C_Str());
             continue;
         }
 
