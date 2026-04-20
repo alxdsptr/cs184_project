@@ -268,6 +268,93 @@ std::unordered_map<std::string, float3> parseColladaRadiance(const std::string& 
     return result;
 }
 
+std::unordered_set<std::string> parseColladaCGLAreaLights(const std::string& path) {
+    std::unordered_set<std::string> result;
+
+    std::ifstream in(path);
+    if (!in.is_open()) return result;
+
+    std::string content((std::istreambuf_iterator<char>(in)),
+                        std::istreambuf_iterator<char>());
+    in.close();
+
+    size_t pos = 0;
+    while (true) {
+        size_t lightStart = content.find("<light ", pos);
+        if (lightStart == std::string::npos) break;
+
+        size_t lightEnd = content.find("</light>", lightStart);
+        if (lightEnd == std::string::npos) break;
+
+        std::string block = content.substr(lightStart, lightEnd - lightStart);
+
+        bool hasCGLArea = false;
+        size_t extraPos = block.find("<extra");
+        while (extraPos != std::string::npos) {
+            size_t extraEnd = block.find("</extra>", extraPos);
+            if (extraEnd == std::string::npos) break;
+            std::string extraBlock = block.substr(extraPos, extraEnd - extraPos);
+            if (extraBlock.find("profile=\"CGL\"") != std::string::npos &&
+                extraBlock.find("<area") != std::string::npos) {
+                hasCGLArea = true;
+                break;
+            }
+            extraPos = block.find("<extra", extraEnd);
+        }
+
+        if (hasCGLArea) {
+            auto extractAttr = [&](const std::string& attr) -> std::string {
+                std::string needle = attr + "=\"";
+                size_t p = block.find(needle);
+                if (p == std::string::npos) return "";
+                size_t s = p + needle.size();
+                size_t e = block.find('"', s);
+                if (e == std::string::npos) return "";
+                return block.substr(s, e - s);
+            };
+            std::string id = extractAttr("id");
+            std::string name = extractAttr("name");
+            if (!id.empty()) result.insert(id);
+            if (!name.empty()) result.insert(name);
+
+            // Also record any <node> that instantiates this light — Assimp
+            // typically sets aiLight::mName to the instantiating node's name.
+            if (!id.empty()) {
+                std::string needle = "url=\"#" + id + "\"";
+                size_t p = 0;
+                while ((p = content.find(needle, p)) != std::string::npos) {
+                    size_t instPos = content.rfind("<instance_light", p);
+                    if (instPos == std::string::npos) { p += needle.size(); continue; }
+                    size_t nodeStart = content.rfind("<node ", instPos);
+                    if (nodeStart == std::string::npos) { p += needle.size(); continue; }
+                    size_t nodeHeaderEnd = content.find('>', nodeStart);
+                    if (nodeHeaderEnd == std::string::npos) { p += needle.size(); continue; }
+                    std::string nodeHeader = content.substr(nodeStart, nodeHeaderEnd - nodeStart);
+
+                    auto extractFrom = [&](const std::string& attr) -> std::string {
+                        std::string n = attr + "=\"";
+                        size_t q = nodeHeader.find(n);
+                        if (q == std::string::npos) return "";
+                        size_t s = q + n.size();
+                        size_t e = nodeHeader.find('"', s);
+                        if (e == std::string::npos) return "";
+                        return nodeHeader.substr(s, e - s);
+                    };
+                    std::string nodeId = extractFrom("id");
+                    std::string nodeName = extractFrom("name");
+                    if (!nodeId.empty()) result.insert(nodeId);
+                    if (!nodeName.empty()) result.insert(nodeName);
+                    p += needle.size();
+                }
+            }
+        }
+
+        pos = lightEnd + 8;
+    }
+
+    return result;
+}
+
 std::string lowerString(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
         return (char)std::tolower(c);
