@@ -219,6 +219,17 @@ static __forceinline__ __device__ float3 materialBsdfEvaluate(
     return bsdfEvaluate(N, V, L, albedo, mat.roughness, mat.metallic);
 }
 
+// Texture-aware Le fetch at a barycentric point on an area light.
+static __forceinline__ __device__ float3 sampleAreaLightLe(
+    const GPUAreaLight& light, float b0, float b1, float b2)
+{
+    if (light.emissiveTex == 0) return light.emission;
+    float u = light.uv0.x * b0 + light.uv1.x * b1 + light.uv2.x * b2;
+    float v = light.uv0.y * b0 + light.uv1.y * b1 + light.uv2.y * b2;
+    float4 texel = tex2D<float4>(light.emissiveTex, u, v);
+    return make_float3(texel.x, texel.y, texel.z) * light.emission;
+}
+
 static __forceinline__ __device__ uint32_t sampleAreaLightIndex(
     const float* cdf, uint32_t count, float target)
 {
@@ -538,8 +549,9 @@ extern "C" __global__ void __raygen__path_trace()
                         float pdfBsdf = materialMixturePdf(mat, N, V, Ld, neeSpecProb);
                         float weight = powerHeuristic(pdfOmega, pdfBsdf);
 
+                        float3 Le = sampleAreaLightLe(light, b0, b1, b2);
                         radiance += throughput * shadowTransmittance * brdf *
-                                    light.emission *
+                                    Le *
                                     (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
                     }
                 }

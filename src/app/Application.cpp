@@ -264,6 +264,15 @@ bool Application::loadScene(const std::string& path) {
         mat.emissiveTexObj = loadCachedTexture(mat.emissiveTexPath);
     }
 
+    // Back-fill emissive texture handles on area lights so NEE can fetch
+    // per-texel emission for textured emitters.
+    for (auto& areaLight : m_scene.getAreaLights()) {
+        if (areaLight.materialIndex >= 0 &&
+            (size_t)areaLight.materialIndex < materials.size()) {
+            areaLight.emissiveTexObj = materials[areaLight.materialIndex].emissiveTexObj;
+        }
+    }
+
     // Build acceleration structure (uploads geometry + builds BVH)
     m_backend->buildAccelerationStructure(m_scene);
     m_sceneLoaded = true;

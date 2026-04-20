@@ -342,7 +342,10 @@ __global__ void pathTraceKernelSplit(
             GPUAreaLight light = scene.d_areaLights[li];
             float r1 = pcg32_float(rng), r2 = pcg32_float(rng);
             float su = sqrtf(r1);
-            float3 lp = light.v0 * (1.0f - su) + (light.v0 + light.e1) * (su * (1.0f - r2)) + (light.v0 + light.e2) * (su * r2);
+            float b0 = 1.0f - su;
+            float b1 = su * (1.0f - r2);
+            float b2 = su * r2;
+            float3 lp = light.v0 * b0 + (light.v0 + light.e1) * b1 + (light.v0 + light.e2) * b2;
             float3 toL = lp - hit.position;
             float d2 = fmaxf(dot(toL, toL), 1e-6f);
             float d = sqrtf(d2);
@@ -395,7 +398,8 @@ __global__ void pathTraceKernelSplit(
                         pdfBs = materialMixturePdf(mat, N, V, Ld, spProb);
                     }
                     float w = powerHeuristic(pdfOmega, pdfBs);
-                    float3 neeContrib = throughput * st * brdf * light.emission * (NdotL / fmaxf(pdfOmega, 1e-7f)) * w;
+                    float3 Le = sampleAreaLightLe(light, b0, b1, b2);
+                    float3 neeContrib = throughput * st * brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f)) * w;
                     pathRadiance += clampFirefly(neeContrib, 10.0f);
                 }
             }

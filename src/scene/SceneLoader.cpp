@@ -332,9 +332,47 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
     // Meshes
     processNode(aiScn, aiScn->mRootNode, scene, baseDir);
 
-    // Emissive triangle area lights
+    // Emissive triangle area lights.
+    //
+    // For uniform (no-texture) emitters: the light's emission and weight are a
+    // simple product of material emission, albedo, and triangle area.
+    //
+    // For textured emitters: we additionally CPU-decode the emissive texture
+    // once and rasterize each triangle's UV footprint to compute an average
+    // texel luminance. The per-triangle weight is area × avgTexLum ×
+    // luminance(albedo) × emissionStrength, biasing CDF selection toward
+    // brighter regions of the emissive texture. At NEE time the kernel
+    // re-samples the texture at the sampled barycentric point to recover the
+    // true per-texel emission (see PathTraceKernel.cu).
     const auto& meshes = scene.getMeshes();
     const auto& materials = scene.getMaterials();
+
+    // Cache decoded emissive textures by path (one mesh = one material, but
+    // multiple materials may share a texture).
+    struct DecodedTexture {
+        std::vector<unsigned char> pixels;
+        int width  = 0;
+        int height = 0;
+        bool valid = false;
+    };
+    std::unordered_map<std::string, DecodedTexture> texCache;
+
+    auto getDecodedTexture = [&](const std::string& texPath) -> const DecodedTexture& {
+        auto it = texCache.find(texPath);
+        if (it != texCache.end()) return it->second;
+        DecodedTexture dt;
+        dt.valid = loadTexturePixelsRGBA8(texPath, dt.pixels, dt.width, dt.height);
+        if (!dt.valid) {
+            LOG_WARN("Failed to CPU-decode emissive texture for importance sampling: %s",
+                     texPath.c_str());
+        } else {
+            LOG_INFO("Decoded emissive texture for per-triangle weighting: %s (%dx%d)",
+                     texPath.c_str(), dt.width, dt.height);
+        }
+        auto [ins, _] = texCache.emplace(texPath, std::move(dt));
+        return ins->second;
+    };
+
     for (const auto& mesh : meshes) {
         if (mesh.materialIndex < 0 || (size_t)mesh.materialIndex >= materials.size()) {
             continue;
@@ -345,18 +383,25 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
             continue;
         }
 
-        // Skip materials that rely on emissive textures for area light creation.
-        // We can't know per-triangle emission from a texture at scene-load time,
-        // so these are handled via BSDF path hits in the kernel instead.
-        if (!mat.emissiveTexPath.empty()) {
-            continue;
+        bool hasTexture = !mat.emissiveTexPath.empty();
+        const DecodedTexture* decoded = nullptr;
+        if (hasTexture) {
+            const DecodedTexture& dt = getDecodedTexture(mat.emissiveTexPath);
+            if (dt.valid) decoded = &dt;
+            // If the CPU decode fails, we still want to create area lights for
+            // this mesh — fall back to a uniform weight based on mat.emission.
         }
 
-        float3 emission = mat.emission * mat.emissionStrength;
-        float emissionLum = luminance(emission);
-        if (emissionLum <= 0.0f) {
-            continue;
-        }
+        // Baseline emission for uniform emitters: mat.emission × strength.
+        // For textured emitters the kernel computes Le = texel × (strength,
+        // strength, strength), so the per-light `emission` multiplier is just
+        // a scalar replicated across RGB. This matches how the kernel's
+        // BSDF-hit emissive path reads texel × strength, so NEE and path-hit
+        // MIS contributions stay radiometrically consistent.
+        float3 baseEmission = mat.emission * mat.emissionStrength;
+        float baseEmissionLum = luminance(baseEmission);
+
+        if (!hasTexture && baseEmissionLum <= 0.0f) continue;
 
         uint32_t triCount = (uint32_t)mesh.indices.size() / 3;
         for (uint32_t t = 0; t < triCount; t++) {
@@ -371,21 +416,59 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
             float3 e2 = v2 - v0;
             float3 n = cross(e1, e2);
             float area = 0.5f * length(n);
-            if (area <= 1e-8f) {
-                continue;
-            }
+            if (area <= 1e-8f) continue;
 
             TriangleAreaLight light;
             light.v0 = v0;
             light.e1 = e1;
             light.e2 = e2;
             light.normal = normalize(n);
-            light.emission = emission;
             light.area = area;
-            light.weight = area * emissionLum;
+
+            if (decoded && !mesh.uvs.empty() &&
+                i0 < mesh.uvs.size() && i1 < mesh.uvs.size() && i2 < mesh.uvs.size())
+            {
+                float2 uv0 = mesh.uvs[i0];
+                float2 uv1 = mesh.uvs[i1];
+                float2 uv2 = mesh.uvs[i2];
+                float avgTexLum = rasterizeTriangleAvgLuminance(
+                    uv0, uv1, uv2,
+                    decoded->pixels.data(), decoded->width, decoded->height);
+                if (avgTexLum <= 0.0f) continue; // dark region — skip to keep CDF clean
+
+                light.uv0 = uv0;
+                light.uv1 = uv1;
+                light.uv2 = uv2;
+                // For textured emitters, emission is a scalar multiplier
+                // applied on top of the texel fetch. Kernel does
+                //   Le = tex2D(emissiveTex, uv) * light.emission
+                // so storing (strength, strength, strength) gives Le = texel×strength,
+                // matching the BSDF-hit branch that computes texel × mat.emissionStrength.
+                light.emission = make_float3(mat.emissionStrength,
+                                             mat.emissionStrength,
+                                             mat.emissionStrength);
+                // Weight ~ integrated Le over the triangle:
+                //   ∫ texel × strength dA ≈ area × avgTexLum × strength
+                light.weight = area * avgTexLum * mat.emissionStrength;
+                // Record the material so Application can back-fill the CUDA
+                // texture handle after TextureManager loads it.
+                light.materialIndex = mesh.materialIndex;
+            } else {
+                // Uniform emitter (or texture decode failed): fall back to the
+                // old behaviour.
+                if (baseEmissionLum <= 0.0f) continue;
+                light.emission = baseEmission;
+                light.weight = area * baseEmissionLum;
+            }
+
             scene.getAreaLights().push_back(light);
         }
     }
+
+    // Store the emissive-texture path → material index mapping through the
+    // area light weights; the CUDA texture object is bound later (Application
+    // loads textures after SceneLoader). The kernel still needs the handle
+    // attached to each light — DeviceScene wires this up via material index.
 
     LOG_INFO("Loaded: %s (%u meshes, %u materials, %u lights, %u triangles, %u vertices)",
              path.c_str(),

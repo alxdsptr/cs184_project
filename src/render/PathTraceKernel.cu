@@ -203,6 +203,20 @@ __device__ inline float3 materialBsdfEvaluate(
     return bsdfEvaluate(N, V, L, albedo, mat.roughness, mat.metallic);
 }
 
+// Fetch the radiance Le emitted at a barycentric point on an area light,
+// handling the textured/untextured cases. For textured emitters we sample the
+// emissive texture via the UVs stored on the light and multiply by the
+// per-light `emission` (= albedo × emissionStrength, set at load time).
+__device__ inline float3 sampleAreaLightLe(
+    const GPUAreaLight& light, float b0, float b1, float b2)
+{
+    if (light.emissiveTex == 0) return light.emission;
+    float u = light.uv0.x * b0 + light.uv1.x * b1 + light.uv2.x * b2;
+    float v = light.uv0.y * b0 + light.uv1.y * b1 + light.uv2.y * b2;
+    float4 texel = tex2D<float4>(light.emissiveTex, u, v);
+    return make_float3(texel.x, texel.y, texel.z) * light.emission;
+}
+
 __device__ inline uint32_t sampleAreaLightIndex(
     const float* cdf,
     uint32_t count,
@@ -468,7 +482,9 @@ __global__ void pathTraceKernel(
             float3 Le = emissiveColor * mat.emissionStrength;
             float weight = 1.0f;
 
-            // Check if this triangle is a registered area light (i.e. has NO emissive texture)
+            // Check if this triangle is a registered area light (NEE-sampleable
+            // via the area light CDF). Texture-emitter triangles are now
+            // registered too, so MIS applies uniformly.
             bool isAreaLight = false;
             if (bounce > 0 && havePrevSurface && !lastBounceSpecular && scene.d_triangleAreaLightIndex) {
                 int areaLightIndex = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
@@ -584,7 +600,8 @@ __global__ void pathTraceKernel(
                     float pdfBsdf = materialMixturePdf(mat, N, V, Ld, neeSpecProb);
                     float weight = powerHeuristic(pdfOmega, pdfBsdf);
 
-                    radiance += throughput * shadowTransmittance * brdf * light.emission * (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
+                    float3 Le = sampleAreaLightLe(light, b0, b1, b2);
+                    radiance += throughput * shadowTransmittance * brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
                 }
             }
         } else if (scene.d_pointLights && scene.pointLightCount > 0) {
