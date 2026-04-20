@@ -45,4 +45,22 @@ aiMatrix4x4 computeWorldTransform(const aiNode* node);
 void applyUnitScaling(aiScene* aiScn, const std::string& ext);
 std::string getTexturePath(const aiMaterial* mat, aiTextureType type, const std::string& baseDir);
 
+// Decode an LDR texture file into RGBA8 pixels on the CPU. Supports the same
+// formats as TextureManager::loadTexture (png/jpg/dds). Returns false if the
+// file cannot be decoded. Used at scene-load time to compute per-triangle
+// importance weights for emissive meshes.
+bool loadTexturePixelsRGBA8(const std::string& path,
+                            std::vector<unsigned char>& outPixels,
+                            int& outWidth, int& outHeight);
+
+// Given a UV-space triangle and an RGBA8 texture, return the average luminance
+// over the triangle's footprint in the texture. Rasterizes the triangle in
+// texel space (covering every texel whose center is inside the UV triangle)
+// and averages the luminance of the fetched texels. UVs outside [0,1] are
+// wrapped modulo 1 (matching cudaAddressModeWrap used at runtime). Returns 0
+// for degenerate triangles or missing texture.
+float rasterizeTriangleAvgLuminance(
+    float2 uv0, float2 uv1, float2 uv2,
+    const unsigned char* pixels, int width, int height);
+
 }

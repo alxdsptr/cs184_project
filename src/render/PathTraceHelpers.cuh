@@ -191,6 +191,17 @@ __device__ inline float3 materialBsdfEvaluate(
     return bsdfEvaluate(N, V, L, albedo, mat.roughness, mat.metallic);
 }
 
+// Fetch Le at a barycentric point on an area light (texture-aware).
+__device__ inline float3 sampleAreaLightLe(
+    const GPUAreaLight& light, float b0, float b1, float b2)
+{
+    if (light.emissiveTex == 0) return light.emission;
+    float u = light.uv0.x * b0 + light.uv1.x * b1 + light.uv2.x * b2;
+    float v = light.uv0.y * b0 + light.uv1.y * b1 + light.uv2.y * b2;
+    float4 texel = tex2D<float4>(light.emissiveTex, u, v);
+    return make_float3(texel.x, texel.y, texel.z) * light.emission;
+}
+
 __device__ inline uint32_t sampleAreaLightIndex(
     const float* cdf, uint32_t count, float target)
 {

@@ -8,6 +8,10 @@
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -526,6 +530,133 @@ void applyUnitScaling(aiScene* aiScn, const std::string& ext) {
     } else if (!applied) {
         LOG_INFO("No unit scaling applied to %s file (units appear standard)", ext.c_str());
     }
+}
+
+// STB image loader — we declare it as extern here because Texture.cpp already
+// defines STB_IMAGE_IMPLEMENTATION. Declaring the signatures manually avoids
+// pulling in the whole stb_image.h again with a redefinition of the impl.
+extern "C" unsigned char* stbi_load(const char*, int*, int*, int*, int);
+extern "C" void stbi_image_free(void*);
+extern "C" void stbi_set_flip_vertically_on_load(int);
+
+bool loadTexturePixelsRGBA8(const std::string& path,
+                            std::vector<unsigned char>& outPixels,
+                            int& outWidth, int& outHeight) {
+    outPixels.clear();
+    outWidth = 0;
+    outHeight = 0;
+    if (path.empty()) return false;
+
+    // DDS: reuse the existing software decompressor (BC1/BC3). If that fails,
+    // give up — we don't pull gli into utils.cpp to keep the CPU path small.
+    std::string lower = lowerString(path);
+    if (lower.size() >= 4 && lower.substr(lower.size() - 4) == ".dds") {
+        if (decompressDDS(path, outPixels, outWidth, outHeight)) return true;
+        return false;
+    }
+
+    stbi_set_flip_vertically_on_load(0);
+    int w = 0, h = 0, c = 0;
+    unsigned char* pixels = stbi_load(path.c_str(), &w, &h, &c, 4);
+    if (!pixels) return false;
+
+    outWidth = w;
+    outHeight = h;
+    size_t bytes = (size_t)w * (size_t)h * 4;
+    outPixels.resize(bytes);
+    std::memcpy(outPixels.data(), pixels, bytes);
+    stbi_image_free(pixels);
+    return true;
+}
+
+namespace {
+// Wrap a normalized UV coordinate into [0, 1). Matches cudaAddressModeWrap.
+inline float wrap01(float v) {
+    float f = v - std::floor(v);
+    if (f < 0.0f) f += 1.0f;
+    if (f >= 1.0f) f = 0.0f;
+    return f;
+}
+
+inline float texelLuminanceRGBA8(const unsigned char* px, int width, int height, int x, int y) {
+    // Wrap texel coordinates.
+    x = x % width;   if (x < 0) x += width;
+    y = y % height;  if (y < 0) y += height;
+    const unsigned char* p = px + ((size_t)y * width + x) * 4;
+    // sRGB -> linear approximation via square (cheap, good enough for weights).
+    float r = (p[0] / 255.0f); r *= r;
+    float g = (p[1] / 255.0f); g *= g;
+    float b = (p[2] / 255.0f); b *= b;
+    return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+}
+}
+
+float rasterizeTriangleAvgLuminance(
+    float2 uv0, float2 uv1, float2 uv2,
+    const unsigned char* pixels, int width, int height)
+{
+    if (!pixels || width <= 0 || height <= 0) return 0.0f;
+
+    // UVs might be outside [0,1]; find the shifted copy whose centroid lies in
+    // [0,1]^2, then rasterize in texel space. This is a simplification — for
+    // triangles spanning the wrap boundary we accept minor bias.
+    float cu = (uv0.x + uv1.x + uv2.x) / 3.0f;
+    float cv = (uv0.y + uv1.y + uv2.y) / 3.0f;
+    float shiftU = std::floor(cu);
+    float shiftV = std::floor(cv);
+
+    float2 p0 = make_float2((uv0.x - shiftU) * width,  (uv0.y - shiftV) * height);
+    float2 p1 = make_float2((uv1.x - shiftU) * width,  (uv1.y - shiftV) * height);
+    float2 p2 = make_float2((uv2.x - shiftU) * width,  (uv2.y - shiftV) * height);
+
+    float minX = std::min(std::min(p0.x, p1.x), p2.x);
+    float maxX = std::max(std::max(p0.x, p1.x), p2.x);
+    float minY = std::min(std::min(p0.y, p1.y), p2.y);
+    float maxY = std::max(std::max(p0.y, p1.y), p2.y);
+
+    // Add one-texel padding so we don't miss thin triangles and clamp to a
+    // reasonable range. Negative indices are wrapped by texelLuminanceRGBA8.
+    int ix0 = (int)std::floor(minX) - 1;
+    int ix1 = (int)std::ceil(maxX)  + 1;
+    int iy0 = (int)std::floor(minY) - 1;
+    int iy1 = (int)std::ceil(maxY)  + 1;
+
+    // Edge function (returns 2x signed area of the sub-triangle).
+    auto edge = [](float2 a, float2 b, float2 c) {
+        return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    };
+    float triArea2 = edge(p0, p1, p2);
+    float sign = triArea2 >= 0.0f ? 1.0f : -1.0f;
+    float absArea2 = std::abs(triArea2);
+    if (absArea2 < 1e-8f) {
+        // Degenerate UV triangle — fall back to sampling the centroid texel.
+        float u = wrap01(cu - shiftU) * width;
+        float v = wrap01(cv - shiftV) * height;
+        return texelLuminanceRGBA8(pixels, width, height, (int)u, (int)v);
+    }
+
+    double lumSum = 0.0;
+    uint64_t count = 0;
+    for (int y = iy0; y <= iy1; y++) {
+        for (int x = ix0; x <= ix1; x++) {
+            float2 p = make_float2((float)x + 0.5f, (float)y + 0.5f);
+            float w0 = edge(p1, p2, p) * sign;
+            float w1 = edge(p2, p0, p) * sign;
+            float w2 = edge(p0, p1, p) * sign;
+            if (w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f) {
+                lumSum += texelLuminanceRGBA8(pixels, width, height, x, y);
+                count++;
+            }
+        }
+    }
+
+    if (count == 0) {
+        // Triangle is smaller than a texel — sample the centroid.
+        float u = wrap01(cu - shiftU) * width;
+        float v = wrap01(cv - shiftV) * height;
+        return texelLuminanceRGBA8(pixels, width, height, (int)u, (int)v);
+    }
+    return (float)(lumSum / (double)count);
 }
 
 std::string getTexturePath(const aiMaterial* mat, aiTextureType type, const std::string& baseDir) {
