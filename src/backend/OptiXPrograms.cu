@@ -387,15 +387,22 @@ extern "C" __global__ void __raygen__path_trace()
                 mat.roughness = mat.roughness * mrTexel.y;
                 mat.metallic = mat.metallic * mrTexel.z;
             }
-            if (mat.useSpecularGlossiness && mat.specularGlossTex != 0) {
-                float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
-                mat.specularColor = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
+            // SG → MR per-pixel remap (see PathTraceKernel.cu for rationale).
+            if (mat.useSpecularGlossiness) {
+                float3 specRGB = mat.specularColor;
+                float  alphaG  = 1.0f;
+                if (mat.specularGlossTex != 0) {
+                    float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
+                    specRGB = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
+                    alphaG  = sg.w;
+                }
+                float metallicFromSpec = fmaxf(specRGB.x, fmaxf(specRGB.y, specRGB.z));
+                mat.metallic = clampf(metallicFromSpec, 0.0f, 1.0f);
+                albedo = lerp(albedo, specRGB, mat.metallic);
                 float gloss = mat.specularGlossAlphaIsGlossiness
-                                ? (mat.glossiness * sg.w)
+                                ? (mat.glossiness * alphaG)
                                 :  mat.glossiness;
                 mat.roughness = 1.0f - gloss;
-            } else if (mat.useSpecularGlossiness) {
-                mat.roughness = 1.0f - mat.glossiness;
             }
             mat.roughness = fmaxf(mat.roughness, 0.045f);
             mat.metallic = clampf(mat.metallic, 0.0f, 1.0f);

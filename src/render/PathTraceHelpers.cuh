@@ -211,7 +211,7 @@ __device__ inline float materialSpecProb(
     const float3& N, const float3& V, const float3& albedo)
 {
     if (mat.pureDiffuse) return 0.0f;
-    if (mat.useSpecularGlossiness) return computeSpecProbSG(N, V, albedo, mat.specularColor);
+    // SG materials are remapped per-pixel into MR before BRDF evaluation.
     return computeSpecProb(N, V, albedo, mat.metallic);
 }
 
@@ -235,9 +235,7 @@ __device__ inline float3 materialBsdfEvaluate(
         if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0, 0, 0);
         return albedo * (1.0f / M_PI_F);
     }
-    if (mat.useSpecularGlossiness) {
-        return bsdfEvaluateSG(N, V, L, albedo, mat.roughness, mat.specularColor);
-    }
+    // SG materials are remapped to MR per-pixel before reaching here.
     return bsdfEvaluate(N, V, L, albedo, mat.roughness, mat.metallic);
 }
 

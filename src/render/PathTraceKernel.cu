@@ -220,7 +220,9 @@ __device__ inline float materialSpecProb(
     const float3& N, const float3& V, const float3& albedo)
 {
     if (mat.pureDiffuse) return 0.0f;
-    if (mat.useSpecularGlossiness) return computeSpecProbSG(N, V, albedo, mat.specularColor);
+    // SG materials are remapped per-pixel into MR (metallic from spec.rgb
+    // luminance, albedo blended with spec colour) before BRDF evaluation, so
+    // the standard MR path is correct here.
     return computeSpecProb(N, V, albedo, mat.metallic);
 }
 
@@ -244,9 +246,7 @@ __device__ inline float3 materialBsdfEvaluate(
         if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0, 0, 0);
         return albedo * (1.0f / M_PI_F);
     }
-    if (mat.useSpecularGlossiness) {
-        return bsdfEvaluateSG(N, V, L, albedo, mat.roughness, mat.specularColor);
-    }
+    // SG materials are remapped to MR per-pixel before reaching here.
     return bsdfEvaluate(N, V, L, albedo, mat.roughness, mat.metallic);
 }
 
@@ -413,17 +413,32 @@ __global__ void pathTraceKernel(
             mat.metallic = mat.metallic * mrTexel.z;
         }
 
-        // Specular-Glossiness: RGB = F0 colour, A = glossiness when the loader
-        // detected meaningful alpha variance, else use the scalar glossiness.
-        if (mat.useSpecularGlossiness && mat.specularGlossTex != 0) {
-            float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
-            mat.specularColor = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
+        // Specular-Glossiness → Metallic-Roughness remap. MEASURE_SEVEN's
+        // *_Specular.dds uses the spec map as a "metallic colour tint" rather
+        // than a literal F0 (e.g. a black-metal pipe with BaseColor=dark-olive
+        // and Specular=magenta — the magenta is the reflectance colour, not
+        // the dielectric F0). Treating it as raw F0 produces near-mirror
+        // surfaces with weird tints. Instead we remap per pixel:
+        //   metallic = max(spec.r, spec.g, spec.b)              -- saturated spec ⇒ metal
+        //   albedo'  = lerp(baseColour, spec.rgb, metallic)     -- metals reflect their colour
+        //   F0       = lerp(0.04, albedo', metallic)            -- standard MR substitution
+        // Roughness comes from glossiness × tex.a (when alpha carries data)
+        // or the scalar glossiness factor alone.
+        if (mat.useSpecularGlossiness) {
+            float3 specRGB = mat.specularColor;
+            float  alphaG  = 1.0f;
+            if (mat.specularGlossTex != 0) {
+                float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
+                specRGB = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
+                alphaG  = sg.w;
+            }
+            float metallicFromSpec = fmaxf(specRGB.x, fmaxf(specRGB.y, specRGB.z));
+            mat.metallic = clampf(metallicFromSpec, 0.0f, 1.0f);
+            albedo = lerp(albedo, specRGB, mat.metallic);
             float gloss = mat.specularGlossAlphaIsGlossiness
-                            ? (mat.glossiness * sg.w)
+                            ? (mat.glossiness * alphaG)
                             :  mat.glossiness;
             mat.roughness = 1.0f - gloss;
-        } else if (mat.useSpecularGlossiness) {
-            mat.roughness = 1.0f - mat.glossiness;
         }
 
         // Clamp roughness/metallic to stable ranges for BRDF sampling/evaluation
