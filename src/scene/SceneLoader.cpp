@@ -301,16 +301,16 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
         mat.specularGlossTexPath = getTexturePath(aiMat, aiTextureType_SPECULAR, baseDir);
 
         // ── Specular-Glossiness workflow detection ───────────────────────
-        // Triggered for legacy FBX content (e.g. MEASURE_SEVEN) that ships a
-        // *_Specular.dds map alongside *_BaseColor and has no metallic-roughness
-        // texture and no PBR metallic factor. The Specular map carries F0
-        // (rgb) and glossiness (alpha) and we must NOT apply the MR
-        // `lerp(0.04, albedo, metallic)` rewrite. Some FBXs ship a 3-channel
-        // (RGB-only) specular map whose alpha is implicitly 1; if we treated
-        // that as glossiness=1 the surface would collapse to a perfect mirror,
-        // so we CPU-decode the texture to check alpha variance and only enable
-        // per-pixel glossiness when the alpha channel actually carries data.
-        if (!mat.specularGlossTexPath.empty()
+        // Currently disabled: the *_Specular.dds maps in the FBX assets we
+        // target (Bistro, MEASURE_SEVEN) are artist-authored tint masks rather
+        // than physical F0 data — any literal or remapped interpretation we
+        // tried rendered the scenes incorrectly (tinted mirrors, yellow-green
+        // cast, or lost reflections on surfaces that should have them). Until
+        // we have a better signal to interpret these maps, we fall back to
+        // default MR (metallic=0, roughness from the material's scalar) so
+        // surfaces render as plain diffuse-with-baseline-dielectric.
+        if (false
+            && !mat.specularGlossTexPath.empty()
             && mat.metallicRoughTexPath.empty()
             && !hasPbrMetallic)
         {
