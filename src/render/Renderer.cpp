@@ -109,6 +109,7 @@ void Renderer::renderFrame(
             gb.motionVectors = s.motionVectors;
             gb.viewZ         = s.viewZ;
             gb.hdrColor      = s.hdrColor;
+            gb.ndcDepth      = s.ndcDepth;
         }
         backend->launchPathTrace(
             scene, camera,
@@ -146,9 +147,20 @@ void Renderer::renderFrame(
         surf.motionVectors           = s.motionVectors;
         surf.albedo                  = s.albedo;
         surf.emissive                = s.emissive;
+        surf.ndcDepth                = s.ndcDepth;
+    }
+    // NRDOnly has no AA resolver behind it (no DLSS, no TAA) — see NRD README:
+    // "NRD tries to preserve jittering at least on geometrical edges ... moves
+    // the problem of anti-aliasing to the application side." Feeding Halton
+    // sub-pixel jitter with no final resolver produces a persistent shimmer on
+    // edges even when the camera is static. Zero the jitter in this mode.
+    // NRDDLSS keeps Halton — DLSS consumes it for super-sampling AA.
+    CameraParams cameraForSplit = camera;
+    if (m_mode == Mode::NRDOnly) {
+        cameraForSplit.jitterOffset = make_float2(0.0f, 0.0f);
     }
     backend->launchPathTraceSplit(
-        scene, camera, surf,
+        scene, cameraForSplit, surf,
         m_renderWidth, m_renderHeight, sampleIndex,
         enableEnvironment, maxBounces, samplesPerFrame);
     m_accumBuffer.incrementSamples();
@@ -156,7 +168,9 @@ void Renderer::renderFrame(
     // Cache what the pre-present recorder needs; it runs inside present(),
     // long after the `camera` argument (a stack local in the caller) has
     // gone out of scope — so take a deep copy, don't stash a pointer.
-    m_lastCamera = camera;
+    // IMPORTANT: cache the *kernel-visible* camera (including the zeroed
+    // jitter for NRDOnly) so NRD sees the same jitter the ray-gen used.
+    m_lastCamera = cameraForSplit;
     m_lastCameraValid = true;
     m_frameIndex = frameIndex;
     // Register the pre-present hook idempotently.
@@ -711,6 +725,7 @@ void Renderer::recordPrePresent(VkCommandBuffer cmd) {
     toGeneral(m_sharedAux->motionVectors().image());
     toGeneral(m_sharedAux->albedo().image());
     toGeneral(m_sharedAux->emissive().image());
+    toGeneral(m_sharedAux->ndcDepth().image());
     // NRD outputs: previous frame's toRead() left these in SHADER_READ_ONLY,
     // but we declared their initial state to NRI as GENERAL. NRI's generated
     // barrier at the top of Denoise() therefore uses an oldLayout that
@@ -849,15 +864,22 @@ void Renderer::recordPrePresent(VkCommandBuffer cmd) {
             VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        SharedVulkanImage::transition(cmd, m_sharedAux->ndcDepth().image(),
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
         m_dlss->evaluate(cmd,
             m_hdrRenderView, m_hdrRenderImage,
             m_hdrOutputView, m_hdrOutputImage,
             m_sharedAux->motionVectors().view(), m_sharedAux->motionVectors().image(),
-            m_sharedAux->viewZ().view(),        m_sharedAux->viewZ().image(),
+            // DLSS Super-Resolution needs post-perspective NDC depth
+            // (clip.z/clip.w, [0,1]); it does NOT support linear viewZ. See
+            // NRD-Sample/DlssBefore.cs.hlsl.
+            m_sharedAux->ndcDepth().view(),     m_sharedAux->ndcDepth().image(),
             VK_FORMAT_R16G16B16A16_SFLOAT,      // color
             VK_FORMAT_R16G16_SFLOAT,            // motion
-            VK_FORMAT_R32_SFLOAT,               // depth (linear viewZ)
+            VK_FORMAT_R32_SFLOAT,               // depth (NDC z in [0,1])
             m_renderWidth, m_renderHeight,
             m_width, m_height,
             m_lastCamera.jitterOffset.x, m_lastCamera.jitterOffset.y,
@@ -927,7 +949,7 @@ void Renderer::recordDlssOnlyPrePresent(VkCommandBuffer cmd) {
     };
     toRead(m_sharedAux->hdrColor().image());
     toRead(m_sharedAux->motionVectors().image());
-    toRead(m_sharedAux->viewZ().image());
+    toRead(m_sharedAux->ndcDepth().image());
 
     // (2) DLSS expects the upscaled output image in GENERAL.
     SharedVulkanImage::transition(cmd, m_hdrOutputImage,
@@ -940,10 +962,11 @@ void Renderer::recordDlssOnlyPrePresent(VkCommandBuffer cmd) {
         m_sharedAux->hdrColor().view(),  m_sharedAux->hdrColor().image(),
         m_hdrOutputView,                 m_hdrOutputImage,
         m_sharedAux->motionVectors().view(), m_sharedAux->motionVectors().image(),
-        m_sharedAux->viewZ().view(),         m_sharedAux->viewZ().image(),
+        // DLSS Super-Resolution needs NDC depth (clip.z/clip.w), not linear viewZ.
+        m_sharedAux->ndcDepth().view(),      m_sharedAux->ndcDepth().image(),
         VK_FORMAT_R16G16B16A16_SFLOAT,   // color
         VK_FORMAT_R16G16_SFLOAT,         // motion
-        VK_FORMAT_R32_SFLOAT,            // depth (linear viewZ)
+        VK_FORMAT_R32_SFLOAT,            // depth (NDC z in [0,1])
         m_renderWidth, m_renderHeight,
         m_width,       m_height,
         m_lastCamera.jitterOffset.x, m_lastCamera.jitterOffset.y,

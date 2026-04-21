@@ -166,6 +166,7 @@ __global__ void pathTraceKernelSplit(
     float  outPrimaryRoughness = 1.0f;
     float  outPrimaryViewZ     = 0.0f;
     float2 outPrimaryMvPx      = make_float2(0.0f, 0.0f);
+    float  outPrimaryNdcZ      = 1.0f;  // DLSS-style NDC depth (1 = far)
 
     if (samplesPerPixel < 1) samplesPerPixel = 1;
 
@@ -174,10 +175,14 @@ __global__ void pathTraceKernelSplit(
         uint32_t rng = pcg32_seed(pixelIdx * 0x9E3779B9u + s,
                                   sampleIndex * 0x85EBCA6Bu + s);
 
-    float jx = pcg32_float(rng) - 0.5f;
-    float jy = pcg32_float(rng) - 0.5f;
-    jx += camera.jitterOffset.x;
-    jy += camera.jitterOffset.y;
+    // NRD/DLSS require that the sub-pixel offset actually used at ray-gen
+    // exactly matches `CommonSettings::cameraJitter` (Halton). Adding a
+    // per-sample random offset here would make the real sample land
+    // somewhere else sub-pixel-wise, so NRD's history reprojection is off
+    // by up to a full pixel — manifesting as a persistent water-wave
+    // jitter on static frames.
+    float jx = camera.jitterOffset.x;
+    float jy = camera.jitterOffset.y;
 
     Ray ray = generateRay(x, y, width, height, camera, jx, jy);
 
@@ -192,6 +197,7 @@ __global__ void pathTraceKernelSplit(
     float primaryRoughness = 1.0f;
     float primaryViewZ = 0.0f;
     float2 primaryMvPx = make_float2(0.0f, 0.0f);
+    float primaryNdcZ  = 1.0f;
     int   pickedBucket = 0;       // 0 = diffuse, 1 = specular
     float bucketHitDist = 0.0f;    // world-space distance to first indirect surface
     bool  bucketHitDistSet = false;
@@ -338,6 +344,14 @@ __global__ void pathTraceKernelSplit(
             primaryViewZ = nrd_helpers::computeViewZ(hit.position, camera.position, camera.forward);
             primaryMvPx = nrd_helpers::computeMotionVectorPx(
                 hit.position, camera.viewProjMatrix, camera.prevViewProjMatrix, width, height);
+            // NDC depth for DLSS — RELAX wants linear viewZ (already above),
+            // DLSS Super-Resolution wants post-perspective clip.z/clip.w.
+            // mat4_transformPoint does the perspective divide so .z is NDC z in
+            // [-1,1] (GL); remap to DLSS's [0,1] convention.
+            {
+                float3 ndc = mat4_transformPoint(camera.viewProjMatrix, hit.position);
+                primaryNdcZ = clampf(ndc.z * 0.5f + 0.5f, 0.0f, 1.0f);
+            }
 
             float3 V = -ray.direction;
             float specProb = materialSpecProb(mat, N, V, albedo);
@@ -652,6 +666,7 @@ __global__ void pathTraceKernelSplit(
             outPrimaryRoughness = primaryRoughness;
             outPrimaryViewZ     = primaryViewZ;
             outPrimaryMvPx      = primaryMvPx;
+            outPrimaryNdcZ      = primaryNdcZ;
             gbufferWritten = true;
         }
     } // end spp loop
@@ -713,6 +728,8 @@ __global__ void pathTraceKernelSplit(
     }
     if (surfaces.viewZ)
         surf2Dwrite<float>(outPrimaryViewZ, surfaces.viewZ, x * 4, y); // R32F = 4B
+    if (surfaces.ndcDepth)
+        surf2Dwrite<float>(outPrimaryNdcZ, surfaces.ndcDepth, x * 4, y); // R32F = 4B
     if (surfaces.motionVectors) {
         // RG16F = 4B. surf2Dwrite doesn't expose an __half2 overload — write
         // as a ushort2 whose bit pattern is a pair of halves.

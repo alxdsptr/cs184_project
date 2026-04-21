@@ -22,6 +22,10 @@ struct SharedAuxSurfaces {
     // DLSSOnly: full HDR composite produced by the path-trace kernel directly,
     // bypassing NRD/composite. Render-resolution input to DLSS upscale.
     cudaSurfaceObject_t hdrColor                = 0; // RGBA16F, linear HDR
+    // DLSS requires NDC depth (clip.z / clip.w), not linear viewZ — see the
+    // NRD-Sample's DlssBefore.cs.hlsl comment "SR doesn't support linear viewZ".
+    // Separate from `viewZ` so NRD can keep consuming linear-meter viewZ.
+    cudaSurfaceObject_t ndcDepth                = 0; // R32F, clip.z / clip.w in [0,1]
 };
 
 class VulkanSharedAuxBuffers {
@@ -52,6 +56,7 @@ public:
     const SharedVulkanImage& albedo()                  const { return m_albedo; }
     const SharedVulkanImage& emissive()                const { return m_emissive; }
     const SharedVulkanImage& hdrColor()                const { return m_hdrColor; }
+    const SharedVulkanImage& ndcDepth()                const { return m_ndcDepth; }
 
     uint32_t width()  const { return m_width; }
     uint32_t height() const { return m_height; }
@@ -66,6 +71,7 @@ private:
     SharedVulkanImage m_albedo;
     SharedVulkanImage m_emissive;
     SharedVulkanImage m_hdrColor;
+    SharedVulkanImage m_ndcDepth;
     uint32_t m_width  = 0;
     uint32_t m_height = 0;
 };

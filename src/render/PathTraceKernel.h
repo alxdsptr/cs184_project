@@ -37,6 +37,7 @@ struct SplitSurfaceOutputs {
     cudaSurfaceObject_t motionVectors           = 0;
     cudaSurfaceObject_t albedo                  = 0;
     cudaSurfaceObject_t emissive                = 0;
+    cudaSurfaceObject_t ndcDepth                = 0; // clip.z / clip.w (for DLSS)
 };
 
 // Split-output variant of the path tracer. Writes demodulated diffuse / specular

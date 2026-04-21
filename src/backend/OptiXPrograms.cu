@@ -297,14 +297,26 @@ extern "C" __global__ void __raygen__path_trace()
     float3 radianceSum = make_float3(0, 0, 0);
     bool gbufferWritten = false;
 
+    // DLSSOnly publishes to `gbuffer.hdrColor`; in that path the sub-pixel
+    // offset must exactly match `camera.jitterOffset` (Halton). An extra
+    // per-sample random offset would confuse DLSS's temporal reprojection
+    // and produce ghosting / shimmer.
+    const bool dlssPublish = (params.gbuffer.hdrColor != 0);
+
     for (uint32_t s = 0; s < samplesPerPixel; s++) {
         uint32_t rng = pcg32_seed(pixelIdx * 0x9E3779B9u + s,
                                   params.sampleIndex * 0x85EBCA6Bu + s);
 
-        float jx = pcg32_float(rng) - 0.5f;
-        float jy = pcg32_float(rng) - 0.5f;
-        jx += camera.jitterOffset.x;
-        jy += camera.jitterOffset.y;
+        float jx, jy;
+        if (dlssPublish) {
+            jx = camera.jitterOffset.x;
+            jy = camera.jitterOffset.y;
+        } else {
+            jx = pcg32_float(rng) - 0.5f;
+            jy = pcg32_float(rng) - 0.5f;
+            jx += camera.jitterOffset.x;
+            jy += camera.jitterOffset.y;
+        }
 
         Ray ray = generateRay(x, y, params.width, params.height, camera, jx, jy);
 
@@ -347,6 +359,9 @@ extern "C" __global__ void __raygen__path_trace()
                     if (params.gbuffer.motionVectors) {
                         ushort2 zero = make_ushort2(0, 0);
                         surf2Dwrite<ushort2>(zero, params.gbuffer.motionVectors, x * 4, y);
+                    }
+                    if (params.gbuffer.ndcDepth) {
+                        surf2Dwrite<float>(1.0f, params.gbuffer.ndcDepth, x * 4, y); // far
                     }
                     gbufferWritten = true;
                     firstBounce = false;
@@ -491,7 +506,10 @@ extern "C" __global__ void __raygen__path_trace()
                                                      (1.0f - clipCurr.y) * 0.5f * params.height);
                     float2 screenPrev = make_float2((clipPrev.x + 1.0f) * 0.5f * params.width,
                                                      (1.0f - clipPrev.y) * 0.5f * params.height);
-                    float2 mvPx = screenCurr - screenPrev;
+                    // DLSS / NRD MV convention: "where was this pixel last
+                    // frame" = `prev - curr`. See PathTraceKernel.cu for the
+                    // longer comment.
+                    float2 mvPx = screenPrev - screenCurr;
 
                     if (params.aux.d_linearDepth)   params.aux.d_linearDepth[pixelIdx] = viewZprim;
                     if (params.aux.d_albedo)        params.aux.d_albedo[pixelIdx]      = albedo;
@@ -512,6 +530,12 @@ extern "C" __global__ void __raygen__path_trace()
                         packed.x = *reinterpret_cast<unsigned short*>(&hx);
                         packed.y = *reinterpret_cast<unsigned short*>(&hy);
                         surf2Dwrite<ushort2>(packed, params.gbuffer.motionVectors, x * 4, y);  // RG16F
+                    }
+                    if (params.gbuffer.ndcDepth) {
+                        // DLSS needs NDC depth in [0,1], not linear viewZ.
+                        // `clipCurr` has already been perspective-divided.
+                        float ndcZ = clampf(clipCurr.z * 0.5f + 0.5f, 0.0f, 1.0f);
+                        surf2Dwrite<float>(ndcZ, params.gbuffer.ndcDepth, x * 4, y);
                     }
 
                     gbufferWritten = true;
@@ -980,15 +1004,19 @@ extern "C" __global__ void __raygen__path_trace_split()
     float  outPrimaryRoughness = 1.0f;
     float  outPrimaryViewZ     = 0.0f;
     float2 outPrimaryMvPx      = make_float2(0.0f, 0.0f);
+    float  outPrimaryNdcZ      = 1.0f;
 
     for (uint32_t s = 0; s < samplesPerPixel; s++) {
         uint32_t rng = pcg32_seed(pixelIdx * 0x9E3779B9u + s,
                                   params.sampleIndex * 0x85EBCA6Bu + s);
 
-        float jx = pcg32_float(rng) - 0.5f;
-        float jy = pcg32_float(rng) - 0.5f;
-        jx += camera.jitterOffset.x;
-        jy += camera.jitterOffset.y;
+        // NRD/DLSS require the ray-gen sub-pixel offset to exactly match
+        // `camera.jitterOffset` (Halton). See PathTraceKernelSplit.cu for
+        // the longer comment — an extra per-sample random offset makes
+        // history reprojection chase the wrong sub-pixel and shows up as
+        // still-frame "water wave" jitter.
+        float jx = camera.jitterOffset.x;
+        float jy = camera.jitterOffset.y;
 
         Ray ray = generateRay(x, y, params.width, params.height, camera, jx, jy);
 
@@ -1003,6 +1031,7 @@ extern "C" __global__ void __raygen__path_trace_split()
         float  primaryRoughness = 1.0f;
         float  primaryViewZ     = 0.0f;
         float2 primaryMvPx      = make_float2(0.0f, 0.0f);
+        float  primaryNdcZ      = 1.0f;
         int    pickedBucket     = 0;       // 0 = diff, 1 = spec
         float  bucketHitDist    = 0.0f;
         bool   bucketHitDistSet = false;
@@ -1174,6 +1203,10 @@ extern "C" __global__ void __raygen__path_trace_split()
                 primaryMvPx      = nrd_helpers::computeMotionVectorPx(
                     hit.position, camera.viewProjMatrix, camera.prevViewProjMatrix,
                     params.width, params.height);
+                {
+                    float3 ndc = mat4_transformPoint(camera.viewProjMatrix, hit.position);
+                    primaryNdcZ = clampf(ndc.z * 0.5f + 0.5f, 0.0f, 1.0f);
+                }
 
                 float3 V = -ray.direction;
                 float specProb = materialSpecProb(mat, N, V, albedo);
@@ -1436,6 +1469,7 @@ extern "C" __global__ void __raygen__path_trace_split()
             outPrimaryRoughness = primaryRoughness;
             outPrimaryViewZ     = primaryViewZ;
             outPrimaryMvPx      = primaryMvPx;
+            outPrimaryNdcZ      = primaryNdcZ;
             gbufferWritten = true;
         }
     } // end spp loop
@@ -1472,6 +1506,8 @@ extern "C" __global__ void __raygen__path_trace_split()
     }
     if (params.splitViewZ)
         surf2Dwrite<float>(outPrimaryViewZ, params.splitViewZ, x * 4, y);
+    if (params.splitNdcDepth)
+        surf2Dwrite<float>(outPrimaryNdcZ, params.splitNdcDepth, x * 4, y);
     if (params.splitMotionVectors) {
         ushort2 packed = packHalf2_split(outPrimaryMvPx.x, outPrimaryMvPx.y);
         surf2Dwrite<ushort2>(packed, params.splitMotionVectors, x * 4, y);

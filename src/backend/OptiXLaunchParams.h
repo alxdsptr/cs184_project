@@ -36,6 +36,7 @@ struct LaunchParams {
     cudaSurfaceObject_t splitMotionVectors;            // RG16F (pixel-space prev−curr)
     cudaSurfaceObject_t splitAlbedo;                   // RGBA8_UNORM (demodulation factor)
     cudaSurfaceObject_t splitEmissive;                 // RGBA16F (linear HDR)
+    cudaSurfaceObject_t splitNdcDepth;                 // R32F (DLSS depth in [0,1])
 
     unsigned int    width;
     unsigned int    height;
