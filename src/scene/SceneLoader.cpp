@@ -408,7 +408,13 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         // world space, regardless of how bright/dark its texture is. This is
         // what keeps Bistro's lamps from blowing out while MEASURE_SEVEN's
         // logo-on-black decals stay visible at the same default "strength".
-        if (!mat.emissiveTexPath.empty() && mat.emissionStrength <= 0.0f) {
+        //
+        // Always override strength here when an emissive texture is present —
+        // Assimp's COLOR_EMISSIVE / EMISSIVE_INTENSITY heuristics above set
+        // strength=1.0 for FBX materials whose scalar emissive happens to be
+        // bright (e.g. Bistro's coloured string lights), which would otherwise
+        // bypass adaptive normalisation entirely and ignore --emissive-target.
+        if (!mat.emissiveTexPath.empty()) {
             mat.emission = make_float3(1.0f, 1.0f, 1.0f);
 
             const DecodedEmissiveTex& dt = getDecodedEmissive(mat.emissiveTexPath);
