@@ -13,6 +13,7 @@ struct GPUMaterial {
     float  transmission;
     int    pureDiffuse;             // nonzero = bypass Cook-Torrance specular lobe
     int    useSpecularGlossiness;   // nonzero = use SG workflow (F0 from specularColor/Tex)
+    int    specularGlossAlphaIsGlossiness; // nonzero = sample tex.a as per-pixel glossiness
     float3 specularColor;           // F0 multiplier (used when useSpecularGlossiness != 0)
     float  glossiness;              // 1 - roughness multiplier
     cudaTextureObject_t albedoTex;

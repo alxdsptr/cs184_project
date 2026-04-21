@@ -363,6 +363,7 @@ extern "C" __global__ void __raygen__path_trace()
                 mat.normalTex = 0;
                 mat.specularGlossTex = 0;
                 mat.useSpecularGlossiness = 0;
+                mat.specularGlossAlphaIsGlossiness = 0;
                 mat.specularColor = make_float3(1.0f, 1.0f, 1.0f);
                 mat.glossiness = 0.5f;
                 mat.pureDiffuse = 0;
@@ -389,7 +390,10 @@ extern "C" __global__ void __raygen__path_trace()
             if (mat.useSpecularGlossiness && mat.specularGlossTex != 0) {
                 float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
                 mat.specularColor = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
-                mat.roughness = 1.0f - mat.glossiness * sg.w;
+                float gloss = mat.specularGlossAlphaIsGlossiness
+                                ? (mat.glossiness * sg.w)
+                                :  mat.glossiness;
+                mat.roughness = 1.0f - gloss;
             } else if (mat.useSpecularGlossiness) {
                 mat.roughness = 1.0f - mat.glossiness;
             }

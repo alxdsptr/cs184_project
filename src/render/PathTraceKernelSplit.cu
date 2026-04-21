@@ -244,6 +244,7 @@ __global__ void pathTraceKernelSplit(
             mat.roughness = 0.5f; mat.metallic = 0.0f;
             mat.emission = make_float3(0,0,0); mat.emissionStrength = 0.0f;
             mat.useSpecularGlossiness = 0;
+            mat.specularGlossAlphaIsGlossiness = 0;
             mat.specularColor = make_float3(1.0f, 1.0f, 1.0f);
             mat.glossiness = 0.5f;
             mat.specularGlossTex = 0;
@@ -274,7 +275,10 @@ __global__ void pathTraceKernelSplit(
         if (mat.useSpecularGlossiness && mat.specularGlossTex != 0) {
             float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
             mat.specularColor = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
-            mat.roughness = 1.0f - mat.glossiness * sg.w;
+            float gloss = mat.specularGlossAlphaIsGlossiness
+                            ? (mat.glossiness * sg.w)
+                            :  mat.glossiness;
+            mat.roughness = 1.0f - gloss;
         } else if (mat.useSpecularGlossiness) {
             mat.roughness = 1.0f - mat.glossiness;
         }

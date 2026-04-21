@@ -25,6 +25,12 @@ struct PBRMaterial {
     bool   useSpecularGlossiness = false;
     float3 specularColor = {1.0f, 1.0f, 1.0f}; // F0 multiplier (linear)
     float  glossiness    = 0.5f;               // 1 - roughness multiplier
+    // True when the spec/gloss texture's alpha channel actually carries
+    // glossiness data (variance > noise floor). When false the kernel uses
+    // only the scalar glossiness factor and does not multiply by tex.a — this
+    // prevents 3-channel specular maps (alpha implicitly 1) from collapsing
+    // every shaded pixel to a perfect mirror.
+    bool   specularGlossAlphaIsGlossiness = false;
 
     std::string albedoTexPath;
     std::string normalTexPath;

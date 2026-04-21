@@ -303,9 +303,13 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
         // ── Specular-Glossiness workflow detection ───────────────────────
         // Triggered for legacy FBX content (e.g. MEASURE_SEVEN) that ships a
         // *_Specular.dds map alongside *_BaseColor and has no metallic-roughness
-        // texture and no PBR metallic factor. In that case the Specular map
-        // carries F0 (rgb) and glossiness (alpha), and we must NOT apply the
-        // MR `lerp(0.04, albedo, metallic)` rewrite.
+        // texture and no PBR metallic factor. The Specular map carries F0
+        // (rgb) and glossiness (alpha) and we must NOT apply the MR
+        // `lerp(0.04, albedo, metallic)` rewrite. Some FBXs ship a 3-channel
+        // (RGB-only) specular map whose alpha is implicitly 1; if we treated
+        // that as glossiness=1 the surface would collapse to a perfect mirror,
+        // so we CPU-decode the texture to check alpha variance and only enable
+        // per-pixel glossiness when the alpha channel actually carries data.
         if (!mat.specularGlossTexPath.empty()
             && mat.metallicRoughTexPath.empty()
             && !hasPbrMetallic)
@@ -313,7 +317,7 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
             mat.useSpecularGlossiness = true;
             mat.metallic = 0.0f;
 
-            // Specular factor: legacy FBX puts F0 in COLOR_SPECULAR (sRGB-ish).
+            // Specular factor: legacy FBX stores F0 in COLOR_SPECULAR (linear).
             // Default to white so the texture's RGB channel survives untouched.
             aiColor3D specColor(1.0f, 1.0f, 1.0f);
             aiMat->Get(AI_MATKEY_COLOR_SPECULAR, specColor);
@@ -321,9 +325,35 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
             mat.specularColor = (specLum > 1e-4f) ? toFloat3(specColor)
                                                   : make_float3(1.0f, 1.0f, 1.0f);
 
-            // Glossiness factor: prefer SHININESS_STRENGTH (0..1). Fall back
-            // to the Phong SHININESS exponent mapped via the standard
-            // gloss = log2(shininess) / 13 curve, clamped to [0,1].
+            // CPU-decode to inspect the alpha channel. If alpha is essentially
+            // constant (range < 1/255 of full scale) the file does not carry
+            // glossiness data and we treat the spec map as F0-only.
+            std::vector<unsigned char> sgPixels;
+            int sgW = 0, sgH = 0;
+            bool decoded = loadTexturePixelsRGBA8(mat.specularGlossTexPath, sgPixels, sgW, sgH);
+            float alphaMean = 1.0f;
+            bool  alphaCarriesGloss = false;
+            if (decoded && !sgPixels.empty()) {
+                int aMin = 255, aMax = 0;
+                double aSum = 0.0;
+                size_t n = (size_t)sgW * (size_t)sgH;
+                for (size_t k = 0; k < n; k++) {
+                    int a = sgPixels[k * 4 + 3];
+                    aMin = std::min(aMin, a);
+                    aMax = std::max(aMax, a);
+                    aSum += a;
+                }
+                alphaMean = (float)(aSum / (double)n) * (1.0f / 255.0f);
+                alphaCarriesGloss = (aMax - aMin) >= 4; // ~1.5% range, robust against compression noise
+                LOG_INFO("Material '%s': specular tex alpha range [%d..%d] mean=%.3f carriesGloss=%d",
+                         materialName.c_str(), aMin, aMax, alphaMean, (int)alphaCarriesGloss);
+            }
+
+            // Glossiness factor. Prefer SHININESS_STRENGTH (0..1); fall back
+            // to the Phong SHININESS exponent via gloss = log2(s)/13. If
+            // neither is set, use 0.5 — a moderate default that pairs with a
+            // glossiness map (alpha modulates around it) and gives a sensible
+            // matte-ish baseline when alpha is absent.
             float shinStrength = 0.0f;
             float shininess    = 0.0f;
             bool hasShinStrength = (aiMat->Get(AI_MATKEY_SHININESS_STRENGTH, shinStrength) == aiReturn_SUCCESS);
@@ -334,17 +364,32 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
                 float g = log2f(fmaxf(shininess, 1.0f)) / 13.0f;
                 mat.glossiness = std::max(0.0f, std::min(1.0f, g));
             } else {
-                mat.glossiness = 1.0f; // texture alpha will modulate this
+                mat.glossiness = 0.5f;
             }
-            // Roughness mirrors glossiness — kernel will overwrite per-pixel
-            // when the spec/gloss texture is bound. This keeps untextured SG
-            // materials shading correctly too.
+
+            // If the texture's alpha is effectively constant, drop the per-pixel
+            // glossiness path: clear the texture handle's "use alpha" flag by
+            // baking the constant alpha into the scalar glossiness factor and
+            // marking the kernel to ignore tex.a (we reuse the existing branch
+            // by setting glossiness directly — kernel multiplies by tex.a, so
+            // a constant tex.a ~= alphaMean folded into glossiness gives the
+            // right roughness).
+            if (!alphaCarriesGloss) {
+                mat.glossiness = std::min(mat.glossiness, alphaMean);
+                // Don't null specularGlossTexPath — we still want F0 from RGB.
+                // Instead, set a flag the kernel will read: when alpha doesn't
+                // carry gloss data, use the scalar factor only.
+                mat.specularGlossAlphaIsGlossiness = false;
+            } else {
+                mat.specularGlossAlphaIsGlossiness = true;
+            }
+
             mat.roughness = std::max(0.045f, 1.0f - mat.glossiness);
 
-            LOG_INFO("Material '%s': Specular-Glossiness workflow (specColor=(%.3f,%.3f,%.3f) glossiness=%.3f)",
+            LOG_INFO("Material '%s': Specular-Glossiness workflow (specColor=(%.3f,%.3f,%.3f) glossiness=%.3f alphaIsGloss=%d)",
                      materialName.c_str(),
                      mat.specularColor.x, mat.specularColor.y, mat.specularColor.z,
-                     mat.glossiness);
+                     mat.glossiness, (int)mat.specularGlossAlphaIsGlossiness);
         }
 
         // If the material has an emissive texture, it is explicitly meant to

@@ -152,6 +152,7 @@ void DeviceScene::upload(const Scene& scene) {
         dst.transmission     = src.transmission;
         dst.pureDiffuse      = src.pureDiffuse ? 1 : 0;
         dst.useSpecularGlossiness = src.useSpecularGlossiness ? 1 : 0;
+        dst.specularGlossAlphaIsGlossiness = src.specularGlossAlphaIsGlossiness ? 1 : 0;
         dst.specularColor    = src.specularColor;
         dst.glossiness       = src.glossiness;
         dst.albedoTex        = src.albedoTexObj;
