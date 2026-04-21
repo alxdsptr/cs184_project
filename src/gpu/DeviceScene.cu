@@ -151,10 +151,14 @@ void DeviceScene::upload(const Scene& scene) {
         dst.ior              = src.ior;
         dst.transmission     = src.transmission;
         dst.pureDiffuse      = src.pureDiffuse ? 1 : 0;
+        dst.useSpecularGlossiness = src.useSpecularGlossiness ? 1 : 0;
+        dst.specularColor    = src.specularColor;
+        dst.glossiness       = src.glossiness;
         dst.albedoTex        = src.albedoTexObj;
         dst.normalTex        = src.normalTexObj;
         dst.metallicRoughTex = src.metallicRoughTexObj;
         dst.emissiveTex      = src.emissiveTexObj;
+        dst.specularGlossTex = src.specularGlossTexObj;
     }
 
     CUDA_CHECK(cudaMalloc(&m_data.d_materials, materials.size() * sizeof(GPUMaterial)));

@@ -154,17 +154,64 @@ __device__ inline float3 bsdfEvaluate(
     return diffuse + specular;
 }
 
+// ── Specular-Glossiness BRDF ─────────────────────────────────
+// Same Cook-Torrance form as `bsdfEvaluate` but takes F0 directly (no
+// metallic→F0 substitution). The diffuse term still uses (1-F) for energy
+// conservation but is not darkened by metallic, matching glTF KHR_materials_pbrSpecularGlossiness.
+
+__device__ inline float computeSpecProbSG(
+    const float3& N, const float3& V,
+    const float3& albedo, const float3& F0)
+{
+    float NdotV = fmaxf(dot(N, V), 0.0f);
+    float t = 1.0f - fminf(fmaxf(NdotV, 0.0f), 1.0f);
+    float t5 = t*t*t*t*t;
+    float3 F = F0 + (make_float3(1,1,1) - F0) * t5;
+    float specW = 0.2126f * F.x + 0.7152f * F.y + 0.0722f * F.z;
+    float3 kd = (make_float3(1,1,1) - F);
+    float diffW = 0.2126f * (kd.x * albedo.x) + 0.7152f * (kd.y * albedo.y) + 0.0722f * (kd.z * albedo.z);
+    float p = specW / fmaxf(specW + diffW, 1e-7f);
+    return fminf(fmaxf(p, 0.1f), 0.9f);
+}
+
+__device__ inline float3 bsdfEvaluateSG(
+    const float3& N, const float3& V, const float3& L,
+    const float3& albedo, float roughness, const float3& F0)
+{
+    float NdotL = fmaxf(dot(N, L), 0.0f);
+    float NdotV = fmaxf(dot(N, V), 0.0f);
+    if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0,0,0);
+
+    float3 H = normalize(V + L);
+    float NdotH = fmaxf(dot(N, H), 0.0f);
+    float LdotH = fmaxf(dot(L, H), 0.0f);
+
+    float3 F = fresnelSchlick_local(LdotH, F0);
+    float D_val = ggxD_local(NdotH, roughness);
+    float alpha = roughness * roughness;
+    float G_val = smithG1_GGX(NdotL, alpha) * smithG1_GGX(NdotV, alpha);
+
+    float3 specular = F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
+    float3 kd = (make_float3(1, 1, 1) - F);
+    float3 diffuse = kd * albedo * (1.0f / M_PI_F);
+    return diffuse + specular;
+}
+
 // ── Material-aware wrappers ─────────────────────────────────
 // These respect GPUMaterial::pureDiffuse: when set, they bypass the
 // Cook-Torrance specular lobe entirely and behave as a pure Lambertian BRDF
 // (albedo/π, cosine-weighted sampling). Used for legacy Collada Phong
 // materials that only carry a <diffuse> term.
+// They also dispatch to the Specular-Glossiness path when
+// GPUMaterial::useSpecularGlossiness is set, taking F0 from
+// GPUMaterial::specularColor directly.
 
 __device__ inline float materialSpecProb(
     const GPUMaterial& mat,
     const float3& N, const float3& V, const float3& albedo)
 {
     if (mat.pureDiffuse) return 0.0f;
+    if (mat.useSpecularGlossiness) return computeSpecProbSG(N, V, albedo, mat.specularColor);
     return computeSpecProb(N, V, albedo, mat.metallic);
 }
 
@@ -187,6 +234,9 @@ __device__ inline float3 materialBsdfEvaluate(
         float NdotV = fmaxf(dot(N, V), 0.0f);
         if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0, 0, 0);
         return albedo * (1.0f / M_PI_F);
+    }
+    if (mat.useSpecularGlossiness) {
+        return bsdfEvaluateSG(N, V, L, albedo, mat.roughness, mat.specularColor);
     }
     return bsdfEvaluate(N, V, L, albedo, mat.roughness, mat.metallic);
 }

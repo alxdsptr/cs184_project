@@ -11,10 +11,13 @@ struct GPUMaterial {
     float  emissionStrength;
     float  ior;
     float  transmission;
-    int    pureDiffuse;   // nonzero = bypass Cook-Torrance specular lobe
-    float  _pad2;
+    int    pureDiffuse;             // nonzero = bypass Cook-Torrance specular lobe
+    int    useSpecularGlossiness;   // nonzero = use SG workflow (F0 from specularColor/Tex)
+    float3 specularColor;           // F0 multiplier (used when useSpecularGlossiness != 0)
+    float  glossiness;              // 1 - roughness multiplier
     cudaTextureObject_t albedoTex;
     cudaTextureObject_t normalTex;
     cudaTextureObject_t metallicRoughTex;
     cudaTextureObject_t emissiveTex;
+    cudaTextureObject_t specularGlossTex; // RGB=F0, A=glossiness
 };

@@ -68,7 +68,9 @@ inline D float3 evaluateCookTorrance(
     if (NdotL < 1e-6f || NdotV < 1e-6f)
         return make_float3(0, 0, 0);
 
-    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, mat.metallic);
+    float3 F0 = mat.useSpecularGlossiness
+                  ? mat.specularColor
+                  : lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, mat.metallic);
     float3 F = fresnelSchlick(LdotH, F0);
 
     float D_val = ggxD(NdotH, mat.roughness);
@@ -76,7 +78,8 @@ inline D float3 evaluateCookTorrance(
 
     float3 specular = F * (D_val * G_val) * (1.0f / (4.0f * NdotL * NdotV + 1e-7f));
 
-    float3 kd = (make_float3(1,1,1) - F) * (1.0f - mat.metallic);
+    float kdScale = mat.useSpecularGlossiness ? 1.0f : (1.0f - mat.metallic);
+    float3 kd = (make_float3(1,1,1) - F) * kdScale;
     float3 diffuse = kd * albedo * (1.0f / M_PI_F);
 
     return (diffuse + specular) * NdotL;

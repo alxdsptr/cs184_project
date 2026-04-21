@@ -18,14 +18,24 @@ struct PBRMaterial {
     // <diffuse> term.
     bool   pureDiffuse = false;
 
+    // ── Specular-Glossiness workflow (legacy FBX, e.g. MEASURE_SEVEN). ──
+    // When enabled, the kernel reads F0 from `specularColor` (× specularTex.rgb
+    // if bound) and roughness from `1 - glossiness` (× specularTex.a if bound),
+    // bypassing the metallic-roughness `lerp(0.04, albedo, metallic)` path.
+    bool   useSpecularGlossiness = false;
+    float3 specularColor = {1.0f, 1.0f, 1.0f}; // F0 multiplier (linear)
+    float  glossiness    = 0.5f;               // 1 - roughness multiplier
+
     std::string albedoTexPath;
     std::string normalTexPath;
     std::string metallicRoughTexPath;
     std::string emissiveTexPath;
+    std::string specularGlossTexPath; // RGB = F0 color, A = glossiness
 
     // Runtime CUDA texture handles (0 means no texture bound).
     cudaTextureObject_t albedoTexObj = 0;
     cudaTextureObject_t normalTexObj = 0;
     cudaTextureObject_t metallicRoughTexObj = 0;
     cudaTextureObject_t emissiveTexObj = 0;
+    cudaTextureObject_t specularGlossTexObj = 0;
 };
