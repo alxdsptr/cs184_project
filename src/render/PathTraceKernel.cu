@@ -409,6 +409,9 @@ __global__ void pathTraceKernel(
                     ushort2 zero = make_ushort2(0, 0);
                     surf2Dwrite<ushort2>(zero, gbuffer.motionVectors, x * 4, y);
                 }
+                if (gbuffer.ndcDepth) {
+                    surf2Dwrite<float>(1.0f, gbuffer.ndcDepth, x * 4, y); // far plane
+                }
                 gbufferWritten = true;
                 firstBounce = false;
             }
@@ -619,6 +622,13 @@ __global__ void pathTraceKernel(
                     packed.x = *reinterpret_cast<unsigned short*>(&hx);
                     packed.y = *reinterpret_cast<unsigned short*>(&hy);
                     surf2Dwrite<ushort2>(packed, gbuffer.motionVectors, x * 4, y);
+                }
+                if (gbuffer.ndcDepth) {
+                    // DLSS needs post-perspective clip.z/clip.w. `clipCurr` is
+                    // already the perspective-divided NDC position in [-1,1];
+                    // remap to DLSS's [0,1] convention (near=0, far=1).
+                    float ndcZ = clampf(clipCurr.z * 0.5f + 0.5f, 0.0f, 1.0f);
+                    surf2Dwrite<float>(ndcZ, gbuffer.ndcDepth, x * 4, y);
                 }
 
                 gbufferWritten = true;

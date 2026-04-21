@@ -360,6 +360,9 @@ extern "C" __global__ void __raygen__path_trace()
                         ushort2 zero = make_ushort2(0, 0);
                         surf2Dwrite<ushort2>(zero, params.gbuffer.motionVectors, x * 4, y);
                     }
+                    if (params.gbuffer.ndcDepth) {
+                        surf2Dwrite<float>(1.0f, params.gbuffer.ndcDepth, x * 4, y); // far
+                    }
                     gbufferWritten = true;
                     firstBounce = false;
                 }
@@ -527,6 +530,12 @@ extern "C" __global__ void __raygen__path_trace()
                         packed.x = *reinterpret_cast<unsigned short*>(&hx);
                         packed.y = *reinterpret_cast<unsigned short*>(&hy);
                         surf2Dwrite<ushort2>(packed, params.gbuffer.motionVectors, x * 4, y);  // RG16F
+                    }
+                    if (params.gbuffer.ndcDepth) {
+                        // DLSS needs NDC depth in [0,1], not linear viewZ.
+                        // `clipCurr` has already been perspective-divided.
+                        float ndcZ = clampf(clipCurr.z * 0.5f + 0.5f, 0.0f, 1.0f);
+                        surf2Dwrite<float>(ndcZ, params.gbuffer.ndcDepth, x * 4, y);
                     }
 
                     gbufferWritten = true;
@@ -995,6 +1004,7 @@ extern "C" __global__ void __raygen__path_trace_split()
     float  outPrimaryRoughness = 1.0f;
     float  outPrimaryViewZ     = 0.0f;
     float2 outPrimaryMvPx      = make_float2(0.0f, 0.0f);
+    float  outPrimaryNdcZ      = 1.0f;
 
     for (uint32_t s = 0; s < samplesPerPixel; s++) {
         uint32_t rng = pcg32_seed(pixelIdx * 0x9E3779B9u + s,
@@ -1021,6 +1031,7 @@ extern "C" __global__ void __raygen__path_trace_split()
         float  primaryRoughness = 1.0f;
         float  primaryViewZ     = 0.0f;
         float2 primaryMvPx      = make_float2(0.0f, 0.0f);
+        float  primaryNdcZ      = 1.0f;
         int    pickedBucket     = 0;       // 0 = diff, 1 = spec
         float  bucketHitDist    = 0.0f;
         bool   bucketHitDistSet = false;
@@ -1192,6 +1203,10 @@ extern "C" __global__ void __raygen__path_trace_split()
                 primaryMvPx      = nrd_helpers::computeMotionVectorPx(
                     hit.position, camera.viewProjMatrix, camera.prevViewProjMatrix,
                     params.width, params.height);
+                {
+                    float3 ndc = mat4_transformPoint(camera.viewProjMatrix, hit.position);
+                    primaryNdcZ = clampf(ndc.z * 0.5f + 0.5f, 0.0f, 1.0f);
+                }
 
                 float3 V = -ray.direction;
                 float specProb = materialSpecProb(mat, N, V, albedo);
@@ -1454,6 +1469,7 @@ extern "C" __global__ void __raygen__path_trace_split()
             outPrimaryRoughness = primaryRoughness;
             outPrimaryViewZ     = primaryViewZ;
             outPrimaryMvPx      = primaryMvPx;
+            outPrimaryNdcZ      = primaryNdcZ;
             gbufferWritten = true;
         }
     } // end spp loop
@@ -1490,6 +1506,8 @@ extern "C" __global__ void __raygen__path_trace_split()
     }
     if (params.splitViewZ)
         surf2Dwrite<float>(outPrimaryViewZ, params.splitViewZ, x * 4, y);
+    if (params.splitNdcDepth)
+        surf2Dwrite<float>(outPrimaryNdcZ, params.splitNdcDepth, x * 4, y);
     if (params.splitMotionVectors) {
         ushort2 packed = packHalf2_split(outPrimaryMvPx.x, outPrimaryMvPx.y);
         surf2Dwrite<ushort2>(packed, params.splitMotionVectors, x * 4, y);

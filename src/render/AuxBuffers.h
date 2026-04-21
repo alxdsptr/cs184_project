@@ -17,6 +17,7 @@ struct PrimaryHitSurfaces {
     cudaSurfaceObject_t motionVectors = 0;  // RG16F, pixel-space delta
     cudaSurfaceObject_t viewZ         = 0;  // R32F,  linear meters
     cudaSurfaceObject_t hdrColor      = 0;  // RGBA16F, accumulated HDR (replaces d_outputBuffer when set)
+    cudaSurfaceObject_t ndcDepth      = 0;  // R32F,  clip.z / clip.w (DLSS depth input)
 };
 
 class AuxBuffers {

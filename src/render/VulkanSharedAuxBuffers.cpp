@@ -48,7 +48,9 @@ bool VulkanSharedAuxBuffers::create(VkDevice device, VkPhysicalDevice phys,
      && m_emissive.create(device, phys, width, height,
                           VK_FORMAT_R16G16B16A16_SFLOAT, kDefaultUsage, chanRGBA16F())
      && m_hdrColor.create(device, phys, width, height,
-                          VK_FORMAT_R16G16B16A16_SFLOAT, kDefaultUsage, chanRGBA16F());
+                          VK_FORMAT_R16G16B16A16_SFLOAT, kDefaultUsage, chanRGBA16F())
+     && m_ndcDepth.create(device, phys, width, height,
+                          VK_FORMAT_R32_SFLOAT, kDefaultUsage, chanR32F());
 
     if (!ok) {
         destroy();
@@ -66,6 +68,7 @@ void VulkanSharedAuxBuffers::destroy() {
     m_albedo.destroy();
     m_emissive.destroy();
     m_hdrColor.destroy();
+    m_ndcDepth.destroy();
     m_width = m_height = 0;
 }
 
@@ -87,5 +90,6 @@ SharedAuxSurfaces VulkanSharedAuxBuffers::surfaces() const {
     s.albedo                  = m_albedo.surface();
     s.emissive                = m_emissive.surface();
     s.hdrColor                = m_hdrColor.surface();
+    s.ndcDepth                = m_ndcDepth.surface();
     return s;
 }
