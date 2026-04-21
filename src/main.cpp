@@ -18,6 +18,7 @@ int main(int argc, char** argv) {
     int initialMode = -1;  // -1=default, 0=Native, 1=NRDOnly, 2=NRDDLSS, 3=DLSSOnly
     int backendKind = 0;   // 0=CUDA, 1=OptiX
     SGWorkflowMode sgMode = SGWorkflowMode::Off;
+    float emissiveTargetLum = 20.0f;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -55,6 +56,13 @@ int main(int argc, char** argv) {
             else if (s == "fbx-c4d")  sgMode = SGWorkflowMode::FbxC4D;
             else if (s == "fbx-ue")   sgMode = SGWorkflowMode::FbxUE;
             else LOG_WARN("Invalid --sg value: %s (use off|heuristic|fbx-c4d|fbx-ue)", s.c_str());
+        } else if (arg == "--emissive-target" && i + 1 < argc) {
+            float v = (float)std::atof(argv[++i]);
+            if (v > 0.0f) {
+                emissiveTargetLum = v;
+            } else {
+                LOG_WARN("Invalid --emissive-target value: %s", argv[i]);
+            }
         } else if ((arg == "--spp" || arg == "-p") && i + 1 < argc) {
             int value = std::atoi(argv[++i]);
             if (value > 0) {
@@ -95,6 +103,7 @@ int main(int argc, char** argv) {
     app.setInitialMode(initialMode);
     app.setBackendKind(backendKind);
     app.setSGWorkflowMode(sgMode);
+    app.setEmissiveTargetLum(emissiveTargetLum);
     if (!outputPath.empty()) {
         app.setHeadlessOutput(outputPath, samples);
     }

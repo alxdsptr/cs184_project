@@ -25,5 +25,6 @@ class SceneLoader {
 public:
     static bool load(const std::string& path,
                      Scene& scene,
-                     SGWorkflowMode sgMode = SGWorkflowMode::Off);
+                     SGWorkflowMode sgMode = SGWorkflowMode::Off,
+                     float texturedEmissiveTargetLum = 20.0f);
 };

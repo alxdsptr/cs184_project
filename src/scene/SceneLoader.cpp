@@ -73,7 +73,8 @@ static void processNode(
         processNode(aiScn, node->mChildren[i], scene, baseDir, forcedMaterialIndex);
 }
 
-bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgMode) {
+bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgMode,
+                       float texturedEmissiveTargetLum) {
     std::string ext = lowerString(std::filesystem::path(path).extension().string());
     if (ext == ".pbrt") {
         return loadPbrtScene(path, scene);
@@ -191,9 +192,10 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
     // depending on texture content. Strength = target / avgLum, clamped to a
     // sensible range so black-background logos don't explode and white lamp
     // plates don't drop to 0.
-    const float kTargetTexturedEmissiveLum = 30.0f;
+    const float kTargetTexturedEmissiveLum = std::max(1e-3f, texturedEmissiveTargetLum);
     const float kMinEmissionStrength       = 1.0f;
     const float kMaxEmissionStrength       = 1000.0f;
+    LOG_INFO("Adaptive textured-emissive target luminance: %.2f", kTargetTexturedEmissiveLum);
 
     // Materials
     for (unsigned i = 0; i < aiScn->mNumMaterials; i++) {
@@ -595,6 +597,17 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         light.constantAttenuation = aiL->mAttenuationConstant;
         light.linearAttenuation = aiL->mAttenuationLinear;
         light.quadraticAttenuation = aiL->mAttenuationQuadratic;
+        // Bistro's FBX encodes point-light falloff as 1/(2*d^2) (quadratic=2),
+        // which halves every contribution relative to the physically-expected
+        // 1/d^2. Normalise to the standard inverse-square law when the file's
+        // only non-zero coefficient is quadratic and it is >1.
+        if (light.constantAttenuation <= 0.0f
+            && light.linearAttenuation <= 0.0f
+            && light.quadraticAttenuation > 1.0f) {
+            LOG_INFO("Light '%s': normalising quadratic attenuation %.3f -> 1.0",
+                     aiL->mName.C_Str(), light.quadraticAttenuation);
+            light.quadraticAttenuation = 1.0f;
+        }
 
         scene.getLights().push_back(light);
     }

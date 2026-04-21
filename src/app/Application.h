@@ -29,6 +29,10 @@ public:
     // Specular-Glossiness workflow mode for legacy FBX assets. Applied at
     // loadScene().
     void setSGWorkflowMode(SGWorkflowMode mode) { m_sgMode = mode; }
+    // Target average linear luminance for textured emitters after adaptive
+    // emissionStrength normalisation. Passed through to SceneLoader at
+    // loadScene().
+    void setEmissiveTargetLum(float v) { m_emissiveTargetLum = v; }
     void setHeadlessOutput(const std::string& outputPath, uint32_t sampleCount);
     void setEnvMap(const std::string& path);
 
@@ -53,6 +57,7 @@ private:
     std::unique_ptr<RayTracingBackend> m_backend;
     int m_backendKind = 0;  // 0 = CUDA, 1 = OptiX
     SGWorkflowMode m_sgMode = SGWorkflowMode::Off;
+    float m_emissiveTargetLum = 20.0f;
 
     bool       m_sceneLoaded = false;
     InputState m_input;

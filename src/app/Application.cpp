@@ -238,7 +238,7 @@ bool Application::loadScene(const std::string& path) {
     m_textures.freeAll();
 
     m_scene = Scene{};
-    if (!SceneLoader::load(path, m_scene, m_sgMode)) {
+    if (!SceneLoader::load(path, m_scene, m_sgMode, m_emissiveTargetLum)) {
         LOG_ERROR("Failed to load scene: %s", path.c_str());
         return false;
     }
