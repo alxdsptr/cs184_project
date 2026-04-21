@@ -947,11 +947,33 @@ extern "C" __global__ void __raygen__path_trace_split()
     uint32_t y = idx.y;
     if (x >= params.width || y >= params.height) return;
 
-    // ── DIAGNOSTIC LEVEL 3: only test viewZ surface write (R32F = simplest).
-    // If this works → surface object is valid, format alignment is OK for R32F.
-    // If this crashes → bug is in surf2Dwrite for R32F or this surface.
+    // ── DIAGNOSTIC LEVEL 4: test all surface formats one by one.
     if (params.splitViewZ) {
-        surf2Dwrite<float>(2.0f, params.splitViewZ, x * 4, y);
+        surf2Dwrite<float>(2.0f, params.splitViewZ, x * 4, y);  // R32F
+    }
+    if (params.splitAlbedo) {
+        uchar4 a4 = make_uchar4(200, 100, 50, 255);
+        surf2Dwrite<uchar4>(a4, params.splitAlbedo, x * 4, y);  // RGBA8
+    }
+    if (params.splitNormalRoughness) {
+        uchar4 nr = make_uchar4(128, 255, 128, 128);
+        surf2Dwrite<uchar4>(nr, params.splitNormalRoughness, x * 4, y);  // RGBA8
+    }
+    if (params.splitMotionVectors) {
+        ushort2 packed = packHalf2_split(0.0f, 0.0f);
+        surf2Dwrite<ushort2>(packed, params.splitMotionVectors, x * 4, y);  // RG16F
+    }
+    if (params.splitDiffuseRadianceHitDist) {
+        ushort4 p = packHalf4_split(make_float4(0.5f, 0.0f, 0.0f, 1.0f));
+        surf2Dwrite<ushort4>(p, params.splitDiffuseRadianceHitDist, x * 8, y);  // RGBA16F
+    }
+    if (params.splitSpecularRadianceHitDist) {
+        ushort4 p = packHalf4_split(make_float4(0.0f, 0.5f, 0.0f, 1.0f));
+        surf2Dwrite<ushort4>(p, params.splitSpecularRadianceHitDist, x * 8, y);  // RGBA16F
+    }
+    if (params.splitEmissive) {
+        ushort4 p = packHalf4_split(make_float4(0.0f, 0.0f, 0.0f, 1.0f));
+        surf2Dwrite<ushort4>(p, params.splitEmissive, x * 8, y);  // RGBA16F
     }
     return;
     // ── Real body below (currently unreachable due to early return above).
