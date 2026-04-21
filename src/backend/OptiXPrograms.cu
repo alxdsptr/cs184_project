@@ -364,6 +364,7 @@ extern "C" __global__ void __raygen__path_trace()
                 mat.specularGlossTex = 0;
                 mat.useSpecularGlossiness = 0;
                 mat.specularGlossAlphaIsGlossiness = 0;
+                mat.useFBXCustomPacking = 0;
                 mat.specularColor = make_float3(1.0f, 1.0f, 1.0f);
                 mat.glossiness = 0.5f;
                 mat.pureDiffuse = 0;
@@ -389,22 +390,31 @@ extern "C" __global__ void __raygen__path_trace()
             }
             // SG "soft" interpretation (see PathTraceKernel.cu for rationale).
             if (mat.useSpecularGlossiness) {
-                float3 specRGB = mat.specularColor;
-                float  alphaG  = 1.0f;
-                if (mat.specularGlossTex != 0) {
+                if (mat.useFBXCustomPacking && mat.specularGlossTex != 0) {
                     float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
-                    specRGB = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
-                    alphaG  = sg.w;
+                    float B = clampf(sg.z, 0.0f, 1.0f);
+                    float G = clampf(sg.y, 0.0f, 1.0f);
+                    albedo = mat.specularColor;
+                    mat.metallic = B;
+                    mat.roughness = G;
+                } else {
+                    float3 specRGB = mat.specularColor;
+                    float  alphaG  = 1.0f;
+                    if (mat.specularGlossTex != 0) {
+                        float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
+                        specRGB = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
+                        alphaG  = sg.w;
+                    }
+                    float specLum = 0.2126f * specRGB.x + 0.7152f * specRGB.y + 0.0722f * specRGB.z;
+                    specLum = clampf(specLum, 0.0f, 1.0f);
+                    float specStrength = sqrtf(specLum);
+                    float F0_target = 0.04f + 0.56f * specStrength;
+                    mat.metallic = clampf((F0_target - 0.04f) / 0.96f, 0.0f, 1.0f);
+                    float gloss = mat.specularGlossAlphaIsGlossiness
+                                    ? (mat.glossiness * alphaG)
+                                    :  specStrength;
+                    mat.roughness = 1.0f - clampf(gloss, 0.0f, 0.95f);
                 }
-                float specLum = 0.2126f * specRGB.x + 0.7152f * specRGB.y + 0.0722f * specRGB.z;
-                specLum = clampf(specLum, 0.0f, 1.0f);
-                float specStrength = sqrtf(specLum);
-                float F0_target = 0.04f + 0.56f * specStrength;
-                mat.metallic = clampf((F0_target - 0.04f) / 0.96f, 0.0f, 1.0f);
-                float gloss = mat.specularGlossAlphaIsGlossiness
-                                ? (mat.glossiness * alphaG)
-                                :  specStrength;
-                mat.roughness = 1.0f - clampf(gloss, 0.0f, 0.95f);
             }
             mat.roughness = fmaxf(mat.roughness, 0.045f);
             mat.metallic = clampf(mat.metallic, 0.0f, 1.0f);

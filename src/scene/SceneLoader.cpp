@@ -301,20 +301,23 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
         mat.specularGlossTexPath = getTexturePath(aiMat, aiTextureType_SPECULAR, baseDir);
 
         // ── Specular-Glossiness workflow detection ───────────────────────
-        // Currently disabled: the *_Specular.dds maps in the FBX assets we
-        // target (Bistro, MEASURE_SEVEN) are artist-authored tint masks rather
-        // than physical F0 data — any literal or remapped interpretation we
-        // tried rendered the scenes incorrectly (tinted mirrors, yellow-green
-        // cast, or lost reflections on surfaces that should have them). Until
-        // we have a better signal to interpret these maps, we fall back to
-        // default MR (metallic=0, roughness from the material's scalar) so
-        // surfaces render as plain diffuse-with-baseline-dielectric.
-        if (false
-            && !mat.specularGlossTexPath.empty()
+        // The *_Specular.dds maps in the FBX assets we target (MEASURE_SEVEN)
+        // are C4D-exported with a non-standard packing:
+        //   R = 255 (unused, just a sRGB weight constant)
+        //   G = per-pixel roughness (varies, low values)
+        //   B = per-material specular strength (constant per material, varies
+        //       between materials: 0 / 49 / 148 / 165 / 255)
+        //   A = 255 (unused, no glossiness data)
+        // The kernel's SG path will detect useFBXCustomPacking and reinterpret
+        // the texture accordingly: F0 = lerp(0.04, specularColor, B/255),
+        // roughness = G/255. This gives differentiated reflections per-material
+        // (B drives strength) and within-material detail (G drives roughness).
+        if (!mat.specularGlossTexPath.empty()
             && mat.metallicRoughTexPath.empty()
             && !hasPbrMetallic)
         {
             mat.useSpecularGlossiness = true;
+            mat.useFBXCustomPacking = (ext == ".fbx");
             mat.metallic = 0.0f;
 
             // Specular factor: legacy FBX stores F0 in COLOR_SPECULAR (linear).
@@ -386,10 +389,11 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
 
             mat.roughness = std::max(0.045f, 1.0f - mat.glossiness);
 
-            LOG_INFO("Material '%s': Specular-Glossiness workflow (specColor=(%.3f,%.3f,%.3f) glossiness=%.3f alphaIsGloss=%d)",
+            LOG_INFO("Material '%s': Specular-Glossiness workflow (specColor=(%.3f,%.3f,%.3f) glossiness=%.3f alphaIsGloss=%d fbxCustom=%d)",
                      materialName.c_str(),
                      mat.specularColor.x, mat.specularColor.y, mat.specularColor.z,
-                     mat.glossiness, (int)mat.specularGlossAlphaIsGlossiness);
+                     mat.glossiness, (int)mat.specularGlossAlphaIsGlossiness,
+                     (int)mat.useFBXCustomPacking);
         }
 
         // If the material has an emissive texture, it is explicitly meant to
