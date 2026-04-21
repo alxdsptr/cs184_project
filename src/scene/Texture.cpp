@@ -230,6 +230,89 @@ cudaTextureObject_t TextureManager::loadHDRTexture(const std::string& path, int&
     return texObj;
 }
 
+bool TextureManager::projectEnvToSH(const std::string& path, float shCoeffsRGB[9][3]) {
+    for (int i = 0; i < 9; i++) {
+        shCoeffsRGB[i][0] = 0.0f;
+        shCoeffsRGB[i][1] = 0.0f;
+        shCoeffsRGB[i][2] = 0.0f;
+    }
+    if (path.empty()) return false;
+
+    stbi_set_flip_vertically_on_load(0);
+    int w = 0, h = 0, c = 0;
+    float* pixels = stbi_loadf(path.c_str(), &w, &h, &c, 4);
+    if (!pixels) {
+        LOG_WARN("SH projection: failed to open HDR %s", path.c_str());
+        return false;
+    }
+
+    // Real SH basis in the same order as gpu/SHEnv.cuh::sh_basis9.
+    auto shBasis = [](float x, float y, float z, float out[9]) {
+        out[0] = 0.282094792f;
+        out[1] = 0.488602512f * y;
+        out[2] = 0.488602512f * z;
+        out[3] = 0.488602512f * x;
+        out[4] = 1.092548431f * x * y;
+        out[5] = 1.092548431f * y * z;
+        out[6] = 0.315391565f * (3.0f * z * z - 1.0f);
+        out[7] = 1.092548431f * x * z;
+        out[8] = 0.546274215f * (x * x - y * y);
+    };
+
+    const float twoPi = 2.0f * 3.14159265358979323846f;
+    const float piF   = 3.14159265358979323846f;
+
+    // Riemann integration over the equirectangular grid. The sin(theta)
+    // weight is the correct area element; each row contributes differentially,
+    // so we must include it to avoid pole overweighting.
+    double acc[9][3] = {{0}};
+    for (int py = 0; py < h; py++) {
+        float v = ((float)py + 0.5f) / (float)h;
+        float theta = v * piF;
+        float sinT = sinf(theta);
+        float cosT = cosf(theta);
+        for (int px = 0; px < w; px++) {
+            float u = ((float)px + 0.5f) / (float)w;
+            float phi = u * twoPi - piF;
+            float x = sinT * cosf(phi);
+            float y = cosT;
+            float z = sinT * sinf(phi);
+
+            const float* texel = &pixels[(py * w + px) * 4];
+            float r = texel[0], g = texel[1], b = texel[2];
+
+            // Clamp extreme HDR values (sun discs) to keep SH projection
+            // stable — a single 10000-nit pixel otherwise dominates the fit.
+            const float clamp = 100.0f;
+            float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            if (lum > clamp) {
+                float s = clamp / lum;
+                r *= s; g *= s; b *= s;
+            }
+
+            float basis[9];
+            shBasis(x, y, z, basis);
+
+            // dΩ = sin(theta) * (2π/w) * (π/h)
+            float dOmega = sinT * (twoPi / (float)w) * (piF / (float)h);
+            for (int i = 0; i < 9; i++) {
+                acc[i][0] += (double)(r * basis[i] * dOmega);
+                acc[i][1] += (double)(g * basis[i] * dOmega);
+                acc[i][2] += (double)(b * basis[i] * dOmega);
+            }
+        }
+    }
+    stbi_image_free(pixels);
+
+    for (int i = 0; i < 9; i++) {
+        shCoeffsRGB[i][0] = (float)acc[i][0];
+        shCoeffsRGB[i][1] = (float)acc[i][1];
+        shCoeffsRGB[i][2] = (float)acc[i][2];
+    }
+    LOG_INFO("Projected env map to SH (L2, 9 coeffs): %s", path.c_str());
+    return true;
+}
+
 void TextureManager::freeAll() {
     for (auto& t : m_textures) {
         if (t.obj)   cudaDestroyTextureObject(t.obj);

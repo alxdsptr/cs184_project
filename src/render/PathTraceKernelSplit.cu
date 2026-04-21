@@ -223,7 +223,11 @@ __global__ void pathTraceKernelSplit(
 
         if (!didHit) {
             if (enableEnvironment) {
-                float3 envColor = sampleEnvironment(ray.direction, scene.envMapTex);
+                bool shForThisBounce = (bounce > 0) && !lastBounceDelta;
+                float3 envColor = sampleEnvironmentForBounce(
+                    ray.direction, scene.envMapTex,
+                    scene.d_shEnvCoeffs, scene.envUseSH != 0,
+                    !shForThisBounce);
                 float envLum = 0.2126f*envColor.x + 0.7152f*envColor.y + 0.0722f*envColor.z;
                 if (envLum > 20.0f) envColor = envColor * (20.0f / envLum);
                 pathRadiance += clampFirefly(throughput * envColor, 10.0f);

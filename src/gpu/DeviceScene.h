@@ -28,6 +28,16 @@ struct DeviceSceneData {
 
     // HDR environment map (equirectangular, float4 texture)
     cudaTextureObject_t envMapTex   = 0;
+
+    // Precomputed L2 (3rd-order) Spherical Harmonics radiance coefficients of
+    // the environment map. Nine RGB coefficients (float3 x 9) laid out in the
+    // canonical order (l,m) = (0,0) (1,-1) (1,0) (1,1) (2,-2) (2,-1) (2,0)
+    // (2,1) (2,2). Used by `evalSHIrradiance` for cheap, noise-free diffuse
+    // environment irradiance at any surface normal. When `envUseSH` is 0 or
+    // `d_shEnvCoeffs` is null, the renderer falls back to stochastic envmap
+    // sampling.
+    float3*  d_shEnvCoeffs = nullptr;
+    int      envUseSH      = 0;
 };
 
 class Scene;

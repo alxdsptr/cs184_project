@@ -9,6 +9,7 @@
 #include "gpu/RayTypes.h"
 #include "gpu/MaterialGPU.h"
 #include "gpu/Sampling.h"
+#include "gpu/SHEnv.cuh"
 
 #ifndef M_PI_F
 #  define M_PI_F 3.14159265358979323846f
@@ -28,6 +29,25 @@ __device__ inline float3 sampleEnvironment(float3 dir, cudaTextureObject_t envMa
     float3 skyTop = make_float3(0.5f, 0.7f, 1.0f);
     float3 skyBot = make_float3(1.0f, 1.0f, 1.0f);
     return lerp(skyBot, skyTop, t) * 0.8f;
+}
+
+// Environment sampling with optional SH shortcut for indirect rays. When
+// `useSH` is true and coefficients are available, the indirect miss returns
+// the SH-reconstructed radiance (smooth, noise-free) — exactly the case where
+// low-order SH is a perfect approximation of the env (only the diffuse band
+// is physically meaningful). Primary-ray miss still uses the full HDR texture
+// so the directly-visible sky remains sharp.
+__device__ inline float3 sampleEnvironmentForBounce(
+    float3 dir,
+    cudaTextureObject_t envMap,
+    const float3* shCoeffs,
+    bool useSH,
+    bool isPrimary)
+{
+    if (useSH && shCoeffs && !isPrimary) {
+        return sh_evalRadiance(dir, shCoeffs);
+    }
+    return sampleEnvironment(dir, envMap);
 }
 
 // ── Ray generation ───────────────────────────────────────────

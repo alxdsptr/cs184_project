@@ -18,6 +18,7 @@
 #include "gpu/Sampling.h"
 #include "gpu/BRDF.h"
 #include "gpu/RayTypes.h"
+#include "gpu/SHEnv.cuh"
 
 #ifndef M_PI_F
 #define M_PI_F 3.14159265358979323846f
@@ -105,6 +106,16 @@ static __forceinline__ __device__ float3 sampleEnvironment(float3 dir, cudaTextu
     float3 skyTop = make_float3(0.5f, 0.7f, 1.0f);
     float3 skyBot = make_float3(1.0f, 1.0f, 1.0f);
     return lerp(skyBot, skyTop, t) * 0.8f;
+}
+
+static __forceinline__ __device__ float3 sampleEnvironmentForBounce(
+    float3 dir, cudaTextureObject_t envMap,
+    const float3* shCoeffs, bool useSH, bool isPrimary)
+{
+    if (useSH && shCoeffs && !isPrimary) {
+        return sh_evalRadiance(dir, shCoeffs);
+    }
+    return sampleEnvironment(dir, envMap);
 }
 
 // ── BSDF helpers (ported from PathTraceKernel.cu) ─────────────
@@ -315,7 +326,11 @@ extern "C" __global__ void __raygen__path_trace()
 
             if (!didHit) {
                 if (enableEnvironment) {
-                    float3 envColor = sampleEnvironment(ray.direction, scene.envMapTex);
+                    bool shForThisBounce = (bounce > 0) && !lastBounceDelta;
+                    float3 envColor = sampleEnvironmentForBounce(
+                        ray.direction, scene.envMapTex,
+                        scene.d_shEnvCoeffs, scene.envUseSH != 0,
+                        !shForThisBounce);
                     float envLum = 0.2126f * envColor.x + 0.7152f * envColor.y + 0.0722f * envColor.z;
                     float envClamp = 100.0f;
                     if (envLum > envClamp) envColor = envColor * (envClamp / envLum);

@@ -76,6 +76,14 @@ private:
     cudaTextureObject_t m_envMapTex = 0;
     char m_envMapPathBuf[512] = {};
     void loadEnvMap(const std::string& path);
+
+    // Precomputed L2 SH radiance of the env map (9 RGB coeffs). Uploaded to
+    // `m_d_shEnvCoeffs` on the device; null until an env map is loaded.
+    // `m_useSHEnvIrradiance` toggles SH-shortcut sampling at runtime.
+    void freeShEnvDevice();
+    float3* m_d_shEnvCoeffs = nullptr;
+    bool m_useSHEnvIrradiance = true;
+    bool m_prevSHKeyDown = false;
     bool m_prevF12Down = false;
     bool m_prevSpeedDownKey = false;
     bool m_prevSpeedUpKey = false;
