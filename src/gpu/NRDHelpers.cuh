@@ -39,7 +39,9 @@ __device__ __forceinline__ float4 packNormalRoughness(float3 normal, float rough
 }
 
 // NRD "YCoCg" radiance packing is optional; RELAX accepts straight RGB in
-// the RGB channels with hitT in alpha. Simpler — we go with that.
+// the RGB channels with hitT in alpha. RELAX takes RAW hitT in meters
+// (RELAX_FrontEnd_PackRadianceAndHitDist) — only REBLUR requires the hitT
+// to be pre-normalized via HitDistanceParameters. Keep this simple for RELAX.
 __device__ __forceinline__ float4 packRadianceHitDist(float3 radiance, float hitDist) {
     // NRD RELAX clamps hitT internally; we clamp to a sane range here to keep
     // FP16 output from blowing up on glancing misses.

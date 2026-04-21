@@ -39,7 +39,8 @@ public:
         float motionVectorScalePx[2],    // typically {1/renderW, 1/renderH} for pixel-space MVs
         uint32_t renderW, uint32_t renderH,
         uint32_t frameIndex,
-        bool reset);
+        bool reset,
+        float denoisingRange);           // pass camera farPlane (or scene bbox*2); pixels with viewZ > range are skipped (treated as sky)
 
     // Dispatch the denoiser onto `cmd`. Inputs come from `aux` (diffuse/spec
     // radiance + hit-dist, normal+roughness, viewZ, MVs).

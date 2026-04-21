@@ -639,7 +639,8 @@ void Renderer::recordPrePresent(VkCommandBuffer cmd) {
     const bool reset = (m_accumBuffer.getSampleCount() == 1);
     m_nrd->setCommonSettings(
         viewToClip, viewToClipPrev, worldToView, worldToViewPrev,
-        jitter, jitterPrev, mvScale, rw, rh, m_frameIndex, reset);
+        jitter, jitterPrev, mvScale, rw, rh, m_frameIndex, reset,
+        m_lastCamera.farPlane);
 
     if (s_ppFrame < 3) LOG_INFO("recordPrePresent[%u]: about to NRD denoise", s_ppFrame);
     // Dispatch the denoiser (NRD may leave its output images in GENERAL).
