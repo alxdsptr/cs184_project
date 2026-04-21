@@ -947,15 +947,7 @@ extern "C" __global__ void __raygen__path_trace_split()
     uint32_t y = idx.y;
     if (x >= params.width || y >= params.height) return;
 
-    // ── DIAGNOSTIC LEVEL 7: add normal+roughness (RGBA8) write.
-    if (params.splitDiffuseRadianceHitDist) {
-        ushort4 p = packHalf4_split(make_float4(0.5f, 0.0f, 0.0f, 1.0f));
-        surf2Dwrite<ushort4>(p, params.splitDiffuseRadianceHitDist, x * 8, y);
-    }
-    if (params.splitSpecularRadianceHitDist) {
-        ushort4 p = packHalf4_split(make_float4(0.0f, 0.5f, 0.0f, 1.0f));
-        surf2Dwrite<ushort4>(p, params.splitSpecularRadianceHitDist, x * 8, y);
-    }
+    // ── DIAGNOSTIC LEVEL 8: ONLY normalRoughness (RGBA8). Test it in isolation.
     if (params.splitNormalRoughness) {
         uchar4 nr = make_uchar4(128, 255, 128, 128);
         surf2Dwrite<uchar4>(nr, params.splitNormalRoughness, x * 4, y);
