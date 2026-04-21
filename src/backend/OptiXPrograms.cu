@@ -947,11 +947,14 @@ extern "C" __global__ void __raygen__path_trace_split()
     uint32_t y = idx.y;
     if (x >= params.width || y >= params.height) return;
 
-    // ── DIAGNOSTIC LEVEL 9: ONLY albedo (RGBA8). If this works but normal
-    // (also RGBA8) crashes, it's the specific surface, not the format.
+    // ── DIAGNOSTIC LEVEL 10: write RGBA8 as uint (pack manually).
+    // OptiX device codegen for surf2Dwrite<uchar4> appears to mis-emit a
+    // misaligned PTX instruction. Writing as uint32_t (same byte layout)
+    // works around it.
     if (params.splitAlbedo) {
-        uchar4 a4 = make_uchar4(200, 100, 50, 255);
-        surf2Dwrite<uchar4>(a4, params.splitAlbedo, x * 4, y);
+        uint32_t packed = ((uint32_t)255 << 24) | ((uint32_t)50 << 16) |
+                          ((uint32_t)100 << 8) | (uint32_t)200;
+        surf2Dwrite<uint32_t>(packed, params.splitAlbedo, x * 4, y);
     }
     return;
     // ── Real body below (currently unreachable due to early return above).
