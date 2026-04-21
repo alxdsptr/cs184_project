@@ -267,6 +267,10 @@ bool Application::loadScene(const std::string& path) {
         mat.normalTexObj        = loadCachedTexture(mat.normalTexPath,        /*sRGB=*/false);
         mat.metallicRoughTexObj = loadCachedTexture(mat.metallicRoughTexPath, /*sRGB=*/false);
         mat.emissiveTexObj      = loadCachedTexture(mat.emissiveTexPath,      /*sRGB=*/true);
+        // Specular-gloss texture: RGB is sRGB-authored F0 colour, A is linear
+        // glossiness. CUDA hw sRGB only decodes RGB and leaves A linear, so a
+        // single sRGB read serves both correctly.
+        mat.specularGlossTexObj = loadCachedTexture(mat.specularGlossTexPath, /*sRGB=*/true);
     }
 
     // Back-fill emissive texture handles on area lights so NEE can fetch

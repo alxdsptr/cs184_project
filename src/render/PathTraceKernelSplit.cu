@@ -63,6 +63,39 @@ __device__ inline float3 bsdfSpecularLobe(
     return F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
 }
 
+// SG variants: F0 comes from the material's specularColor instead of being
+// derived from albedo+metallic. Diffuse lobe drops the (1-metallic) darkening.
+__device__ inline float3 bsdfDiffuseLobeSG(
+    const float3& N, const float3& V, const float3& L,
+    const float3& albedo, const float3& F0)
+{
+    float NdotL = fmaxf(dot(N, L), 0.0f);
+    float NdotV = fmaxf(dot(N, V), 0.0f);
+    if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0,0,0);
+    float3 H = normalize(V + L);
+    float LdotH = fmaxf(dot(L, H), 0.0f);
+    float3 F  = fresnelSchlick_local(LdotH, F0);
+    float3 kd = (make_float3(1,1,1) - F);
+    return kd * albedo * (1.0f / M_PI_F);
+}
+
+__device__ inline float3 bsdfSpecularLobeSG(
+    const float3& N, const float3& V, const float3& L,
+    float roughness, const float3& F0)
+{
+    float NdotL = fmaxf(dot(N, L), 0.0f);
+    float NdotV = fmaxf(dot(N, V), 0.0f);
+    if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0,0,0);
+    float3 H = normalize(V + L);
+    float NdotH = fmaxf(dot(N, H), 0.0f);
+    float LdotH = fmaxf(dot(L, H), 0.0f);
+    float3 F  = fresnelSchlick_local(LdotH, F0);
+    float D_val = ggxD_local(NdotH, roughness);
+    float alpha = roughness * roughness;
+    float G_val = smithG1_GGX(NdotL, alpha) * smithG1_GGX(NdotV, alpha);
+    return F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
+}
+
 // Material-aware lobe wrappers — pureDiffuse materials have no specular lobe,
 // and the diffuse lobe is pure albedo/π (no F0 dielectric scaling).
 __device__ inline float3 materialDiffuseLobe(
@@ -75,6 +108,9 @@ __device__ inline float3 materialDiffuseLobe(
         if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0, 0, 0);
         return albedo * (1.0f / M_PI_F);
     }
+    if (mat.useSpecularGlossiness) {
+        return bsdfDiffuseLobeSG(N, V, L, albedo, mat.specularColor);
+    }
     return bsdfDiffuseLobe(N, V, L, albedo, mat.roughness, mat.metallic);
 }
 
@@ -83,6 +119,9 @@ __device__ inline float3 materialSpecularLobe(
     const float3& N, const float3& V, const float3& L, const float3& albedo)
 {
     if (mat.pureDiffuse) return make_float3(0, 0, 0);
+    if (mat.useSpecularGlossiness) {
+        return bsdfSpecularLobeSG(N, V, L, mat.roughness, mat.specularColor);
+    }
     return bsdfSpecularLobe(N, V, L, albedo, mat.roughness, mat.metallic);
 }
 
@@ -201,6 +240,10 @@ __global__ void pathTraceKernelSplit(
             mat.albedo = make_float3(0.8f, 0.2f, 0.8f);
             mat.roughness = 0.5f; mat.metallic = 0.0f;
             mat.emission = make_float3(0,0,0); mat.emissionStrength = 0.0f;
+            mat.useSpecularGlossiness = 0;
+            mat.specularColor = make_float3(1.0f, 1.0f, 1.0f);
+            mat.glossiness = 0.5f;
+            mat.specularGlossTex = 0;
         }
 
         uint32_t triIdx = (uint32_t)hit.primitiveIndex;
@@ -224,6 +267,13 @@ __global__ void pathTraceKernelSplit(
             float4 mr = tex2D<float4>(mat.metallicRoughTex, texUV.x, texUV.y);
             mat.roughness = mat.roughness * mr.y;
             mat.metallic = mat.metallic * mr.z;
+        }
+        if (mat.useSpecularGlossiness && mat.specularGlossTex != 0) {
+            float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
+            mat.specularColor = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
+            mat.roughness = 1.0f - mat.glossiness * sg.w;
+        } else if (mat.useSpecularGlossiness) {
+            mat.roughness = 1.0f - mat.glossiness;
         }
         mat.roughness = fmaxf(mat.roughness, 0.045f);
         mat.metallic = clampf(mat.metallic, 0.0f, 1.0f);

@@ -358,6 +358,11 @@ extern "C" __global__ void __raygen__path_trace()
                 mat.metallicRoughTex = 0;
                 mat.emissiveTex = 0;
                 mat.normalTex = 0;
+                mat.specularGlossTex = 0;
+                mat.useSpecularGlossiness = 0;
+                mat.specularColor = make_float3(1.0f, 1.0f, 1.0f);
+                mat.glossiness = 0.5f;
+                mat.pureDiffuse = 0;
             }
 
             float2 texUV = make_float2(0.0f, 0.0f);
@@ -377,6 +382,13 @@ extern "C" __global__ void __raygen__path_trace()
                 float4 mrTexel = tex2D<float4>(mat.metallicRoughTex, texUV.x, texUV.y);
                 mat.roughness = mat.roughness * mrTexel.y;
                 mat.metallic = mat.metallic * mrTexel.z;
+            }
+            if (mat.useSpecularGlossiness && mat.specularGlossTex != 0) {
+                float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
+                mat.specularColor = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
+                mat.roughness = 1.0f - mat.glossiness * sg.w;
+            } else if (mat.useSpecularGlossiness) {
+                mat.roughness = 1.0f - mat.glossiness;
             }
             mat.roughness = fmaxf(mat.roughness, 0.045f);
             mat.metallic = clampf(mat.metallic, 0.0f, 1.0f);

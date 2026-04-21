@@ -298,6 +298,54 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
         mat.normalTexPath        = getTexturePath(aiMat, aiTextureType_NORMALS, baseDir);
         mat.metallicRoughTexPath = getTexturePath(aiMat, aiTextureType_METALNESS, baseDir);
         mat.emissiveTexPath      = getTexturePath(aiMat, aiTextureType_EMISSIVE, baseDir);
+        mat.specularGlossTexPath = getTexturePath(aiMat, aiTextureType_SPECULAR, baseDir);
+
+        // ── Specular-Glossiness workflow detection ───────────────────────
+        // Triggered for legacy FBX content (e.g. MEASURE_SEVEN) that ships a
+        // *_Specular.dds map alongside *_BaseColor and has no metallic-roughness
+        // texture and no PBR metallic factor. In that case the Specular map
+        // carries F0 (rgb) and glossiness (alpha), and we must NOT apply the
+        // MR `lerp(0.04, albedo, metallic)` rewrite.
+        if (!mat.specularGlossTexPath.empty()
+            && mat.metallicRoughTexPath.empty()
+            && !hasPbrMetallic)
+        {
+            mat.useSpecularGlossiness = true;
+            mat.metallic = 0.0f;
+
+            // Specular factor: legacy FBX puts F0 in COLOR_SPECULAR (sRGB-ish).
+            // Default to white so the texture's RGB channel survives untouched.
+            aiColor3D specColor(1.0f, 1.0f, 1.0f);
+            aiMat->Get(AI_MATKEY_COLOR_SPECULAR, specColor);
+            float specLum = luminance(toFloat3(specColor));
+            mat.specularColor = (specLum > 1e-4f) ? toFloat3(specColor)
+                                                  : make_float3(1.0f, 1.0f, 1.0f);
+
+            // Glossiness factor: prefer SHININESS_STRENGTH (0..1). Fall back
+            // to the Phong SHININESS exponent mapped via the standard
+            // gloss = log2(shininess) / 13 curve, clamped to [0,1].
+            float shinStrength = 0.0f;
+            float shininess    = 0.0f;
+            bool hasShinStrength = (aiMat->Get(AI_MATKEY_SHININESS_STRENGTH, shinStrength) == aiReturn_SUCCESS);
+            aiMat->Get(AI_MATKEY_SHININESS, shininess);
+            if (hasShinStrength && shinStrength > 0.0f) {
+                mat.glossiness = std::min(1.0f, shinStrength);
+            } else if (shininess > 0.0f) {
+                float g = log2f(fmaxf(shininess, 1.0f)) / 13.0f;
+                mat.glossiness = std::max(0.0f, std::min(1.0f, g));
+            } else {
+                mat.glossiness = 1.0f; // texture alpha will modulate this
+            }
+            // Roughness mirrors glossiness — kernel will overwrite per-pixel
+            // when the spec/gloss texture is bound. This keeps untextured SG
+            // materials shading correctly too.
+            mat.roughness = std::max(0.045f, 1.0f - mat.glossiness);
+
+            LOG_INFO("Material '%s': Specular-Glossiness workflow (specColor=(%.3f,%.3f,%.3f) glossiness=%.3f)",
+                     materialName.c_str(),
+                     mat.specularColor.x, mat.specularColor.y, mat.specularColor.z,
+                     mat.glossiness);
+        }
 
         // If the material has an emissive texture, it is explicitly meant to
         // emit light. Enable emission even when the scalar emissive color from
