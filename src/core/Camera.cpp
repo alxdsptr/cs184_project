@@ -65,14 +65,19 @@ void Camera::update(float dt, const InputState& input) {
     m_moved = false;
     float speed = m_moveSpeed * dt;
 
-    // WASD movement
+    // WASD movement — use locked basis if the user has frozen the movement
+    // frame, otherwise follow the current camera orientation.
+    const float3 fwd   = m_frameLocked ? m_lockedForward : m_forward;
+    const float3 right = m_frameLocked ? m_lockedRight   : m_right;
+    const float3 upAxis = m_frameLocked ? m_lockedUp     : make_float3(0, 1, 0);
+
     float3 moveDir = make_float3(0, 0, 0);
-    if (input.forward)  moveDir += m_forward;
-    if (input.backward) moveDir += m_forward * (-1.0f);
-    if (input.left)     moveDir += m_right * (-1.0f);
-    if (input.right)    moveDir += m_right;
-    if (input.up)       moveDir += make_float3(0, 1, 0);
-    if (input.down)     moveDir += make_float3(0, -1, 0);
+    if (input.forward)  moveDir += fwd;
+    if (input.backward) moveDir += fwd * (-1.0f);
+    if (input.left)     moveDir += right * (-1.0f);
+    if (input.right)    moveDir += right;
+    if (input.up)       moveDir += upAxis;
+    if (input.down)     moveDir += upAxis * (-1.0f);
 
     float len = length(moveDir);
     if (len > 0.001f) {
@@ -91,6 +96,13 @@ void Camera::update(float dt, const InputState& input) {
     if (m_moved) {
         rebuildMatrices();
     }
+}
+
+void Camera::lockMovementFrame() {
+    m_lockedForward = m_forward;
+    m_lockedRight   = m_right;
+    m_lockedUp      = m_up;
+    m_frameLocked   = true;
 }
 
 void Camera::rebuildMatrices() {

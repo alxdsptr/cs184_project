@@ -89,6 +89,8 @@ private:
     bool m_showGui = true;
     bool m_prevSpeedDownKey = false;
     bool m_prevSpeedUpKey = false;
+    bool m_prevF2Down = false;
+    bool m_prevF3Down = false;
     uint32_t m_maxBounces = 8;
     uint32_t m_samplesPerFrame = 1;
     int m_initialMode = -1;  // -1 = leave as default (Native)
