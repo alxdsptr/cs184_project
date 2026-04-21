@@ -947,11 +947,14 @@ extern "C" __global__ void __raygen__path_trace_split()
     uint32_t y = idx.y;
     if (x >= params.width || y >= params.height) return;
 
-    // ── DIAGNOSTIC LEVEL 5: try ONLY one RGBA16F write (the diff surface).
-    // Last test (just R32F viewZ) worked. This adds the first RGBA16F.
+    // ── DIAGNOSTIC LEVEL 6: add 2 RGBA16F writes (diff + spec).
     if (params.splitDiffuseRadianceHitDist) {
         ushort4 p = packHalf4_split(make_float4(0.5f, 0.0f, 0.0f, 1.0f));
-        surf2Dwrite<ushort4>(p, params.splitDiffuseRadianceHitDist, x * 8, y);  // RGBA16F = 8B
+        surf2Dwrite<ushort4>(p, params.splitDiffuseRadianceHitDist, x * 8, y);
+    }
+    if (params.splitSpecularRadianceHitDist) {
+        ushort4 p = packHalf4_split(make_float4(0.0f, 0.5f, 0.0f, 1.0f));
+        surf2Dwrite<ushort4>(p, params.splitSpecularRadianceHitDist, x * 8, y);
     }
     return;
     // ── Real body below (currently unreachable due to early return above).
