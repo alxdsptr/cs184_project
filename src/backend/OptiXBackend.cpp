@@ -194,6 +194,9 @@ bool OptiXBackend::loadModule(const std::string& optixirPath) {
     pgdRaygenSplit.raygen.entryFunctionName = "__raygen__path_trace_split";
     logSize = sizeof(logBuf);
     OPTIX_CHECK(optixProgramGroupCreate(m_ctx, &pgdRaygenSplit, 1, &pgOptions, logBuf, &logSize, &m_pgRaygenSplit));
+    LOG_INFO("OptiXBackend: split raygen program group created, ptr=%p", (void*)m_pgRaygenSplit);
+#else
+    LOG_INFO("OptiXBackend: PATHTRACER_NRD_DLSS_ENABLED NOT defined when compiling backend!");
 #endif
 
     OptixProgramGroupDesc pgdMissR{};
@@ -328,6 +331,12 @@ bool OptiXBackend::buildSBT() {
     m_sbt.hitgroupRecordBase          = hitBase;
     m_sbt.hitgroupRecordStrideInBytes = (unsigned int)recSize;
     m_sbt.hitgroupRecordCount         = 2;
+    LOG_INFO("OptiXBackend: SBT built, recSize=%zu numRaygens=%u haveSplit=%d",
+             recSize, (unsigned)numRaygens, (int)haveSplit);
+    LOG_INFO("  raygenRecord       = 0x%016llx", (unsigned long long)m_dRaygenRecord);
+    LOG_INFO("  raygenSplitRecord  = 0x%016llx", (unsigned long long)m_dRaygenSplitRecord);
+    LOG_INFO("  missRecordBase     = 0x%016llx", (unsigned long long)m_sbt.missRecordBase);
+    LOG_INFO("  hitgroupRecordBase = 0x%016llx", (unsigned long long)m_sbt.hitgroupRecordBase);
     return true;
 }
 
@@ -474,7 +483,34 @@ void OptiXBackend::launchPathTraceSplit(
     uint32_t maxBounces,
     uint32_t samplesPerPixel)
 {
-    if (!m_initialized || !m_gasHandle || !m_dRaygenSplitRecord) return;
+    if (!m_initialized || !m_gasHandle || !m_dRaygenSplitRecord) {
+        LOG_ERROR("launchPathTraceSplit: prereqs missing init=%d gas=0x%llx splitRec=0x%llx",
+                  (int)m_initialized,
+                  (unsigned long long)m_gasHandle,
+                  (unsigned long long)m_dRaygenSplitRecord);
+        return;
+    }
+
+    static int s_splitFrame = 0;
+    if (s_splitFrame < 3) {
+        LOG_INFO("launchPathTraceSplit[%d]: w=%u h=%u spp=%u maxB=%u sIdx=%u",
+                 s_splitFrame, width, height,
+                 samplesPerPixel < 1 ? 1 : samplesPerPixel,
+                 maxBounces, sampleIndex);
+        LOG_INFO("  surfaces: diff=%llu spec=%llu nr=%llu vz=%llu mv=%llu alb=%llu em=%llu",
+                 (unsigned long long)surfaces.diffuseRadianceHitDist,
+                 (unsigned long long)surfaces.specularRadianceHitDist,
+                 (unsigned long long)surfaces.normalRoughness,
+                 (unsigned long long)surfaces.viewZ,
+                 (unsigned long long)surfaces.motionVectors,
+                 (unsigned long long)surfaces.albedo,
+                 (unsigned long long)surfaces.emissive);
+        LOG_INFO("  scene: positions=%p indices=%p materials=%p tris=%u",
+                 scene.d_positions, scene.d_indices, scene.d_materials,
+                 (unsigned)scene.totalTriangles);
+        LOG_INFO("  m_dLaunchParams=0x%llx sizeof(LaunchParams)=%zu",
+                 (unsigned long long)m_dLaunchParams, sizeof(LaunchParams));
+    }
 
     LaunchParams lp;
     std::memset(&lp, 0, sizeof(lp));
@@ -498,6 +534,16 @@ void OptiXBackend::launchPathTraceSplit(
 
     // Swap to the split raygen for this launch.
     m_sbt.raygenRecord = m_dRaygenSplitRecord;
+
+    if (s_splitFrame < 3) {
+        LOG_INFO("  m_sbt: raygen=0x%llx missBase=0x%llx hitBase=0x%llx missCount=%u hitCount=%u",
+                 (unsigned long long)m_sbt.raygenRecord,
+                 (unsigned long long)m_sbt.missRecordBase,
+                 (unsigned long long)m_sbt.hitgroupRecordBase,
+                 (unsigned)m_sbt.missRecordCount,
+                 (unsigned)m_sbt.hitgroupRecordCount);
+    }
+    s_splitFrame++;
 
     CUDA_CHECK(cudaMemcpyAsync(
         (void*)m_dLaunchParams, &lp, sizeof(lp),
