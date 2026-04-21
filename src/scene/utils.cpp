@@ -659,11 +659,45 @@ float rasterizeTriangleAvgLuminance(
     return (float)(lumSum / (double)count);
 }
 
+float3 computeAverageTextureRGB(
+    const unsigned char* pixels, int width, int height)
+{
+    if (!pixels || width <= 0 || height <= 0) return make_float3(0.0f, 0.0f, 0.0f);
+
+    double sumR = 0.0, sumG = 0.0, sumB = 0.0;
+    const size_t count = (size_t)width * (size_t)height;
+    for (size_t i = 0; i < count; i++) {
+        const unsigned char* p = pixels + i * 4;
+        // sRGB -> linear approximation via square (cheap, matches the same
+        // approximation used by texelLuminanceRGBA8 / rasterizeTriangleAvgLuminance).
+        // The GPU reads these textures through sRGB hardware decode producing
+        // the true piecewise transfer, so this CPU value is a close-enough
+        // stand-in for normalisation decisions.
+        float r = p[0] * (1.0f / 255.0f); r *= r;
+        float g = p[1] * (1.0f / 255.0f); g *= g;
+        float b = p[2] * (1.0f / 255.0f); b *= b;
+        sumR += r;
+        sumG += g;
+        sumB += b;
+    }
+    double inv = 1.0 / (double)count;
+    return make_float3(
+        (float)(sumR * inv),
+        (float)(sumG * inv),
+        (float)(sumB * inv));
+}
+
 std::string getTexturePath(const aiMaterial* mat, aiTextureType type, const std::string& baseDir) {
     if (mat->GetTextureCount(type) > 0) {
         aiString str;
         mat->GetTexture(type, 0, &str);
         std::string texturePath = str.C_Str();
+
+        // Normalise Windows-style backslashes to forward slashes so the same
+        // FBX exported from a Windows DCC tool resolves on Linux/macOS. On
+        // Windows std::filesystem accepts either separator, so this is safe
+        // cross-platform.
+        std::replace(texturePath.begin(), texturePath.end(), '\\', '/');
 
         std::string lowerPath = texturePath;
         std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(),

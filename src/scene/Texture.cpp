@@ -13,6 +13,7 @@
 #include "utils.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -82,7 +83,7 @@ bool loadDDSWithGliRGBA8(
 }
 }
 
-cudaTextureObject_t TextureManager::loadTexture(const std::string& path) {
+cudaTextureObject_t TextureManager::loadTexture(const std::string& path, bool sRGB) {
     if (path.empty()) return 0;
 
     int w = 0, h = 0, c = 0;
@@ -110,13 +111,55 @@ cudaTextureObject_t TextureManager::loadTexture(const std::string& path) {
         pixelsOwnedByStb = true;
     }
 
-    // Create CUDA array
-    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<uchar4>();
     cudaArray_t cuArray = nullptr;
-    CUDA_CHECK(cudaMallocArray(&cuArray, &channelDesc, w, h));
-    CUDA_CHECK(cudaMemcpy2DToArray(cuArray, 0, 0, pixels, w * 4, w * 4, h, cudaMemcpyHostToDevice));
-    if (pixelsOwnedByStb) {
-        stbi_image_free(pixels);
+    cudaTextureReadMode readMode;
+
+    if (sRGB) {
+        // Software sRGB → linear conversion on the CPU and upload as float4.
+        // CUDA's texDesc.sRGB flag does NOT actually perform gamma decoding
+        // for cudaArrays built from standard channel descriptors, so we do it
+        // ourselves. Float4 storage is 4× the memory of uint8 but the fetch
+        // path stays simple and portable across CUDA versions.
+        std::vector<float> linearPixels((size_t)w * (size_t)h * 4);
+        auto srgbToLinear = [](float c) {
+            // Piecewise sRGB transfer function.
+            return (c <= 0.04045f) ? (c / 12.92f)
+                                   : std::pow((c + 0.055f) / 1.055f, 2.4f);
+        };
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                size_t off = (size_t)(y * w + x) * 4;
+                float r = pixels[off + 0] * (1.0f / 255.0f);
+                float g = pixels[off + 1] * (1.0f / 255.0f);
+                float b = pixels[off + 2] * (1.0f / 255.0f);
+                float a = pixels[off + 3] * (1.0f / 255.0f);
+                linearPixels[off + 0] = srgbToLinear(r);
+                linearPixels[off + 1] = srgbToLinear(g);
+                linearPixels[off + 2] = srgbToLinear(b);
+                linearPixels[off + 3] = a; // alpha stays linear
+            }
+        }
+        if (pixelsOwnedByStb) {
+            stbi_image_free(pixels);
+            pixelsOwnedByStb = false;
+        }
+
+        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float4>();
+        CUDA_CHECK(cudaMallocArray(&cuArray, &channelDesc, w, h));
+        CUDA_CHECK(cudaMemcpy2DToArray(
+            cuArray, 0, 0, linearPixels.data(),
+            w * sizeof(float4), w * sizeof(float4), h, cudaMemcpyHostToDevice));
+        readMode = cudaReadModeElementType; // already float, no normalization
+    } else {
+        // Raw unsigned 8-bit; hardware will normalise to [0,1] float on fetch.
+        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<uchar4>();
+        CUDA_CHECK(cudaMallocArray(&cuArray, &channelDesc, w, h));
+        CUDA_CHECK(cudaMemcpy2DToArray(
+            cuArray, 0, 0, pixels, w * 4, w * 4, h, cudaMemcpyHostToDevice));
+        if (pixelsOwnedByStb) {
+            stbi_image_free(pixels);
+        }
+        readMode = cudaReadModeNormalizedFloat;
     }
 
     // Create texture object
@@ -128,14 +171,15 @@ cudaTextureObject_t TextureManager::loadTexture(const std::string& path) {
     texDesc.addressMode[0] = cudaAddressModeWrap;
     texDesc.addressMode[1] = cudaAddressModeWrap;
     texDesc.filterMode = cudaFilterModeLinear;
-    texDesc.readMode = cudaReadModeNormalizedFloat;
+    texDesc.readMode = readMode;
     texDesc.normalizedCoords = 1;
+    texDesc.sRGB = 0; // handled on the CPU side for sRGB textures
 
     cudaTextureObject_t texObj = 0;
     CUDA_CHECK(cudaCreateTextureObject(&texObj, &resDesc, &texDesc, nullptr));
 
     m_textures.push_back({cuArray, texObj});
-    LOG_INFO("Loaded texture: %s (%dx%d)", path.c_str(), w, h);
+    LOG_INFO("Loaded texture: %s (%dx%d, sRGB=%d)", path.c_str(), w, h, (int)sRGB);
     return texObj;
 }
 

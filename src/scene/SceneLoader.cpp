@@ -139,6 +139,49 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
         colladaCGLAreaLights = parseColladaCGLAreaLights(path);
     }
 
+    // CPU-decoded emissive textures, keyed by resolved path. Populated lazily
+    // during material load (for adaptive emissionStrength normalisation) and
+    // reused again during area-light construction (for per-triangle weights).
+    struct DecodedEmissiveTex {
+        std::vector<unsigned char> pixels;
+        int width  = 0;
+        int height = 0;
+        float3 avgRGB = {0, 0, 0};
+        float  avgLum = 0.0f;
+        bool   valid  = false;
+        bool   loaded = false;
+    };
+    std::unordered_map<std::string, DecodedEmissiveTex> emissiveTexCache;
+
+    auto getDecodedEmissive = [&](const std::string& texPath) -> DecodedEmissiveTex& {
+        auto it = emissiveTexCache.find(texPath);
+        if (it != emissiveTexCache.end()) return it->second;
+        DecodedEmissiveTex dt;
+        dt.loaded = true;
+        dt.valid = loadTexturePixelsRGBA8(texPath, dt.pixels, dt.width, dt.height);
+        if (dt.valid) {
+            dt.avgRGB = computeAverageTextureRGB(dt.pixels.data(), dt.width, dt.height);
+            dt.avgLum = luminance(dt.avgRGB);
+            LOG_INFO("Decoded emissive texture: %s (%dx%d) avgRGB=(%.4f,%.4f,%.4f) avgLum=%.4f",
+                     texPath.c_str(), dt.width, dt.height,
+                     dt.avgRGB.x, dt.avgRGB.y, dt.avgRGB.z, dt.avgLum);
+        } else {
+            LOG_WARN("Failed to CPU-decode emissive texture: %s", texPath.c_str());
+        }
+        auto [ins, _] = emissiveTexCache.emplace(texPath, std::move(dt));
+        return ins->second;
+    };
+
+    // Adaptive emissionStrength for textured emitters: we target a roughly
+    // constant *textured linear luminance* across scenes (Bistro, MEASURE_SEVEN,
+    // etc.) so one "emissionStrength=50 hardcoded" doesn't over/under-expose
+    // depending on texture content. Strength = target / avgLum, clamped to a
+    // sensible range so black-background logos don't explode and white lamp
+    // plates don't drop to 0.
+    const float kTargetTexturedEmissiveLum = 30.0f;
+    const float kMinEmissionStrength       = 1.0f;
+    const float kMaxEmissionStrength       = 1000.0f;
+
     // Materials
     for (unsigned i = 0; i < aiScn->mNumMaterials; i++) {
         const aiMaterial* aiMat = aiScn->mMaterials[i];
@@ -243,12 +286,45 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
         mat.metallicRoughTexPath = getTexturePath(aiMat, aiTextureType_METALNESS, baseDir);
         mat.emissiveTexPath      = getTexturePath(aiMat, aiTextureType_EMISSIVE, baseDir);
 
-        // If the material has an emissive texture, it is explicitly meant to emit
-        // light. Enable emission even when the scalar emissive color from Assimp
-        // was zero (common in FBX files where the texture carries all the data).
+        // If the material has an emissive texture, it is explicitly meant to
+        // emit light. Enable emission even when the scalar emissive color from
+        // Assimp was zero (common in FBX files where the texture carries all
+        // the data). Adaptive: scale emissionStrength so every textured
+        // emitter ends up with roughly the same average linear luminance in
+        // world space, regardless of how bright/dark its texture is. This is
+        // what keeps Bistro's lamps from blowing out while MEASURE_SEVEN's
+        // logo-on-black decals stay visible at the same default "strength".
         if (!mat.emissiveTexPath.empty() && mat.emissionStrength <= 0.0f) {
             mat.emission = make_float3(1.0f, 1.0f, 1.0f);
-            mat.emissionStrength = 1.0f;
+
+            const DecodedEmissiveTex& dt = getDecodedEmissive(mat.emissiveTexPath);
+            if (dt.valid && dt.avgLum > 1e-6f) {
+                float strength = kTargetTexturedEmissiveLum / dt.avgLum;
+                strength = std::max(kMinEmissionStrength,
+                                    std::min(kMaxEmissionStrength, strength));
+                mat.emissionStrength = strength;
+                LOG_INFO("Material '%s': adaptive emissionStrength=%.2f "
+                         "(avgTexLum=%.4f, target=%.2f)",
+                         materialName.c_str(), strength, dt.avgLum,
+                         kTargetTexturedEmissiveLum);
+            } else if (dt.valid && dt.avgLum <= 1e-6f) {
+                // Texture is entirely black — the material isn't actually
+                // emissive even though the FBX tagged it so. Skip it rather
+                // than letting mat.emission=(1,1,1) make it glow white.
+                mat.emission = make_float3(0.0f, 0.0f, 0.0f);
+                mat.emissionStrength = 0.0f;
+                LOG_INFO("Material '%s': emissive texture is all black, "
+                         "treating as non-emissive",
+                         materialName.c_str());
+            } else {
+                // Texture couldn't be decoded at all (e.g. missing file). Keep
+                // a conservative strength so the material visibly emits white
+                // light — easier to spot and fix than an invisibly dark lamp.
+                mat.emissionStrength = 10.0f;
+                LOG_WARN("Material '%s': emissive texture not decodable, "
+                         "falling back to emissionStrength=%.2f",
+                         materialName.c_str(), mat.emissionStrength);
+            }
         }
 
         // Detect legacy Collada Phong materials that should render as pure
@@ -275,6 +351,82 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
             LOG_INFO("Material '%s': disabling transmission (%.3f) for emissive material",
                      materialName.c_str(), mat.transmission);
             mat.transmission = 0.0f;
+        }
+
+        // ── Diagnostic dump ──────────────────────────────────────────
+        // Log every channel we read from Assimp plus the resulting PBRMaterial
+        // state. Use this to debug "why is emissive yellow instead of green",
+        // "why is the floor not reflective", "why is this scene over/under
+        // exposed", etc.
+        {
+            aiColor3D diagDiffuse(0, 0, 0);
+            aiColor3D diagBaseColor(0, 0, 0);
+            aiColor3D diagSpecular(0, 0, 0);
+            aiColor3D diagEmissive(0, 0, 0);
+            aiColor3D diagAmbient(0, 0, 0);
+            aiColor3D diagReflective(0, 0, 0);
+            float diagShininess = 0.0f;
+            float diagShininessStrength = 0.0f;
+            float diagReflectivity = 0.0f;
+            float diagMetallic = -1.0f;
+            float diagRoughness = -1.0f;
+            float diagSpecFactor = -1.0f;
+            float diagEmissiveIntensity = -1.0f;
+            float diagOpacity = 1.0f;
+            float diagIor = 0.0f;
+            aiMat->Get(AI_MATKEY_COLOR_DIFFUSE, diagDiffuse);
+            aiMat->Get(AI_MATKEY_BASE_COLOR, diagBaseColor);
+            aiMat->Get(AI_MATKEY_COLOR_SPECULAR, diagSpecular);
+            aiMat->Get(AI_MATKEY_COLOR_EMISSIVE, diagEmissive);
+            aiMat->Get(AI_MATKEY_COLOR_AMBIENT, diagAmbient);
+            aiMat->Get(AI_MATKEY_COLOR_REFLECTIVE, diagReflective);
+            aiMat->Get(AI_MATKEY_SHININESS, diagShininess);
+            aiMat->Get(AI_MATKEY_SHININESS_STRENGTH, diagShininessStrength);
+            aiMat->Get(AI_MATKEY_REFLECTIVITY, diagReflectivity);
+            aiMat->Get(AI_MATKEY_METALLIC_FACTOR, diagMetallic);
+            aiMat->Get(AI_MATKEY_ROUGHNESS_FACTOR, diagRoughness);
+            aiMat->Get(AI_MATKEY_SPECULAR_FACTOR, diagSpecFactor);
+            aiMat->Get(AI_MATKEY_EMISSIVE_INTENSITY, diagEmissiveIntensity);
+            aiMat->Get(AI_MATKEY_OPACITY, diagOpacity);
+            aiMat->Get(AI_MATKEY_REFRACTI, diagIor);
+
+            auto texCount = [&](aiTextureType t) {
+                return (unsigned)aiMat->GetTextureCount(t);
+            };
+
+            LOG_INFO("─── Material '%s' (idx=%u) ───", materialName.c_str(), i);
+            LOG_INFO("  Assimp raw: diffuse=(%.3f,%.3f,%.3f) base=(%.3f,%.3f,%.3f) spec=(%.3f,%.3f,%.3f)",
+                     diagDiffuse.r, diagDiffuse.g, diagDiffuse.b,
+                     diagBaseColor.r, diagBaseColor.g, diagBaseColor.b,
+                     diagSpecular.r, diagSpecular.g, diagSpecular.b);
+            LOG_INFO("              emissive=(%.3f,%.3f,%.3f) ambient=(%.3f,%.3f,%.3f) reflective=(%.3f,%.3f,%.3f)",
+                     diagEmissive.r, diagEmissive.g, diagEmissive.b,
+                     diagAmbient.r, diagAmbient.g, diagAmbient.b,
+                     diagReflective.r, diagReflective.g, diagReflective.b);
+            LOG_INFO("              shininess=%.3f shin_strength=%.3f reflectivity=%.3f opacity=%.3f ior=%.3f",
+                     diagShininess, diagShininessStrength, diagReflectivity, diagOpacity, diagIor);
+            LOG_INFO("              metallic_factor=%.3f roughness_factor=%.3f spec_factor=%.3f emissive_intensity=%.3f",
+                     diagMetallic, diagRoughness, diagSpecFactor, diagEmissiveIntensity);
+            LOG_INFO("  Tex counts: BASE=%u DIFFUSE=%u NORMAL=%u METALNESS=%u DIFF_ROUGH=%u SPECULAR=%u EMISSIVE=%u SHININESS=%u",
+                     texCount(aiTextureType_BASE_COLOR),
+                     texCount(aiTextureType_DIFFUSE),
+                     texCount(aiTextureType_NORMALS),
+                     texCount(aiTextureType_METALNESS),
+                     texCount(aiTextureType_DIFFUSE_ROUGHNESS),
+                     texCount(aiTextureType_SPECULAR),
+                     texCount(aiTextureType_EMISSIVE),
+                     texCount(aiTextureType_SHININESS));
+            LOG_INFO("  Resolved -> albedo=(%.3f,%.3f,%.3f) roughness=%.3f metallic=%.3f transmission=%.3f ior=%.3f pureDiffuse=%d",
+                     mat.albedo.x, mat.albedo.y, mat.albedo.z,
+                     mat.roughness, mat.metallic, mat.transmission, mat.ior,
+                     (int)mat.pureDiffuse);
+            LOG_INFO("  Resolved -> emission=(%.3f,%.3f,%.3f) emissionStrength=%.3f",
+                     mat.emission.x, mat.emission.y, mat.emission.z, mat.emissionStrength);
+            LOG_INFO("  Texture paths: albedo='%s' normal='%s' metRough='%s' emissive='%s'",
+                     mat.albedoTexPath.c_str(),
+                     mat.normalTexPath.c_str(),
+                     mat.metallicRoughTexPath.c_str(),
+                     mat.emissiveTexPath.c_str());
         }
 
         scene.getMaterials().push_back(std::move(mat));
@@ -347,32 +499,11 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
     const auto& meshes = scene.getMeshes();
     const auto& materials = scene.getMaterials();
 
-    // Cache decoded emissive textures by path (one mesh = one material, but
-    // multiple materials may share a texture).
-    struct DecodedTexture {
-        std::vector<unsigned char> pixels;
-        int width  = 0;
-        int height = 0;
-        bool valid = false;
-    };
-    std::unordered_map<std::string, DecodedTexture> texCache;
-
-    auto getDecodedTexture = [&](const std::string& texPath) -> const DecodedTexture& {
-        auto it = texCache.find(texPath);
-        if (it != texCache.end()) return it->second;
-        DecodedTexture dt;
-        dt.valid = loadTexturePixelsRGBA8(texPath, dt.pixels, dt.width, dt.height);
-        if (!dt.valid) {
-            LOG_WARN("Failed to CPU-decode emissive texture for importance sampling: %s",
-                     texPath.c_str());
-        } else {
-            LOG_INFO("Decoded emissive texture for per-triangle weighting: %s (%dx%d)",
-                     texPath.c_str(), dt.width, dt.height);
-        }
-        auto [ins, _] = texCache.emplace(texPath, std::move(dt));
-        return ins->second;
-    };
-
+    // The per-triangle importance-sampling weights reuse the same CPU-decoded
+    // texture cache that adaptive emissionStrength populated during material
+    // load (`emissiveTexCache` / `getDecodedEmissive` above). Calling
+    // getDecodedEmissive() again here is cheap: the first hit populates the
+    // cache, subsequent hits just return the stored pixels.
     for (const auto& mesh : meshes) {
         if (mesh.materialIndex < 0 || (size_t)mesh.materialIndex >= materials.size()) {
             continue;
@@ -384,9 +515,9 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
         }
 
         bool hasTexture = !mat.emissiveTexPath.empty();
-        const DecodedTexture* decoded = nullptr;
+        const DecodedEmissiveTex* decoded = nullptr;
         if (hasTexture) {
-            const DecodedTexture& dt = getDecodedTexture(mat.emissiveTexPath);
+            const DecodedEmissiveTex& dt = getDecodedEmissive(mat.emissiveTexPath);
             if (dt.valid) decoded = &dt;
             // If the CPU decode fails, we still want to create area lights for
             // this mesh — fall back to a uniform weight based on mat.emission.
