@@ -488,6 +488,13 @@ void Application::runGui() {
         bool saveScreenshot = f12Down && !m_prevF12Down;
         m_prevF12Down = f12Down;
 
+        // F1 toggles the on-screen GUI overlay.
+        bool f1Down = glfwGetKey(m_window, GLFW_KEY_F1) == GLFW_PRESS;
+        if (f1Down && !m_prevF1Down) {
+            m_showGui = !m_showGui;
+        }
+        m_prevF1Down = f1Down;
+
         // 'H' toggles SH environment irradiance shortcut (only takes effect
         // when an env map is loaded and its SH has been precomputed).
         bool shKeyDown = glfwGetKey(m_window, GLFW_KEY_H) == GLFW_PRESS;
@@ -533,21 +540,24 @@ void Application::runGui() {
         uint32_t rrW = 0, rrH = 0;
 #endif
 
-        bool envChanged = m_gui.render(
-            m_fps,
-            m_renderer.getSampleCount(),
-            m_width,
-            m_height,
-            m_enableEnvironment,
-            m_invertMouseY,
-            m_maxBounces,
-            exposure,
-            toneMappingMode,
-            moveSpeed,
-            m_envMapPathBuf,
-            sizeof(m_envMapPathBuf),
-            envMapLoadRequested,
-            modePtr, qualityPtr, rrW, rrH);
+        bool envChanged = false;
+        if (m_showGui) {
+            envChanged = m_gui.render(
+                m_fps,
+                m_renderer.getSampleCount(),
+                m_width,
+                m_height,
+                m_enableEnvironment,
+                m_invertMouseY,
+                m_maxBounces,
+                exposure,
+                toneMappingMode,
+                moveSpeed,
+                m_envMapPathBuf,
+                sizeof(m_envMapPathBuf),
+                envMapLoadRequested,
+                modePtr, qualityPtr, rrW, rrH);
+        }
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
         if (modePtr && *modePtr != (int)m_renderer.getMode()) {
