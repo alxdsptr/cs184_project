@@ -350,6 +350,9 @@ bool NRDContext::resize(uint32_t renderW, uint32_t renderH) {
     if (!m_impl->createOutputs(renderW, renderH)) return false;
     // Input wraps will be rebuilt lazily when they're next needed.
     m_impl->destroyInputWraps();
+    // Re-trigger one-shot RelaxSettings apply on next denoise() — the new
+    // integration starts fresh with default RELAX settings.
+    m_impl->frameCounter = 0;
     return true;
 }
 
@@ -359,7 +362,8 @@ void NRDContext::setCommonSettings(
     float cameraJitter[2], float cameraJitterPrev[2],
     float motionVectorScalePx[2],
     uint32_t w, uint32_t h,
-    uint32_t frameIndex, bool reset)
+    uint32_t frameIndex, bool reset,
+    float denoisingRange)
 {
     auto& c = m_impl->common;
     std::memcpy(c.viewToClipMatrix,      viewToClip,      sizeof(float)*16);
@@ -390,6 +394,10 @@ void NRDContext::setCommonSettings(
     c.accumulationMode    = reset ? nrd::AccumulationMode::RESTART
                                   : nrd::AccumulationMode::CONTINUE;
     c.isMotionVectorInWorldSpace = false;
+    // viewZScale stays at 1.0 (default): we write linear meters into IN_VIEWZ.
+    // denoisingRange clipped to a sane minimum so a degenerate camera
+    // farPlane (0/NaN) doesn't disable denoising entirely.
+    c.denoisingRange = (denoisingRange > 1.0f) ? denoisingRange : 1000.0f;
 
     // One-shot snapshot of every field NRD validates, so the next failure
     // (if any) is instantly diagnosable from log.txt.
@@ -416,6 +424,30 @@ void NRDContext::denoise(VkCommandBuffer cmd, const VulkanSharedAuxBuffers& aux)
     m_impl->nrd.NewFrame();
     if (trace) LOG_INFO("NRD.denoise[%u]: SetCommonSettings", m_impl->frameCounter);
     m_impl->nrd.SetCommonSettings(m_impl->common);
+
+    // RELAX denoiser settings — one-shot (settings are sticky across frames in
+    // the integration). Re-apply if the integration was recreated (resize).
+    if (m_impl->frameCounter == 0) {
+        nrd::RelaxSettings relax{};
+        // Probabilistic per-pixel diffuse/specular bucket selection means the
+        // unselected bucket has hitT=0; AREA_3X3 reconstructs it from neighbors.
+        // Without this, glossy reflections show "hitT collapsed to 0" artifacts.
+        relax.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::AREA_3X3;
+        // Path tracing easily produces fireflies (caustics, glancing GGX). NRD
+        // would otherwise smear a single-frame firefly into a multi-second halo.
+        relax.enableAntiFirefly = true;
+        // Faster history response for interactive camera. SPP=1-2 + many bounces
+        // generates plenty of new info per frame, so 30 frames of accumulation
+        // is too laggy.
+        relax.diffuseMaxAccumulatedFrameNum  = 20;
+        relax.specularMaxAccumulatedFrameNum = 20;
+        if (m_impl->nrd.SetDenoiserSettings(kRelaxId, &relax) != nrd::Result::SUCCESS) {
+            LOG_ERROR("NRD.denoise: SetDenoiserSettings(RELAX) failed");
+        } else {
+            LOG_INFO("NRD.denoise: RELAX settings applied "
+                     "(antiFirefly=on, hitDistRecon=AREA_3X3, accum=20)");
+        }
+    }
 
     // We own the NRI device (initNri), so we go through the plain `Denoise()`
     // path with NRI-wrapped textures — NOT `DenoiseVK`, which is reserved for
