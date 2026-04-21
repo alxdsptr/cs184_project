@@ -247,7 +247,7 @@ if(PATHTRACER_ENABLE_OPTIX)
                 --expt-relaxed-constexpr
                 -I${CMAKE_CURRENT_SOURCE_DIR}/src
                 -I${PATHTRACER_OPTIX_SDK_DIR}/include
-                -I${CUDAToolkit_INCLUDE_DIRS}
+                "-I$<JOIN:${CUDAToolkit_INCLUDE_DIRS},;-I>"
                 -o ${OPTIX_PROGRAMS_IR}
                 ${OPTIX_PROGRAMS_SRC}
         DEPENDS ${OPTIX_PROGRAMS_SRC}
