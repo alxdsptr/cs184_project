@@ -397,10 +397,13 @@ extern "C" __global__ void __raygen__path_trace()
                     alphaG  = sg.w;
                 }
                 float specLum = 0.2126f * specRGB.x + 0.7152f * specRGB.y + 0.0722f * specRGB.z;
-                mat.metallic = 0.0f;
+                specLum = clampf(specLum, 0.0f, 1.0f);
+                float specStrength = sqrtf(specLum);
+                float F0_target = 0.04f + 0.56f * specStrength;
+                mat.metallic = clampf((F0_target - 0.04f) / 0.96f, 0.0f, 1.0f);
                 float gloss = mat.specularGlossAlphaIsGlossiness
                                 ? (mat.glossiness * alphaG)
-                                :  (mat.glossiness * specLum);
+                                :  specStrength;
                 mat.roughness = 1.0f - clampf(gloss, 0.0f, 0.95f);
             }
             mat.roughness = fmaxf(mat.roughness, 0.045f);

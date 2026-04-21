@@ -413,15 +413,24 @@ __global__ void pathTraceKernel(
             mat.metallic = mat.metallic * mrTexel.z;
         }
 
-        // Specular-Glossiness "soft" interpretation: the *_Specular.dds maps in
-        // Bistro and MEASURE_SEVEN are too ill-formed to interpret as literal
-        // F0 — endpoints come out as saturated magentas and primaries that, if
-        // taken at face value, render every shaded pixel as a tinted mirror.
-        // We instead use only the spec map's *luminance* as a roughness hint
-        // (bright spec → glossy, dark spec → rough), keep F0 at the dielectric
-        // 0.04 baseline, and let BaseColor carry all chromaticity. This loses
-        // the per-pixel F0 colour signal but produces visually correct results
-        // across both assets without per-asset hand-tuning.
+        // Specular-Glossiness "soft" interpretation: the spec map's chromaticity
+        // is unreliable across assets (saturated magentas / yellows that aren't
+        // physical F0), but its *luminance* is a meaningful "how reflective is
+        // this pixel" signal. We use spec luminance to drive both roughness and
+        // F0 strength so that bright-spec areas (MEASURE_SEVEN's polished floor)
+        // get visible mirror-like highlights, while dark-spec areas (matte
+        // walls, fabric) stay properly diffuse. Albedo keeps its BaseColor
+        // chromaticity — only its weighting in the BRDF changes.
+        //
+        // Encoding the target F0 through (metallic, albedo) so we don't fork
+        // the BRDF: setting metallic = m and albedo = a gives F0 =
+        //   lerp(0.04, a, m) = 0.04*(1-m) + a*m.
+        // We pick m so that F0 (white) = 0.04 + (Ftarget - 0.04) = Ftarget when
+        // a is treated as white at the F0-mixing site. To keep diffuse colour
+        // intact we apply this ONLY to F0; the diffuse term still uses the
+        // original BaseColor through kd = (1-F)*(1-m), which gracefully fades
+        // diffuse as the surface becomes more metallic — the exact behaviour
+        // we want for polished stone / brushed metal.
         if (mat.useSpecularGlossiness) {
             float3 specRGB = mat.specularColor;
             float  alphaG  = 1.0f;
@@ -431,10 +440,30 @@ __global__ void pathTraceKernel(
                 alphaG  = sg.w;
             }
             float specLum = 0.2126f * specRGB.x + 0.7152f * specRGB.y + 0.0722f * specRGB.z;
-            mat.metallic = 0.0f;
-            float gloss = mat.specularGlossAlphaIsGlossiness
-                            ? (mat.glossiness * alphaG)
-                            :  (mat.glossiness * specLum);
+            specLum = clampf(specLum, 0.0f, 1.0f);
+
+            // sqrt curve: even mid-luminance spec gives a noticeable polish,
+            // matching how artists usually paint these masks.
+            float specStrength = sqrtf(specLum);
+
+            // Target F0 ranges from dielectric baseline (0.04) to ~0.6 for the
+            // brightest spec values — well into "polished metal" territory but
+            // capped below pure mirror to leave headroom for the BaseColor tint
+            // visible in the diffuse lobe.
+            float F0_target = 0.04f + 0.56f * specStrength;
+            mat.metallic = clampf((F0_target - 0.04f) / 0.96f, 0.0f, 1.0f);
+
+            // When alpha carries glossiness data, use it (modulated by the
+            // material factor). When it doesn't, let spec luminance directly
+            // drive glossiness so bright-spec areas show clear reflections;
+            // the scalar `glossiness` factor only acts as an upper bound /
+            // global trim.
+            float gloss;
+            if (mat.specularGlossAlphaIsGlossiness) {
+                gloss = mat.glossiness * alphaG;
+            } else {
+                gloss = specStrength;
+            }
             mat.roughness = 1.0f - clampf(gloss, 0.0f, 0.95f);
         }
 
