@@ -3,6 +3,7 @@
 #include "display/VulkanDisplay.h"
 #include "gui/GUI.h"
 #include "scene/Scene.h"
+#include "scene/SceneLoader.h"
 #include "scene/Texture.h"
 #include "render/Renderer.h"
 #include "backend/RayTracingBackend.h"
@@ -21,10 +22,13 @@ public:
     void shutdown();
     void setMaxBounces(uint32_t maxBounces);
     void setSamplesPerFrame(uint32_t spp);
-    // 0 = Native, 1 = NRDOnly, 2 = NRDDLSS. Applied after init().
+    // 0 = Native, 1 = NRDOnly, 2 = NRDDLSS, 3 = DLSSOnly. Applied after init().
     void setInitialMode(int mode) { m_initialMode = mode; }
     // 0 = CUDA (default), 1 = OptiX. Applied during init().
     void setBackendKind(int kind) { m_backendKind = kind; }
+    // Specular-Glossiness workflow mode for legacy FBX assets. Applied at
+    // loadScene().
+    void setSGWorkflowMode(SGWorkflowMode mode) { m_sgMode = mode; }
     void setHeadlessOutput(const std::string& outputPath, uint32_t sampleCount);
     void setEnvMap(const std::string& path);
 
@@ -48,6 +52,7 @@ private:
     Renderer   m_renderer;
     std::unique_ptr<RayTracingBackend> m_backend;
     int m_backendKind = 0;  // 0 = CUDA, 1 = OptiX
+    SGWorkflowMode m_sgMode = SGWorkflowMode::Off;
 
     bool       m_sceneLoaded = false;
     InputState m_input;

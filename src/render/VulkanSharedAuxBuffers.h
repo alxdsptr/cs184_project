@@ -19,6 +19,9 @@ struct SharedAuxSurfaces {
     cudaSurfaceObject_t motionVectors           = 0; // RG16F, screen-space pixel deltas
     cudaSurfaceObject_t albedo                  = 0; // RGBA8_UNORM, diffuse reflectance (demodulation factor)
     cudaSurfaceObject_t emissive                = 0; // RGBA16F, linear HDR
+    // DLSSOnly: full HDR composite produced by the path-trace kernel directly,
+    // bypassing NRD/composite. Render-resolution input to DLSS upscale.
+    cudaSurfaceObject_t hdrColor                = 0; // RGBA16F, linear HDR
 };
 
 class VulkanSharedAuxBuffers {
@@ -48,6 +51,7 @@ public:
     const SharedVulkanImage& motionVectors()           const { return m_motionVectors; }
     const SharedVulkanImage& albedo()                  const { return m_albedo; }
     const SharedVulkanImage& emissive()                const { return m_emissive; }
+    const SharedVulkanImage& hdrColor()                const { return m_hdrColor; }
 
     uint32_t width()  const { return m_width; }
     uint32_t height() const { return m_height; }
@@ -61,6 +65,7 @@ private:
     SharedVulkanImage m_motionVectors;
     SharedVulkanImage m_albedo;
     SharedVulkanImage m_emissive;
+    SharedVulkanImage m_hdrColor;
     uint32_t m_width  = 0;
     uint32_t m_height = 0;
 };

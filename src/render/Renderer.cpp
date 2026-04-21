@@ -99,7 +99,41 @@ void Renderer::renderFrame(
     }
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
-    // ── Split-output path-trace into Vulkan-shared aux images.
+    // ── DLSSOnly: backend writes HDR + motion + viewZ directly into the
+    // shared interop image. No diff/spec split, no NRD. The same backend
+    // (CUDA or OptiX) used for Native is used here.
+    if (m_mode == Mode::DLSSOnly) {
+        PrimaryHitSurfaces gb{};
+        if (m_sharedAux) {
+            SharedAuxSurfaces s = m_sharedAux->surfaces();
+            gb.motionVectors = s.motionVectors;
+            gb.viewZ         = s.viewZ;
+            gb.hdrColor      = s.hdrColor;
+        }
+        backend->launchPathTrace(
+            scene, camera,
+            m_accumBuffer.getAccumBuffer(),
+            // d_outputBuffer not needed (gb.hdrColor publishes the result),
+            // but kernels still use it as a scratch / debug write. Pass the
+            // accum-buffer's CUDA-side output to keep the existing path alive.
+            m_accumBuffer.getOutputBuffer(),
+            m_auxBuffers.getPtrs(),
+            m_renderWidth, m_renderHeight, sampleIndex,
+            enableEnvironment, maxBounces, samplesPerFrame,
+            gb);
+        m_accumBuffer.addSamples(samplesPerFrame);
+
+        m_lastCamera = camera;
+        m_lastCameraValid = true;
+        m_frameIndex = frameIndex;
+        if (display && display != m_display) {
+            display->setPrePresentRecorder(&Renderer::prePresentTrampoline, this);
+            m_display = display;
+        }
+        return;
+    }
+
+    // ── NRDOnly / NRDDLSS: split-output path-trace into Vulkan-shared aux images.
     SplitSurfaceOutputs surf{};
     if (m_sharedAux) {
         SharedAuxSurfaces s = m_sharedAux->surfaces();
@@ -136,7 +170,7 @@ void Renderer::renderFrame(
 }
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
-// Forward decl — defined below in the NRD+DLSS impl section.
+// Forward decls — defined below in the NRD+DLSS impl section.
 static bool initHdrIntermediates(
     VkDevice dev, VkPhysicalDevice phys,
     uint32_t renderW, uint32_t renderH,
@@ -144,6 +178,9 @@ static bool initHdrIntermediates(
     VkRenderPass& hdrRenderPass,
     VkImage& renderImg, VkDeviceMemory& renderMem, VkImageView& renderView, VkFramebuffer& renderFb,
     VkImage& outputImg, VkDeviceMemory& outputMem, VkImageView& outputView);
+static bool createHdrTarget(VkDevice dev, VkPhysicalDevice phys,
+    uint32_t w, uint32_t h, VkImageUsageFlags extraUsage,
+    VkImage& outImg, VkDeviceMemory& outMem, VkImageView& outView);
 #endif
 
 bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
@@ -167,6 +204,12 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
     }
 
     if (newMode == Mode::Native) {
+        // Restore accum/aux buffers to output resolution if the previous mode
+        // had shrunk them (DLSSOnly resizes them to renderW × renderH).
+        if (m_renderWidth != m_width || m_renderHeight != m_height) {
+            m_accumBuffer.resize(m_width, m_height);
+            m_auxBuffers.resize(m_width, m_height);
+        }
         m_mode = Mode::Native;
         m_display = display;
         m_renderWidth = m_width;
@@ -180,14 +223,25 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
         return false;
     }
 
-    // For NRDDLSS, ask DLSS for optimal render resolution first.
+    // For NRDDLSS / DLSSOnly, ask DLSS for optimal render resolution first.
     uint32_t renderW = m_width, renderH = m_height;
-    if (newMode == Mode::NRDDLSS) {
+    const bool wantsDlss = (newMode == Mode::NRDDLSS || newMode == Mode::DLSSOnly);
+    if (wantsDlss) {
         if (!initDlssPath(display, m_width, m_height)) {
-            LOG_WARN("DLSS init failed — demoting NRDDLSS → NRDOnly");
-            newMode = Mode::NRDOnly;
-            renderW = m_width;
-            renderH = m_height;
+            LOG_WARN("DLSS init failed — demoting %s → %s",
+                     newMode == Mode::NRDDLSS ? "NRDDLSS" : "DLSSOnly",
+                     newMode == Mode::NRDDLSS ? "NRDOnly" : "Native");
+            if (newMode == Mode::NRDDLSS) {
+                newMode = Mode::NRDOnly;
+                renderW = m_width;
+                renderH = m_height;
+            } else {
+                m_mode = Mode::Native;
+                m_display = display;
+                m_renderWidth = m_width;
+                m_renderHeight = m_height;
+                return false;
+            }
         } else if (m_dlss) {
             uint32_t rw = 0, rh = 0;
             DLSSContext::QualityMode dq = DLSSContext::BALANCED;
@@ -203,7 +257,8 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
         }
     }
 
-    if (!initNrdPath(display, renderW, renderH)) {
+    const bool needsNrd = (newMode == Mode::NRDOnly || newMode == Mode::NRDDLSS);
+    if (!initNrdPath(display, renderW, renderH, /*withNrd=*/needsNrd)) {
         LOG_WARN("NRD init failed — demoting to Native");
         shutdownDlssPath();
         shutdownNrdPath();
@@ -261,6 +316,47 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
                     return false;
                 }
             }
+        }
+    }
+
+    // DLSSOnly: the path-trace kernel accumulates into m_accumBuffer at the
+    // (sub-output) render resolution; we must resize it before the first
+    // frame, otherwise the kernel walks past the buffer end.
+    if (newMode == Mode::DLSSOnly && (renderW != m_width || renderH != m_height)) {
+        m_accumBuffer.resize(renderW, renderH);
+        m_auxBuffers.resize(renderW, renderH);
+    }
+
+    // DLSSOnly mode: path tracer writes HDR directly into m_sharedAux->hdrColor()
+    // (a render-res shared image), DLSS upscales it into m_hdrOutputImage, then
+    // m_tonemap maps to LDR sRGB on the swapchain-sized sampled image. No
+    // composite-render pass (no diff/spec to combine), no NRD render-res HDR
+    // intermediate (we use the shared interop image as DLSS input).
+    if (newMode == Mode::DLSSOnly) {
+        VkDevice dev = display->device();
+        VkPhysicalDevice phys = display->physicalDevice();
+        // Output-res HDR image only (DLSS write target). The shared
+        // m_sharedAux->hdrColor() serves as DLSS input.
+        if (!createHdrTarget(dev, phys, m_width, m_height,
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                m_hdrOutputImage, m_hdrOutputMem, m_hdrOutputView)) {
+            LOG_ERROR("DLSSOnly: HDR output image alloc failed — demoting to Native");
+            shutdownDlssPath();
+            shutdownNrdPath();
+            m_mode = Mode::Native;
+            m_display = display;
+            return false;
+        }
+        m_tonemap = std::make_unique<CompositePass>();
+        if (!m_tonemap->init(dev, m_ldrRenderPass,
+                             CompositePass::TONEMAP_ONLY,
+                             display->sampledImageFormat(), "shaders")) {
+            LOG_ERROR("DLSSOnly: Tonemap pass init failed — demoting to Native");
+            shutdownDlssPath();
+            shutdownNrdPath();
+            m_mode = Mode::Native;
+            m_display = display;
+            return false;
         }
     }
 
@@ -338,7 +434,9 @@ static VkRenderPass createLdrRenderPass(VkDevice device, VkFormat format) {
     return rp;
 }
 
-bool Renderer::initNrdPath(VulkanDisplay* display, uint32_t renderW, uint32_t renderH) {
+bool Renderer::initNrdPath(VulkanDisplay* display, uint32_t renderW, uint32_t renderH,
+                           bool withNrd)
+{
     m_sharedAux = std::make_unique<VulkanSharedAuxBuffers>();
     if (!m_sharedAux->create(display->device(), display->physicalDevice(), renderW, renderH)) {
         LOG_ERROR("VulkanSharedAuxBuffers::create failed");
@@ -346,11 +444,13 @@ bool Renderer::initNrdPath(VulkanDisplay* display, uint32_t renderW, uint32_t re
         return false;
     }
 
-    m_nrd = std::make_unique<NRDContext>();
-    if (!m_nrd->init(*display, renderW, renderH)) {
-        m_nrd.reset();
-        m_sharedAux.reset();
-        return false;
+    if (withNrd) {
+        m_nrd = std::make_unique<NRDContext>();
+        if (!m_nrd->init(*display, renderW, renderH)) {
+            m_nrd.reset();
+            m_sharedAux.reset();
+            return false;
+        }
     }
 
     // Composite render pass + framebuffer onto VulkanDisplay's sampled image.
@@ -376,15 +476,21 @@ bool Renderer::initNrdPath(VulkanDisplay* display, uint32_t renderW, uint32_t re
         return false;
     }
 
-    // Composite pipeline: combine NRD outputs + albedo + emissive → tonemapped LDR.
-    m_compositeRender = std::make_unique<CompositePass>();
-    if (!m_compositeRender->init(dev, m_ldrRenderPass,
-                                 CompositePass::COMPOSITE_TONEMAP, fmt, "shaders")) {
-        LOG_ERROR("Renderer: CompositePass::init failed");
-        vkDestroyFramebuffer(dev, m_ldrFramebuffer, nullptr); m_ldrFramebuffer = VK_NULL_HANDLE;
-        vkDestroyRenderPass(dev, m_ldrRenderPass, nullptr); m_ldrRenderPass = VK_NULL_HANDLE;
-        m_nrd.reset(); m_sharedAux.reset();
-        return false;
+    // For NRDOnly the composite combines (NRD diff + spec + alb + emis) and
+    // tonemaps in one pass. For DLSSOnly that pass would be redundant — DLSS
+    // already produced an HDR image we just need to tonemap. Skip it; the
+    // DLSSOnly recordPrePresent() path uses `m_tonemap` (built later in
+    // setMode()) instead.
+    if (withNrd) {
+        m_compositeRender = std::make_unique<CompositePass>();
+        if (!m_compositeRender->init(dev, m_ldrRenderPass,
+                                     CompositePass::COMPOSITE_TONEMAP, fmt, "shaders")) {
+            LOG_ERROR("Renderer: CompositePass::init failed");
+            vkDestroyFramebuffer(dev, m_ldrFramebuffer, nullptr); m_ldrFramebuffer = VK_NULL_HANDLE;
+            vkDestroyRenderPass(dev, m_ldrRenderPass, nullptr); m_ldrRenderPass = VK_NULL_HANDLE;
+            m_nrd.reset(); m_sharedAux.reset();
+            return false;
+        }
     }
     return true;
 }
@@ -560,10 +666,20 @@ void Renderer::prePresentTrampoline(VkCommandBuffer cmd, void* user) {
 }
 
 void Renderer::recordPrePresent(VkCommandBuffer cmd) {
-    if (!m_display || !m_nrd || !m_sharedAux || !m_lastCameraValid) return;
+    if (!m_display || !m_sharedAux || !m_lastCameraValid) return;
+    // NRDOnly / NRDDLSS need the NRD denoiser; DLSSOnly does not.
+    const bool needsNrd = (m_mode == Mode::NRDOnly || m_mode == Mode::NRDDLSS);
+    if (needsNrd && !m_nrd) return;
 
     const uint32_t rw = m_renderWidth;
     const uint32_t rh = m_renderHeight;
+
+    // ── DLSSOnly fast path: skip NRD + composite. The path tracer wrote HDR
+    // straight into m_sharedAux->hdrColor(); we just need DLSS upscale + tonemap.
+    if (m_mode == Mode::DLSSOnly) {
+        recordDlssOnlyPrePresent(cmd);
+        return;
+    }
 
     // Temporary crash-triage checkpoints. Remove once NRD is stable.
     static uint32_t s_ppFrame = 0;
@@ -767,6 +883,92 @@ void Renderer::recordPrePresent(VkCommandBuffer cmd) {
     m_prevJitter[1] = m_lastCamera.jitterOffset.y;
     if (s_ppFrame < 3) LOG_INFO("recordPrePresent[%u]: done", s_ppFrame);
     ++s_ppFrame;
+}
+
+// ────────────────────────────────────────────────────────────────
+// DLSSOnly pre-present: skip NRD entirely. The path tracer wrote HDR
+// directly into m_sharedAux->hdrColor() (render res); we DLSS-upscale
+// into m_hdrOutputImage (output res) then tonemap into the swapchain
+// sampledImage. No diff/spec/normal/albedo/emissive consumed.
+// ────────────────────────────────────────────────────────────────
+void Renderer::recordDlssOnlyPrePresent(VkCommandBuffer cmd) {
+    if (!m_display || !m_dlss || !m_tonemap || !m_sharedAux || !m_lastCameraValid) return;
+
+    static uint32_t s_dlssOnlyFrame = 0;
+    const bool trace = s_dlssOnlyFrame < 3;
+
+    // Lazily create the DLSS feature on the first frame after mode change.
+    if (!m_dlss->isValid()) {
+        m_dlss->createFeature(cmd, m_renderWidth, m_renderHeight,
+                              m_width, m_height,
+                              DLSSContext::BALANCED,  // (quality is retargeted via setDLSSQuality)
+                              /*isHDR=*/true);
+        if (trace) LOG_INFO("DLSSOnly: feature created (%ux%u → %ux%u)",
+                            m_renderWidth, m_renderHeight, m_width, m_height);
+    }
+
+    // (1) Bring shared interop images into the layout DLSS expects:
+    //   - color (hdrColor): SHADER_READ_ONLY
+    //   - motion vectors  : SHADER_READ_ONLY
+    //   - viewZ           : SHADER_READ_ONLY
+    // CUDA wrote them via surface objects with no Vulkan layout tracking, so
+    // we transition from UNDEFINED (contents preserved on most drivers but
+    // formally undefined-by-spec — same trick as the NRD path).
+    auto toRead = [&](VkImage img) {
+        SharedVulkanImage::transition(cmd, img,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, VK_ACCESS_SHADER_READ_BIT);
+    };
+    toRead(m_sharedAux->hdrColor().image());
+    toRead(m_sharedAux->motionVectors().image());
+    toRead(m_sharedAux->viewZ().image());
+
+    // (2) DLSS expects the upscaled output image in GENERAL.
+    SharedVulkanImage::transition(cmd, m_hdrOutputImage,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, VK_ACCESS_SHADER_WRITE_BIT);
+
+    m_dlss->evaluate(cmd,
+        // Inputs: color (render res from path tracer), output (output res, DLSS write).
+        m_sharedAux->hdrColor().view(),  m_sharedAux->hdrColor().image(),
+        m_hdrOutputView,                 m_hdrOutputImage,
+        m_sharedAux->motionVectors().view(), m_sharedAux->motionVectors().image(),
+        m_sharedAux->viewZ().view(),         m_sharedAux->viewZ().image(),
+        VK_FORMAT_R16G16B16A16_SFLOAT,   // color
+        VK_FORMAT_R16G16_SFLOAT,         // motion
+        VK_FORMAT_R32_SFLOAT,            // depth (linear viewZ)
+        m_renderWidth, m_renderHeight,
+        m_width,       m_height,
+        m_lastCamera.jitterOffset.x, m_lastCamera.jitterOffset.y,
+        /*reset=*/m_accumBuffer.getSampleCount() == 1);
+
+    // (3) Tonemap @ output res → sampledImage.
+    SharedVulkanImage::transition(cmd, m_hdrOutputImage,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+    const int tmMode = (m_toneMappingMode == ToneMappingMode::Reinhard) ? 1
+                     : (m_toneMappingMode == ToneMappingMode::ACES)     ? 2 : 0;
+    m_tonemap->setInputs(m_hdrOutputView);
+    VkExtent2D sext{ m_width, m_height };
+    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rbi.renderPass  = m_ldrRenderPass;
+    rbi.framebuffer = m_ldrFramebuffer;
+    rbi.renderArea.offset = {0, 0};
+    rbi.renderArea.extent = sext;
+    rbi.clearValueCount = 0;
+    vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    m_tonemap->record(cmd, sext, m_exposure, tmMode);
+    vkCmdEndRenderPass(cmd);
+
+    m_lastCameraMoved = false;
+    m_prevJitter[0] = m_lastCamera.jitterOffset.x;
+    m_prevJitter[1] = m_lastCamera.jitterOffset.y;
+    if (trace) LOG_INFO("DLSSOnly: pre-present[%u] done", s_dlssOnlyFrame);
+    ++s_dlssOnlyFrame;
 }
 
 #endif // PATHTRACER_NRD_DLSS_ENABLED
