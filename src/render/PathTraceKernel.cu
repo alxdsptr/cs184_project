@@ -10,6 +10,9 @@
 #include "accel/BVH.h"
 #include "util/CudaCheck.h"
 
+#include <cuda_fp16.h>
+#include <surface_indirect_functions.h>
+
 #ifndef M_PI_F
 #define M_PI_F 3.14159265358979323846f
 #endif
@@ -294,7 +297,8 @@ __global__ void pathTraceKernel(
     uint32_t        sampleIndex,
     bool            enableEnvironment,
     uint32_t        maxBounces,
-    uint32_t        samplesPerPixel)
+    uint32_t        samplesPerPixel,
+    PrimaryHitSurfaces gbuffer)
 {
     uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -362,6 +366,18 @@ __global__ void pathTraceKernel(
                 }
                 radiance += throughput * envColor;
             }
+            // Sky pixel: write a sentinel viewZ so DLSS / NRD treat it as far.
+            if (firstBounce && !gbufferWritten) {
+                if (gbuffer.viewZ) {
+                    surf2Dwrite<float>(1.0e6f, gbuffer.viewZ, x * 4, y);
+                }
+                if (gbuffer.motionVectors) {
+                    ushort2 zero = make_ushort2(0, 0);
+                    surf2Dwrite<ushort2>(zero, gbuffer.motionVectors, x * 4, y);
+                }
+                gbufferWritten = true;
+                firstBounce = false;
+            }
             break;
         }
 
@@ -378,6 +394,7 @@ __global__ void pathTraceKernel(
             mat.useSpecularGlossiness = 0;
             mat.specularGlossAlphaIsGlossiness = 0;
             mat.useFBXCustomPacking = 0;
+            mat.useFBXUEPacking = 0;
             mat.specularColor = make_float3(1.0f, 1.0f, 1.0f);
             mat.glossiness = 0.5f;
             mat.specularGlossTex = 0;
@@ -451,6 +468,16 @@ __global__ void pathTraceKernel(
                 albedo = mat.specularColor;
                 mat.metallic = B;
                 mat.roughness = G;
+            } else if (mat.useFBXUEPacking && mat.specularGlossTex != 0) {
+                // UE / standard PBR-Specular packing: G = glossiness (high =
+                // smooth, opposite of roughness), B = metallic mask. Albedo
+                // keeps its BaseColor — this gives metals their characteristic
+                // tinted F0 = lerp(0.04, baseColor, 1) = baseColor.
+                float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
+                float G = clampf(sg.y, 0.0f, 1.0f);
+                float B = clampf(sg.z, 0.0f, 1.0f);
+                mat.metallic  = B;
+                mat.roughness = 1.0f - G;
             } else {
                 float3 specRGB = mat.specularColor;
                 float  alphaG  = 1.0f;
@@ -528,21 +555,34 @@ __global__ void pathTraceKernel(
         // the samples-per-pixel loop so we don't overwrite on subsequent spp.
         if (firstBounce) {
             if (!gbufferWritten) {
-                if (auxBuffers.d_linearDepth)
-                    auxBuffers.d_linearDepth[pixelIdx] = dot(hit.position - camera.position, camera.forward);
-                if (auxBuffers.d_albedo)
-                    auxBuffers.d_albedo[pixelIdx] = albedo;
-                if (auxBuffers.d_normal)
-                    auxBuffers.d_normal[pixelIdx] = N;
-                if (auxBuffers.d_motionVectors) {
-                    float3 clipCurr = mat4_transformPoint(camera.viewProjMatrix, hit.position);
-                    float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hit.position);
-                    float2 screenCurr = make_float2((clipCurr.x + 1.0f) * 0.5f * width,
-                                                     (1.0f - clipCurr.y) * 0.5f * height);
-                    float2 screenPrev = make_float2((clipPrev.x + 1.0f) * 0.5f * width,
-                                                     (1.0f - clipPrev.y) * 0.5f * height);
-                    auxBuffers.d_motionVectors[pixelIdx] = screenCurr - screenPrev;
+                float viewZprim = dot(hit.position - camera.position, camera.forward);
+                float3 clipCurr = mat4_transformPoint(camera.viewProjMatrix, hit.position);
+                float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hit.position);
+                float2 screenCurr = make_float2((clipCurr.x + 1.0f) * 0.5f * width,
+                                                 (1.0f - clipCurr.y) * 0.5f * height);
+                float2 screenPrev = make_float2((clipPrev.x + 1.0f) * 0.5f * width,
+                                                 (1.0f - clipPrev.y) * 0.5f * height);
+                float2 mvPx = screenCurr - screenPrev;
+
+                if (auxBuffers.d_linearDepth)   auxBuffers.d_linearDepth[pixelIdx]   = viewZprim;
+                if (auxBuffers.d_albedo)        auxBuffers.d_albedo[pixelIdx]        = albedo;
+                if (auxBuffers.d_normal)        auxBuffers.d_normal[pixelIdx]        = N;
+                if (auxBuffers.d_motionVectors) auxBuffers.d_motionVectors[pixelIdx] = mvPx;
+
+                // DLSSOnly: also write to Vulkan-shared surfaces (mirrors the
+                // OptiX raygen logic — see OptiXPrograms.cu).
+                if (gbuffer.viewZ) {
+                    surf2Dwrite<float>(viewZprim, gbuffer.viewZ, x * 4, y);
                 }
+                if (gbuffer.motionVectors) {
+                    __half hx = __float2half(mvPx.x);
+                    __half hy = __float2half(mvPx.y);
+                    ushort2 packed;
+                    packed.x = *reinterpret_cast<unsigned short*>(&hx);
+                    packed.y = *reinterpret_cast<unsigned short*>(&hy);
+                    surf2Dwrite<ushort2>(packed, gbuffer.motionVectors, x * 4, y);
+                }
+
                 gbufferWritten = true;
             }
             firstBounce = false;
@@ -910,7 +950,22 @@ __global__ void pathTraceKernel(
     float4 sumTexel = make_float4(radianceSum.x, radianceSum.y, radianceSum.z, (float)samplesPerPixel);
     d_accumBuffer[pixelIdx] = d_accumBuffer[pixelIdx] + sumTexel;
     float invN = 1.0f / (float)(sampleIndex + samplesPerPixel);
-    d_outputBuffer[pixelIdx] = d_accumBuffer[pixelIdx] * invN;
+    float4 hdr = d_accumBuffer[pixelIdx] * invN;
+    if (d_outputBuffer) d_outputBuffer[pixelIdx] = hdr;
+
+    // DLSSOnly: also publish HDR into the Vulkan-shared interop image.
+    if (gbuffer.hdrColor) {
+        __half hx = __float2half(hdr.x);
+        __half hy = __float2half(hdr.y);
+        __half hz = __float2half(hdr.z);
+        __half hw = __float2half(1.0f);
+        ushort4 p;
+        p.x = *reinterpret_cast<unsigned short*>(&hx);
+        p.y = *reinterpret_cast<unsigned short*>(&hy);
+        p.z = *reinterpret_cast<unsigned short*>(&hz);
+        p.w = *reinterpret_cast<unsigned short*>(&hw);
+        surf2Dwrite<ushort4>(p, gbuffer.hdrColor, x * 8, y);
+    }
 }
 
 void launchPathTraceKernel(
@@ -924,13 +979,15 @@ void launchPathTraceKernel(
     uint32_t sampleIndex,
     bool enableEnvironment,
     uint32_t maxBounces,
-    uint32_t samplesPerPixel)
+    uint32_t samplesPerPixel,
+    PrimaryHitSurfaces gbufferSurfaces)
 {
     if (samplesPerPixel < 1) samplesPerPixel = 1;
     dim3 block(8, 8);
     dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
     pathTraceKernel<<<grid, block>>>(
         scene, camera, d_accumBuffer, d_outputBuffer, auxBuffers,
-        width, height, sampleIndex, enableEnvironment, maxBounces, samplesPerPixel);
+        width, height, sampleIndex, enableEnvironment, maxBounces, samplesPerPixel,
+        gbufferSurfaces);
     CUDA_CHECK(cudaGetLastError());
 }

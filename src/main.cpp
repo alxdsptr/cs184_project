@@ -1,4 +1,5 @@
 #include "app/Application.h"
+#include "scene/SceneLoader.h"
 #include "util/Log.h"
 
 #include <cstdint>
@@ -16,6 +17,7 @@ int main(int argc, char** argv) {
     uint32_t samplesPerFrame = 1;  // spp per realtime frame (independent of `-s`)
     int initialMode = -1;  // -1=default, 0=Native, 1=NRDOnly, 2=NRDDLSS
     int backendKind = 0;   // 0=CUDA, 1=OptiX
+    SGWorkflowMode sgMode = SGWorkflowMode::Off;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -46,6 +48,13 @@ int main(int argc, char** argv) {
             if (b == "cuda") backendKind = 0;
             else if (b == "optix") backendKind = 1;
             else LOG_WARN("Invalid --backend value: %s (use cuda|optix)", b.c_str());
+        } else if (arg == "--sg" && i + 1 < argc) {
+            std::string s = argv[++i];
+            if (s == "off")           sgMode = SGWorkflowMode::Off;
+            else if (s == "heuristic") sgMode = SGWorkflowMode::SpecLumHeuristic;
+            else if (s == "fbx-c4d")  sgMode = SGWorkflowMode::FbxC4D;
+            else if (s == "fbx-ue")   sgMode = SGWorkflowMode::FbxUE;
+            else LOG_WARN("Invalid --sg value: %s (use off|heuristic|fbx-c4d|fbx-ue)", s.c_str());
         } else if ((arg == "--spp" || arg == "-p") && i + 1 < argc) {
             int value = std::atoi(argv[++i]);
             if (value > 0) {
@@ -85,6 +94,7 @@ int main(int argc, char** argv) {
     app.setSamplesPerFrame(samplesPerFrame);
     app.setInitialMode(initialMode);
     app.setBackendKind(backendKind);
+    app.setSGWorkflowMode(sgMode);
     if (!outputPath.empty()) {
         app.setHeadlessOutput(outputPath, samples);
     }

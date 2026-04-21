@@ -6,6 +6,8 @@
 // Miss (shadow): no-op (transmittance slots carry final value).
 
 #include <optix.h>
+#include <cuda_fp16.h>
+#include <surface_indirect_functions.h>
 
 #include "backend/OptiXLaunchParams.h"
 #include "core/Math.h"
@@ -319,6 +321,20 @@ extern "C" __global__ void __raygen__path_trace()
                     if (envLum > envClamp) envColor = envColor * (envClamp / envLum);
                     radiance += throughput * envColor;
                 }
+                // Sky pixel: write a sentinel viewZ so NRD treats it as sky
+                // (any value > denoisingRange) and DLSS sees uniform far depth.
+                // Motion vector stays 0 — sky doesn't reproject by camera.
+                if (firstBounce && !gbufferWritten) {
+                    if (params.gbuffer.viewZ) {
+                        surf2Dwrite<float>(1.0e6f, params.gbuffer.viewZ, x * 4, y);
+                    }
+                    if (params.gbuffer.motionVectors) {
+                        ushort2 zero = make_ushort2(0, 0);
+                        surf2Dwrite<ushort2>(zero, params.gbuffer.motionVectors, x * 4, y);
+                    }
+                    gbufferWritten = true;
+                    firstBounce = false;
+                }
                 break;
             }
 
@@ -365,6 +381,7 @@ extern "C" __global__ void __raygen__path_trace()
                 mat.useSpecularGlossiness = 0;
                 mat.specularGlossAlphaIsGlossiness = 0;
                 mat.useFBXCustomPacking = 0;
+                mat.useFBXUEPacking = 0;
                 mat.specularColor = make_float3(1.0f, 1.0f, 1.0f);
                 mat.glossiness = 0.5f;
                 mat.pureDiffuse = 0;
@@ -397,6 +414,12 @@ extern "C" __global__ void __raygen__path_trace()
                     albedo = mat.specularColor;
                     mat.metallic = B;
                     mat.roughness = G;
+                } else if (mat.useFBXUEPacking && mat.specularGlossTex != 0) {
+                    float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
+                    float G = clampf(sg.y, 0.0f, 1.0f);
+                    float B = clampf(sg.z, 0.0f, 1.0f);
+                    mat.metallic  = B;
+                    mat.roughness = 1.0f - G;
                 } else {
                     float3 specRGB = mat.specularColor;
                     float  alphaG  = 1.0f;
@@ -445,21 +468,36 @@ extern "C" __global__ void __raygen__path_trace()
 
             if (firstBounce) {
                 if (!gbufferWritten) {
-                    if (params.aux.d_linearDepth)
-                        params.aux.d_linearDepth[pixelIdx] = dot(hit.position - camera.position, camera.forward);
-                    if (params.aux.d_albedo)
-                        params.aux.d_albedo[pixelIdx] = albedo;
-                    if (params.aux.d_normal)
-                        params.aux.d_normal[pixelIdx] = N;
-                    if (params.aux.d_motionVectors) {
-                        float3 clipCurr = mat4_transformPoint(camera.viewProjMatrix, hit.position);
-                        float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hit.position);
-                        float2 screenCurr = make_float2((clipCurr.x + 1.0f) * 0.5f * params.width,
-                                                         (1.0f - clipCurr.y) * 0.5f * params.height);
-                        float2 screenPrev = make_float2((clipPrev.x + 1.0f) * 0.5f * params.width,
-                                                         (1.0f - clipPrev.y) * 0.5f * params.height);
-                        params.aux.d_motionVectors[pixelIdx] = screenCurr - screenPrev;
+                    float viewZprim = dot(hit.position - camera.position, camera.forward);
+                    float3 clipCurr = mat4_transformPoint(camera.viewProjMatrix, hit.position);
+                    float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hit.position);
+                    float2 screenCurr = make_float2((clipCurr.x + 1.0f) * 0.5f * params.width,
+                                                     (1.0f - clipCurr.y) * 0.5f * params.height);
+                    float2 screenPrev = make_float2((clipPrev.x + 1.0f) * 0.5f * params.width,
+                                                     (1.0f - clipPrev.y) * 0.5f * params.height);
+                    float2 mvPx = screenCurr - screenPrev;
+
+                    if (params.aux.d_linearDepth)   params.aux.d_linearDepth[pixelIdx] = viewZprim;
+                    if (params.aux.d_albedo)        params.aux.d_albedo[pixelIdx]      = albedo;
+                    if (params.aux.d_normal)        params.aux.d_normal[pixelIdx]      = N;
+                    if (params.aux.d_motionVectors) params.aux.d_motionVectors[pixelIdx] = mvPx;
+
+                    // DLSSOnly / NRD: also write to Vulkan-shared surfaces so
+                    // post-processing can read them as VkImages directly. Only
+                    // the first-sample primary hit wins (averaging across SPP
+                    // would soften silhouettes and break temporal reprojection).
+                    if (params.gbuffer.viewZ) {
+                        surf2Dwrite<float>(viewZprim, params.gbuffer.viewZ, x * 4, y);  // R32F
                     }
+                    if (params.gbuffer.motionVectors) {
+                        __half hx = __float2half(mvPx.x);
+                        __half hy = __float2half(mvPx.y);
+                        ushort2 packed;
+                        packed.x = *reinterpret_cast<unsigned short*>(&hx);
+                        packed.y = *reinterpret_cast<unsigned short*>(&hy);
+                        surf2Dwrite<ushort2>(packed, params.gbuffer.motionVectors, x * 4, y);  // RG16F
+                    }
+
                     gbufferWritten = true;
                 }
                 firstBounce = false;
@@ -708,7 +746,24 @@ extern "C" __global__ void __raygen__path_trace()
     float4 sumTexel = make_float4(radianceSum.x, radianceSum.y, radianceSum.z, (float)samplesPerPixel);
     params.accum[pixelIdx] = params.accum[pixelIdx] + sumTexel;
     float invN = 1.0f / (float)(params.sampleIndex + samplesPerPixel);
-    params.output[pixelIdx] = params.accum[pixelIdx] * invN;
+    float4 hdr = params.accum[pixelIdx] * invN;
+    if (params.output) params.output[pixelIdx] = hdr;
+
+    // DLSSOnly: also publish HDR into the Vulkan-shared interop image so the
+    // post-processing chain can sample it. Packed as four halves matching the
+    // RGBA16F VkImage format of `m_hdrColor`.
+    if (params.gbuffer.hdrColor) {
+        __half hx = __float2half(hdr.x);
+        __half hy = __float2half(hdr.y);
+        __half hz = __float2half(hdr.z);
+        __half hw = __float2half(1.0f);
+        ushort4 p;
+        p.x = *reinterpret_cast<unsigned short*>(&hx);
+        p.y = *reinterpret_cast<unsigned short*>(&hy);
+        p.z = *reinterpret_cast<unsigned short*>(&hz);
+        p.w = *reinterpret_cast<unsigned short*>(&hw);
+        surf2Dwrite<ushort4>(p, params.gbuffer.hdrColor, x * 8, y);  // RGBA16F = 8B
+    }
 }
 
 // ── Miss: radiance ────────────────────────────────────────────

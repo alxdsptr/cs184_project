@@ -73,7 +73,7 @@ static void processNode(
         processNode(aiScn, node->mChildren[i], scene, baseDir, forcedMaterialIndex);
 }
 
-bool SceneLoader::load(const std::string& path, Scene& scene) {
+bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgMode) {
     std::string ext = lowerString(std::filesystem::path(path).extension().string());
     if (ext == ".pbrt") {
         return loadPbrtScene(path, scene);
@@ -312,12 +312,14 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
         // the texture accordingly: F0 = lerp(0.04, specularColor, B/255),
         // roughness = G/255. This gives differentiated reflections per-material
         // (B drives strength) and within-material detail (G drives roughness).
-        if (!mat.specularGlossTexPath.empty()
+        if (sgMode != SGWorkflowMode::Off
+            && !mat.specularGlossTexPath.empty()
             && mat.metallicRoughTexPath.empty()
             && !hasPbrMetallic)
         {
             mat.useSpecularGlossiness = true;
-            mat.useFBXCustomPacking = (ext == ".fbx");
+            mat.useFBXCustomPacking = (sgMode == SGWorkflowMode::FbxC4D);
+            mat.useFBXUEPacking     = (sgMode == SGWorkflowMode::FbxUE);
             mat.metallic = 0.0f;
 
             // Specular factor: legacy FBX stores F0 in COLOR_SPECULAR (linear).
@@ -389,11 +391,11 @@ bool SceneLoader::load(const std::string& path, Scene& scene) {
 
             mat.roughness = std::max(0.045f, 1.0f - mat.glossiness);
 
-            LOG_INFO("Material '%s': Specular-Glossiness workflow (specColor=(%.3f,%.3f,%.3f) glossiness=%.3f alphaIsGloss=%d fbxCustom=%d)",
+            LOG_INFO("Material '%s': Specular-Glossiness workflow (specColor=(%.3f,%.3f,%.3f) glossiness=%.3f alphaIsGloss=%d fbxCustom=%d fbxUE=%d)",
                      materialName.c_str(),
                      mat.specularColor.x, mat.specularColor.y, mat.specularColor.z,
                      mat.glossiness, (int)mat.specularGlossAlphaIsGlossiness,
-                     (int)mat.useFBXCustomPacking);
+                     (int)mat.useFBXCustomPacking, (int)mat.useFBXUEPacking);
         }
 
         // If the material has an emissive texture, it is explicitly meant to

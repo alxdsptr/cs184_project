@@ -39,6 +39,16 @@ struct PBRMaterial {
     // lerp(0.04, specularColor, B) and roughness is read from G directly.
     bool   useFBXCustomPacking = false;
 
+    // UE / standard PBR-Specular packing (Bistro and most NVIDIA-distributed
+    // FBX assets):
+    //   R = AO (often unused)
+    //   G = glossiness (NOT roughness — high G = smooth)
+    //   B = metallic mask (typically 0 or 255)
+    //   A = unused
+    // F0 still comes from baseColor through lerp(0.04, baseColor, metallic)
+    // — i.e. the metal's tint comes from the BaseColor texture.
+    bool   useFBXUEPacking = false;
+
     std::string albedoTexPath;
     std::string normalTexPath;
     std::string metallicRoughTexPath;
