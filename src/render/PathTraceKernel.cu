@@ -374,6 +374,16 @@ __global__ void pathTraceKernel(
             float3 n2 = scene.d_normals[i2];
             N = normalize(n0 * baryW + n1 * baryU + n2 * baryV);
         }
+        // Normal mapping: skip for glass so refraction stays on the geometric
+        // surface. For opaque surfaces, perturb before the back-face flip so
+        // the flip considers the perturbed orientation.
+        if (mat.transmission <= 0.0f && mat.normalTex != 0 && scene.d_tangents) {
+            float4 t0 = scene.d_tangents[i0];
+            float4 t1 = scene.d_tangents[i1];
+            float4 t2 = scene.d_tangents[i2];
+            float4 tangent = t0 * baryW + t1 * baryU + t2 * baryV;
+            N = applyNormalMap(N, tangent, mat.normalTex, texUV);
+        }
         // For glass, preserve the original normal orientation (frontFace is the ground truth).
         // For opaque surfaces, flip to face the ray as before.
         if (mat.transmission <= 0.0f) {

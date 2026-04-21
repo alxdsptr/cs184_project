@@ -394,6 +394,13 @@ extern "C" __global__ void __raygen__path_trace()
                 float3 n2 = scene.d_normals[i2];
                 N = normalize(n0 * baryW + n1 * baryU + n2 * baryV);
             }
+            if (mat.transmission <= 0.0f && mat.normalTex != 0 && scene.d_tangents) {
+                float4 t0 = scene.d_tangents[i0];
+                float4 t1 = scene.d_tangents[i1];
+                float4 t2 = scene.d_tangents[i2];
+                float4 tangent = t0 * baryW + t1 * baryU + t2 * baryV;
+                N = applyNormalMap(N, tangent, mat.normalTex, texUV);
+            }
             if (mat.transmission <= 0.0f) {
                 if (dot(N, ray.direction) > 0) N = -N;
             }

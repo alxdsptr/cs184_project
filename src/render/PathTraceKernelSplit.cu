@@ -238,6 +238,12 @@ __global__ void pathTraceKernelSplit(
         if (scene.d_normals) {
             N = normalize(scene.d_normals[i0] * baryW + scene.d_normals[i1] * baryU + scene.d_normals[i2] * baryV);
         }
+        if (mat.transmission <= 0.0f && mat.normalTex != 0 && scene.d_tangents) {
+            float4 tangent = scene.d_tangents[i0] * baryW
+                           + scene.d_tangents[i1] * baryU
+                           + scene.d_tangents[i2] * baryV;
+            N = applyNormalMap(N, tangent, mat.normalTex, texUV);
+        }
         if (mat.transmission <= 0.0f) {
             if (dot(N, ray.direction) > 0) N = -N;
         }
