@@ -7,6 +7,7 @@
 #include "gpu/Random.h"
 #include "gpu/Sampling.h"
 #include "gpu/BRDF.h"
+#include "gpu/SHEnv.cuh"
 #include "accel/BVH.h"
 #include "util/CudaCheck.h"
 
@@ -33,6 +34,22 @@ __device__ inline float3 sampleEnvironment(float3 dir, cudaTextureObject_t envMa
     float3 skyTop = make_float3(0.5f, 0.7f, 1.0f);
     float3 skyBot = make_float3(1.0f, 1.0f, 1.0f);
     return lerp(skyBot, skyTop, t) * 0.8f;
+}
+
+// Wrapper: uses L2 SH radiance reconstruction for indirect rays when enabled
+// — this is the cheap, noise-free path the user asked for. Primary rays (or
+// SH disabled / not precomputed) still read the full HDR texture.
+__device__ inline float3 sampleEnvironmentForBounce(
+    float3 dir,
+    cudaTextureObject_t envMap,
+    const float3* shCoeffs,
+    bool useSH,
+    bool isPrimary)
+{
+    if (useSH && shCoeffs && !isPrimary) {
+        return sh_evalRadiance(dir, shCoeffs);
+    }
+    return sampleEnvironment(dir, envMap);
 }
 
 // ── Ray generation ───────────────────────────────────────────
@@ -356,7 +373,14 @@ __global__ void pathTraceKernel(
 
         if (!didHit) {
             if (enableEnvironment) {
-                float3 envColor = sampleEnvironment(ray.direction, scene.envMapTex);
+                // Use SH shortcut for indirect non-delta bounces. Primary rays
+                // and delta (mirror/glass) bounces still see the full HDR to
+                // keep the directly-visible sky and mirror reflections sharp.
+                bool shForThisBounce = (bounce > 0) && !lastBounceDelta;
+                float3 envColor = sampleEnvironmentForBounce(
+                    ray.direction, scene.envMapTex,
+                    scene.d_shEnvCoeffs, scene.envUseSH != 0,
+                    !shForThisBounce);
                 // Clamp extremely bright HDR texels (sun etc.) to prevent
                 // fireflies when a path through glass hits a hot pixel.
                 float envLum = 0.2126f * envColor.x + 0.7152f * envColor.y + 0.0722f * envColor.z;

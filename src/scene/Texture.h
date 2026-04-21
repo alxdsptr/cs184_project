@@ -24,6 +24,13 @@ public:
     // Returns 0 on failure. Also outputs width/height for importance sampling.
     cudaTextureObject_t loadHDRTexture(const std::string& path, int& outWidth, int& outHeight);
 
+    // Project an HDR equirectangular environment map into L2 (9 coefficient)
+    // Spherical Harmonics radiance coefficients. Coefficient order matches
+    // `sh_basis9` in gpu/SHEnv.cuh. Returns false on load failure.
+    // Re-reads the HDR file via stb_image; the CUDA texture handle itself is
+    // opaque so we can't read back from the GPU-side array.
+    static bool projectEnvToSH(const std::string& path, float shCoeffsRGB[9][3]);
+
     void freeAll();
 
 private:

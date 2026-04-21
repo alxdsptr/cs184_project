@@ -375,6 +375,13 @@ void Application::processInput() {
     }
 }
 
+void Application::freeShEnvDevice() {
+    if (m_d_shEnvCoeffs) {
+        cudaFree(m_d_shEnvCoeffs);
+        m_d_shEnvCoeffs = nullptr;
+    }
+}
+
 void Application::loadEnvMap(const std::string& path) {
     if (path.empty()) return;
     int w = 0, h = 0;
@@ -382,6 +389,23 @@ void Application::loadEnvMap(const std::string& path) {
     if (tex != 0) {
         m_envMapTex = tex;
         LOG_INFO("Environment map loaded: %s (%dx%d)", path.c_str(), w, h);
+
+        // Precompute L2 SH diffuse irradiance coefficients for the new env map.
+        // Cheap (one-time CPU pass); drops the noisy env-diffuse sampling path
+        // on indirect bounces to a deterministic 9-coeff lookup.
+        float sh[9][3];
+        if (TextureManager::projectEnvToSH(path, sh)) {
+            float3 host[9];
+            for (int i = 0; i < 9; i++) {
+                host[i] = make_float3(sh[i][0], sh[i][1], sh[i][2]);
+            }
+            freeShEnvDevice();
+            CUDA_CHECK(cudaMalloc(&m_d_shEnvCoeffs, sizeof(float3) * 9));
+            CUDA_CHECK(cudaMemcpy(m_d_shEnvCoeffs, host,
+                                  sizeof(float3) * 9, cudaMemcpyHostToDevice));
+        } else {
+            freeShEnvDevice();
+        }
     } else {
         LOG_ERROR("Failed to load environment map: %s", path.c_str());
     }
@@ -392,6 +416,8 @@ void Application::renderSceneSample(uchar4* d_pbo, bool timeHeadless) {
         CameraParams camParams = m_camera.getParams(m_frameIndex);
         DeviceSceneData sceneData = m_backend->getSceneData();
         sceneData.envMapTex = m_envMapTex;
+        sceneData.d_shEnvCoeffs = m_d_shEnvCoeffs;
+        sceneData.envUseSH = (m_useSHEnvIrradiance && m_d_shEnvCoeffs) ? 1 : 0;
         m_renderer.renderFrame(camParams, sceneData, m_backend.get(), d_pbo,
                                m_enableEnvironment, m_maxBounces,
                                m_samplesPerFrame,
@@ -451,6 +477,17 @@ void Application::runGui() {
         bool f12Down = glfwGetKey(m_window, GLFW_KEY_F12) == GLFW_PRESS;
         bool saveScreenshot = f12Down && !m_prevF12Down;
         m_prevF12Down = f12Down;
+
+        // 'H' toggles SH environment irradiance shortcut (only takes effect
+        // when an env map is loaded and its SH has been precomputed).
+        bool shKeyDown = glfwGetKey(m_window, GLFW_KEY_H) == GLFW_PRESS;
+        if (shKeyDown && !m_prevSHKeyDown && !m_gui.wantCaptureKeyboard()) {
+            m_useSHEnvIrradiance = !m_useSHEnvIrradiance;
+            m_renderer.resetAccumulation();
+            LOG_INFO("SH env irradiance shortcut: %s",
+                     m_useSHEnvIrradiance ? "ON" : "OFF");
+        }
+        m_prevSHKeyDown = shKeyDown;
 
         uchar4* d_pbo = (uchar4*)m_display.mapForCUDA();
         renderSceneSample(d_pbo, false);
@@ -572,6 +609,7 @@ void Application::shutdown() {
     m_display.waitIdle();
     m_renderer.shutdown();
     m_textures.freeAll();
+    freeShEnvDevice();
     m_gui.shutdown();
     m_display.shutdown();
     glfwDestroyWindow(m_window);
