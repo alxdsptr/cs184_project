@@ -54,6 +54,10 @@ public:
     float  getMoveSpeed() const { return m_moveSpeed; }
     void   setMoveSpeed(float s) { m_moveSpeed = clampf(s, 0.05f, 200.0f); }
 
+    void lockMovementFrame();
+    void unlockMovementFrame() { m_frameLocked = false; }
+    bool isMovementFrameLocked() const { return m_frameLocked; }
+
 private:
     void rebuildMatrices();
 
@@ -76,4 +80,12 @@ private:
     float4x4 m_prevViewMatrix = float4x4::identity();
     float4x4 m_prevProjMatrix = float4x4::identity();
     bool     m_moved = false;
+
+    // Locked movement frame: when enabled, WASD/space/shift translate along
+    // these saved axes instead of the current camera basis. Mouse-look still
+    // rotates the view freely.
+    bool   m_frameLocked = false;
+    float3 m_lockedForward = make_float3(0, 0, -1);
+    float3 m_lockedRight   = make_float3(1, 0, 0);
+    float3 m_lockedUp      = make_float3(0, 1, 0);
 };

@@ -495,6 +495,23 @@ void Application::runGui() {
         }
         m_prevF1Down = f1Down;
 
+        // F2 freezes the current camera basis as the movement frame; WASD/
+        // space/shift then translate along the saved axes regardless of where
+        // the camera is looking. F3 releases it back to free-fly.
+        bool f2Down = glfwGetKey(m_window, GLFW_KEY_F2) == GLFW_PRESS;
+        if (f2Down && !m_prevF2Down) {
+            m_camera.lockMovementFrame();
+            LOG_INFO("Movement frame: LOCKED");
+        }
+        m_prevF2Down = f2Down;
+
+        bool f3Down = glfwGetKey(m_window, GLFW_KEY_F3) == GLFW_PRESS;
+        if (f3Down && !m_prevF3Down) {
+            m_camera.unlockMovementFrame();
+            LOG_INFO("Movement frame: FREE");
+        }
+        m_prevF3Down = f3Down;
+
         // 'H' toggles SH environment irradiance shortcut (only takes effect
         // when an env map is loaded and its SH has been precomputed).
         bool shKeyDown = glfwGetKey(m_window, GLFW_KEY_H) == GLFW_PRESS;
