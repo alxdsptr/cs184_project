@@ -947,10 +947,11 @@ extern "C" __global__ void __raygen__path_trace_split()
     uint32_t y = idx.y;
     if (x >= params.width || y >= params.height) return;
 
-    // ── DIAGNOSTIC LEVEL 8: ONLY normalRoughness (RGBA8). Test it in isolation.
-    if (params.splitNormalRoughness) {
-        uchar4 nr = make_uchar4(128, 255, 128, 128);
-        surf2Dwrite<uchar4>(nr, params.splitNormalRoughness, x * 4, y);
+    // ── DIAGNOSTIC LEVEL 9: ONLY albedo (RGBA8). If this works but normal
+    // (also RGBA8) crashes, it's the specific surface, not the format.
+    if (params.splitAlbedo) {
+        uchar4 a4 = make_uchar4(200, 100, 50, 255);
+        surf2Dwrite<uchar4>(a4, params.splitAlbedo, x * 4, y);
     }
     return;
     // ── Real body below (currently unreachable due to early return above).
