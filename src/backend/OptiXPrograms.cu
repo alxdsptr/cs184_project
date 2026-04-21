@@ -920,6 +920,26 @@ static __forceinline__ __device__ float3 clampFirefly_split(float3 c, float maxL
     return c;
 }
 
+// Lift packHalf4 out of the raygen body — lambdas inside OptiX raygen
+// functions have caused misaligned-stack issues in some toolchain versions.
+// Use the __half_as_ushort intrinsic (no pointer reinterpret) to avoid any
+// alignment ambiguity.
+static __forceinline__ __device__ ushort4 packHalf4_split(float4 v) {
+    ushort4 r;
+    r.x = __half_as_ushort(__float2half(v.x));
+    r.y = __half_as_ushort(__float2half(v.y));
+    r.z = __half_as_ushort(__float2half(v.z));
+    r.w = __half_as_ushort(__float2half(v.w));
+    return r;
+}
+
+static __forceinline__ __device__ ushort2 packHalf2_split(float x, float y) {
+    ushort2 r;
+    r.x = __half_as_ushort(__float2half(x));
+    r.y = __half_as_ushort(__float2half(y));
+    return r;
+}
+
 extern "C" __global__ void __raygen__path_trace_split()
 {
     uint3 idx = optixGetLaunchIndex();
@@ -1426,27 +1446,12 @@ extern "C" __global__ void __raygen__path_trace_split()
         1.0f);
     float4 emTexel = make_float4(emissiveAvg.x, emissiveAvg.y, emissiveAvg.z, 1.0f);
 
-    // surf2Dwrite needs sizeof(T) bytes at a byte offset. RGBA16F is 8 bytes →
-    // pack into ushort4 carrying four halves.
-    auto packHalf4 = [](float4 v) -> ushort4 {
-        __half hx = __float2half(v.x);
-        __half hy = __float2half(v.y);
-        __half hz = __float2half(v.z);
-        __half hw = __float2half(v.w);
-        ushort4 r;
-        r.x = *reinterpret_cast<unsigned short*>(&hx);
-        r.y = *reinterpret_cast<unsigned short*>(&hy);
-        r.z = *reinterpret_cast<unsigned short*>(&hz);
-        r.w = *reinterpret_cast<unsigned short*>(&hw);
-        return r;
-    };
-
     if (params.splitDiffuseRadianceHitDist) {
-        ushort4 p = packHalf4(diffTexel);
+        ushort4 p = packHalf4_split(diffTexel);
         surf2Dwrite<ushort4>(p, params.splitDiffuseRadianceHitDist, x * 8, y);
     }
     if (params.splitSpecularRadianceHitDist) {
-        ushort4 p = packHalf4(specTexel);
+        ushort4 p = packHalf4_split(specTexel);
         surf2Dwrite<ushort4>(p, params.splitSpecularRadianceHitDist, x * 8, y);
     }
     if (params.splitNormalRoughness) {
@@ -1460,11 +1465,7 @@ extern "C" __global__ void __raygen__path_trace_split()
     if (params.splitViewZ)
         surf2Dwrite<float>(outPrimaryViewZ, params.splitViewZ, x * 4, y);
     if (params.splitMotionVectors) {
-        __half hx = __float2half(outPrimaryMvPx.x);
-        __half hy = __float2half(outPrimaryMvPx.y);
-        ushort2 packed;
-        packed.x = *reinterpret_cast<unsigned short*>(&hx);
-        packed.y = *reinterpret_cast<unsigned short*>(&hy);
+        ushort2 packed = packHalf2_split(outPrimaryMvPx.x, outPrimaryMvPx.y);
         surf2Dwrite<ushort2>(packed, params.splitMotionVectors, x * 4, y);
     }
     if (params.splitAlbedo) {
@@ -1476,7 +1477,7 @@ extern "C" __global__ void __raygen__path_trace_split()
         surf2Dwrite<uchar4>(a4, params.splitAlbedo, x * 4, y);
     }
     if (params.splitEmissive) {
-        ushort4 p = packHalf4(emTexel);
+        ushort4 p = packHalf4_split(emTexel);
         surf2Dwrite<ushort4>(p, params.splitEmissive, x * 8, y);
     }
 }
