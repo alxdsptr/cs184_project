@@ -267,7 +267,9 @@ __global__ void pathTraceKernelSplit(
             mat.roughness = mat.roughness * mr.y;
             mat.metallic = mat.metallic * mr.z;
         }
-        // SG → MR per-pixel remap (see PathTraceKernel.cu for rationale).
+        // SG "soft" interpretation (see PathTraceKernel.cu for rationale): use
+        // only the spec map's luminance as a roughness hint; keep F0 dielectric
+        // and let BaseColor carry chromaticity.
         if (mat.useSpecularGlossiness) {
             float3 specRGB = mat.specularColor;
             float  alphaG  = 1.0f;
@@ -276,13 +278,12 @@ __global__ void pathTraceKernelSplit(
                 specRGB = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
                 alphaG  = sg.w;
             }
-            float metallicFromSpec = fmaxf(specRGB.x, fmaxf(specRGB.y, specRGB.z));
-            mat.metallic = clampf(metallicFromSpec, 0.0f, 1.0f);
-            albedo = lerp(albedo, specRGB, mat.metallic);
+            float specLum = 0.2126f * specRGB.x + 0.7152f * specRGB.y + 0.0722f * specRGB.z;
+            mat.metallic = 0.0f;
             float gloss = mat.specularGlossAlphaIsGlossiness
                             ? (mat.glossiness * alphaG)
-                            :  mat.glossiness;
-            mat.roughness = 1.0f - gloss;
+                            :  (mat.glossiness * specLum);
+            mat.roughness = 1.0f - clampf(gloss, 0.0f, 0.95f);
         }
         mat.roughness = fmaxf(mat.roughness, 0.045f);
         mat.metallic = clampf(mat.metallic, 0.0f, 1.0f);

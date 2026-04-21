@@ -413,17 +413,15 @@ __global__ void pathTraceKernel(
             mat.metallic = mat.metallic * mrTexel.z;
         }
 
-        // Specular-Glossiness → Metallic-Roughness remap. MEASURE_SEVEN's
-        // *_Specular.dds uses the spec map as a "metallic colour tint" rather
-        // than a literal F0 (e.g. a black-metal pipe with BaseColor=dark-olive
-        // and Specular=magenta — the magenta is the reflectance colour, not
-        // the dielectric F0). Treating it as raw F0 produces near-mirror
-        // surfaces with weird tints. Instead we remap per pixel:
-        //   metallic = max(spec.r, spec.g, spec.b)              -- saturated spec ⇒ metal
-        //   albedo'  = lerp(baseColour, spec.rgb, metallic)     -- metals reflect their colour
-        //   F0       = lerp(0.04, albedo', metallic)            -- standard MR substitution
-        // Roughness comes from glossiness × tex.a (when alpha carries data)
-        // or the scalar glossiness factor alone.
+        // Specular-Glossiness "soft" interpretation: the *_Specular.dds maps in
+        // Bistro and MEASURE_SEVEN are too ill-formed to interpret as literal
+        // F0 — endpoints come out as saturated magentas and primaries that, if
+        // taken at face value, render every shaded pixel as a tinted mirror.
+        // We instead use only the spec map's *luminance* as a roughness hint
+        // (bright spec → glossy, dark spec → rough), keep F0 at the dielectric
+        // 0.04 baseline, and let BaseColor carry all chromaticity. This loses
+        // the per-pixel F0 colour signal but produces visually correct results
+        // across both assets without per-asset hand-tuning.
         if (mat.useSpecularGlossiness) {
             float3 specRGB = mat.specularColor;
             float  alphaG  = 1.0f;
@@ -432,13 +430,12 @@ __global__ void pathTraceKernel(
                 specRGB = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
                 alphaG  = sg.w;
             }
-            float metallicFromSpec = fmaxf(specRGB.x, fmaxf(specRGB.y, specRGB.z));
-            mat.metallic = clampf(metallicFromSpec, 0.0f, 1.0f);
-            albedo = lerp(albedo, specRGB, mat.metallic);
+            float specLum = 0.2126f * specRGB.x + 0.7152f * specRGB.y + 0.0722f * specRGB.z;
+            mat.metallic = 0.0f;
             float gloss = mat.specularGlossAlphaIsGlossiness
                             ? (mat.glossiness * alphaG)
-                            :  mat.glossiness;
-            mat.roughness = 1.0f - gloss;
+                            :  (mat.glossiness * specLum);
+            mat.roughness = 1.0f - clampf(gloss, 0.0f, 0.95f);
         }
 
         // Clamp roughness/metallic to stable ranges for BRDF sampling/evaluation
