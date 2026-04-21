@@ -12,8 +12,13 @@ struct TextureData {
 
 class TextureManager {
 public:
-    // Load LDR image (PNG/JPG/DDS) as RGBA8, create CUDA texture object
-    cudaTextureObject_t loadTexture(const std::string& path);
+    // Load LDR image (PNG/JPG/DDS) as RGBA8, create CUDA texture object.
+    // When sRGB = true, creates an sRGB-format CUDA array so texel fetches
+    // are automatically gamma-decoded (sRGB → linear) by hardware. Use this
+    // for colour textures (albedo, emissive). Set sRGB = false for data
+    // textures (normal maps, metallic-roughness) where the values are already
+    // linear and must not be gamma-corrected.
+    cudaTextureObject_t loadTexture(const std::string& path, bool sRGB = false);
 
     // Load HDR image (.hdr/.exr) as float4, create CUDA texture object
     // Returns 0 on failure. Also outputs width/height for importance sampling.

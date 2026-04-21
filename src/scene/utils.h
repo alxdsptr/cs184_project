@@ -63,4 +63,14 @@ float rasterizeTriangleAvgLuminance(
     float2 uv0, float2 uv1, float2 uv2,
     const unsigned char* pixels, int width, int height);
 
+// Compute the average linear RGB over every texel of an RGBA8 texture. Used to
+// auto-normalise emissive material strengths — if a texture carries e.g. a
+// small bright logo on a mostly-black background, the returned luminance is
+// low and callers should boost emissionStrength accordingly so the logo
+// radiates a reasonable amount of light. sRGB -> linear conversion uses the
+// same cheap square approximation as rasterizeTriangleAvgLuminance (matches
+// what the GPU sampling path's sRGB-aware texture reads give us).
+float3 computeAverageTextureRGB(
+    const unsigned char* pixels, int width, int height);
+
 }

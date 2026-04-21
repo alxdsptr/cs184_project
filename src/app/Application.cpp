@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
+#include <map>
 #include <unordered_map>
 
 #include <imgui.h>
@@ -242,26 +243,30 @@ bool Application::loadScene(const std::string& path) {
     }
 
     // Load textures and bind CUDA texture objects per material.
-    std::unordered_map<std::string, cudaTextureObject_t> textureCache;
-    auto loadCachedTexture = [&](const std::string& texPath) -> cudaTextureObject_t {
+    // Cache key = (path, sRGB) since the same file may appear as both a
+    // colour texture (needs sRGB decode) and a data texture (must stay
+    // linear), and they need separate CUDA texture objects.
+    std::map<std::pair<std::string, bool>, cudaTextureObject_t> textureCache;
+    auto loadCachedTexture = [&](const std::string& texPath, bool sRGB) -> cudaTextureObject_t {
         if (texPath.empty()) {
             return 0;
         }
-        auto it = textureCache.find(texPath);
+        auto key = std::make_pair(texPath, sRGB);
+        auto it = textureCache.find(key);
         if (it != textureCache.end()) {
             return it->second;
         }
-        cudaTextureObject_t obj = m_textures.loadTexture(texPath);
-        textureCache.emplace(texPath, obj);
+        cudaTextureObject_t obj = m_textures.loadTexture(texPath, sRGB);
+        textureCache.emplace(key, obj);
         return obj;
     };
 
     auto& materials = m_scene.getMaterials();
     for (auto& mat : materials) {
-        mat.albedoTexObj = loadCachedTexture(mat.albedoTexPath);
-        mat.normalTexObj = loadCachedTexture(mat.normalTexPath);
-        mat.metallicRoughTexObj = loadCachedTexture(mat.metallicRoughTexPath);
-        mat.emissiveTexObj = loadCachedTexture(mat.emissiveTexPath);
+        mat.albedoTexObj        = loadCachedTexture(mat.albedoTexPath,        /*sRGB=*/true);
+        mat.normalTexObj        = loadCachedTexture(mat.normalTexPath,        /*sRGB=*/false);
+        mat.metallicRoughTexObj = loadCachedTexture(mat.metallicRoughTexPath, /*sRGB=*/false);
+        mat.emissiveTexObj      = loadCachedTexture(mat.emissiveTexPath,      /*sRGB=*/true);
     }
 
     // Back-fill emissive texture handles on area lights so NEE can fetch
