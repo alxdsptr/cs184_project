@@ -330,18 +330,28 @@ __global__ void pathTraceKernel(
     float3 radianceSum = make_float3(0, 0, 0);
     bool gbufferWritten = false;
 
+    // DLSSOnly publishes to `gbuffer.hdrColor`; in that path the sub-pixel
+    // offset must exactly match `camera.jitterOffset` (Halton) — DLSS does
+    // its own sub-pixel reconstruction and an extra per-sample random offset
+    // just feeds it noise it interprets as motion, producing ghosting.
+    const bool dlssPublish = (gbuffer.hdrColor != 0);
+
     for (uint32_t s = 0; s < samplesPerPixel; s++) {
     // Unique RNG subseed per (pixel, frame, sample-in-frame).
     uint32_t rng = pcg32_seed(pixelIdx * 0x9E3779B9u + s,
                               sampleIndex * 0x85EBCA6Bu + s);
 
-    // Sub-pixel jitter
-    float jx = pcg32_float(rng) - 0.5f;
-    float jy = pcg32_float(rng) - 0.5f;
-
-    // Add Halton jitter for DLSS
-    jx += camera.jitterOffset.x;
-    jy += camera.jitterOffset.y;
+    float jx, jy;
+    if (dlssPublish) {
+        jx = camera.jitterOffset.x;
+        jy = camera.jitterOffset.y;
+    } else {
+        // Native (no DLSS): per-sample random sub-pixel jitter for AA.
+        jx = pcg32_float(rng) - 0.5f;
+        jy = pcg32_float(rng) - 0.5f;
+        jx += camera.jitterOffset.x;
+        jy += camera.jitterOffset.y;
+    }
 
     Ray ray = generateRay(x, y, width, height, camera, jx, jy);
 
@@ -586,7 +596,11 @@ __global__ void pathTraceKernel(
                                                  (1.0f - clipCurr.y) * 0.5f * height);
                 float2 screenPrev = make_float2((clipPrev.x + 1.0f) * 0.5f * width,
                                                  (1.0f - clipPrev.y) * 0.5f * height);
-                float2 mvPx = screenCurr - screenPrev;
+                // DLSS / NRD MV convention: "where was this pixel last frame",
+                // i.e. `prev - curr`. With the opposite sign DLSS reprojects
+                // history in the wrong direction and smears moving content
+                // into a long ghost trail.
+                float2 mvPx = screenPrev - screenCurr;
 
                 if (auxBuffers.d_linearDepth)   auxBuffers.d_linearDepth[pixelIdx]   = viewZprim;
                 if (auxBuffers.d_albedo)        auxBuffers.d_albedo[pixelIdx]        = albedo;

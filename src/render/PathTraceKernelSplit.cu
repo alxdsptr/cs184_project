@@ -174,10 +174,14 @@ __global__ void pathTraceKernelSplit(
         uint32_t rng = pcg32_seed(pixelIdx * 0x9E3779B9u + s,
                                   sampleIndex * 0x85EBCA6Bu + s);
 
-    float jx = pcg32_float(rng) - 0.5f;
-    float jy = pcg32_float(rng) - 0.5f;
-    jx += camera.jitterOffset.x;
-    jy += camera.jitterOffset.y;
+    // NRD/DLSS require that the sub-pixel offset actually used at ray-gen
+    // exactly matches `CommonSettings::cameraJitter` (Halton). Adding a
+    // per-sample random offset here would make the real sample land
+    // somewhere else sub-pixel-wise, so NRD's history reprojection is off
+    // by up to a full pixel — manifesting as a persistent water-wave
+    // jitter on static frames.
+    float jx = camera.jitterOffset.x;
+    float jy = camera.jitterOffset.y;
 
     Ray ray = generateRay(x, y, width, height, camera, jx, jy);
 
