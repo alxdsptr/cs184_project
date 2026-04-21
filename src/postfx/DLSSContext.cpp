@@ -185,7 +185,12 @@ bool DLSSContext::createFeature(
     flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR *      (isHDR ? 1 : 0);
     flags |= NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;    // our MVs are at render (low) res
     flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted * 0; // we use linear view-space Z, not inverted clip
-    // Do NOT request jittered MVs or auto-exposure.
+    // We don't feed DLSS an explicit per-frame exposure texture, so enable
+    // its internal auto-exposure. Without this, preset J/K in HDR mode run
+    // without any exposure hint, which the programming guide explicitly
+    // calls out as a cause of ghosting on moving objects.
+    flags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    // Do NOT request jittered MVs.
     createParams.InFeatureCreateFlags = flags;
 
     NVSDK_NGX_Result r = NGX_VULKAN_CREATE_DLSS_EXT(
