@@ -58,6 +58,7 @@ void OptiXBackend::destroyAll() {
     if (m_sbtRecordsBuf) { cudaFree((void*)m_sbtRecordsBuf); m_sbtRecordsBuf = 0; }
     if (m_pipeline)       { optixPipelineDestroy(m_pipeline); m_pipeline = nullptr; }
     if (m_pgRaygen)       { optixProgramGroupDestroy(m_pgRaygen); m_pgRaygen = nullptr; }
+    if (m_pgRaygenSplit)  { optixProgramGroupDestroy(m_pgRaygenSplit); m_pgRaygenSplit = nullptr; }
     if (m_pgMissRadiance) { optixProgramGroupDestroy(m_pgMissRadiance); m_pgMissRadiance = nullptr; }
     if (m_pgMissShadow)   { optixProgramGroupDestroy(m_pgMissShadow); m_pgMissShadow = nullptr; }
     if (m_pgHitRadiance)  { optixProgramGroupDestroy(m_pgHitRadiance); m_pgHitRadiance = nullptr; }
@@ -183,6 +184,18 @@ bool OptiXBackend::loadModule(const std::string& optixirPath) {
     logSize = sizeof(logBuf);
     OPTIX_CHECK(optixProgramGroupCreate(m_ctx, &pgdRaygen, 1, &pgOptions, logBuf, &logSize, &m_pgRaygen));
 
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+    // Second raygen for NRD's split-output path trace. Same hit/miss programs;
+    // only the entry function differs. We pick which raygen to launch by
+    // swapping m_sbt.raygenRecord at launch time.
+    OptixProgramGroupDesc pgdRaygenSplit{};
+    pgdRaygenSplit.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+    pgdRaygenSplit.raygen.module = m_module;
+    pgdRaygenSplit.raygen.entryFunctionName = "__raygen__path_trace_split";
+    logSize = sizeof(logBuf);
+    OPTIX_CHECK(optixProgramGroupCreate(m_ctx, &pgdRaygenSplit, 1, &pgOptions, logBuf, &logSize, &m_pgRaygenSplit));
+#endif
+
     OptixProgramGroupDesc pgdMissR{};
     pgdMissR.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
     pgdMissR.miss.module = m_module;
@@ -215,10 +228,15 @@ bool OptiXBackend::loadModule(const std::string& optixirPath) {
 }
 
 bool OptiXBackend::buildPipeline() {
-    OptixProgramGroup groups[] = {
+    // Linker must see every program group whose record may sit in the SBT —
+    // including the optional split raygen.
+    std::vector<OptixProgramGroup> groups = {
         m_pgRaygen, m_pgMissRadiance, m_pgMissShadow,
         m_pgHitRadiance, m_pgHitShadow
     };
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+    if (m_pgRaygenSplit) groups.push_back(m_pgRaygenSplit);
+#endif
 
     OptixPipelineLinkOptions linkOptions{};
     linkOptions.maxTraceDepth = 2;  // primary trace can fire shadow trace
@@ -227,7 +245,7 @@ bool OptiXBackend::buildPipeline() {
     size_t logSize = sizeof(logBuf);
     OPTIX_CHECK(optixPipelineCreate(
         m_ctx, &m_pipelineCompileOptions, &linkOptions,
-        groups, (unsigned int)(sizeof(groups) / sizeof(groups[0])),
+        groups.data(), (unsigned int)groups.size(),
         logBuf, &logSize,
         &m_pipeline));
 
@@ -256,36 +274,58 @@ bool OptiXBackend::buildPipeline() {
 }
 
 bool OptiXBackend::buildSBT() {
-    // Layout: [raygen][missR][missS][hitR][hitS]
+    // Layout: [raygen][raygenSplit?][missR][missS][hitR][hitS]
+    // raygenSplit is included only when NRD/DLSS is compiled in.
     const size_t recSize = sizeof(RaygenRecord);  // all records same size (empty data)
-    const size_t total   = recSize * 5;
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+    const bool   haveSplit = (m_pgRaygenSplit != nullptr);
+#else
+    const bool   haveSplit = false;
+#endif
+    const uint32_t numRaygens = haveSplit ? 2u : 1u;
+    const size_t total = recSize * (numRaygens + 4u);
 
     CUDA_CHECK(cudaMalloc((void**)&m_sbtRecordsBuf, total));
 
     RaygenRecord raygenRec;
+    RaygenRecord raygenSplitRec;
     MissRecord   missR;
     MissRecord   missS;
     HitRecord_   hitR;
     HitRecord_   hitS;
     OPTIX_CHECK(optixSbtRecordPackHeader(m_pgRaygen,       &raygenRec));
+    if (haveSplit) {
+        OPTIX_CHECK(optixSbtRecordPackHeader(m_pgRaygenSplit, &raygenSplitRec));
+    }
     OPTIX_CHECK(optixSbtRecordPackHeader(m_pgMissRadiance, &missR));
     OPTIX_CHECK(optixSbtRecordPackHeader(m_pgMissShadow,   &missS));
     OPTIX_CHECK(optixSbtRecordPackHeader(m_pgHitRadiance,  &hitR));
     OPTIX_CHECK(optixSbtRecordPackHeader(m_pgHitShadow,    &hitS));
 
     char* base = (char*)m_sbtRecordsBuf;
-    CUDA_CHECK(cudaMemcpy(base + 0 * recSize, &raygenRec, recSize, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(base + 1 * recSize, &missR,     recSize, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(base + 2 * recSize, &missS,     recSize, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(base + 3 * recSize, &hitR,      recSize, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(base + 4 * recSize, &hitS,      recSize, cudaMemcpyHostToDevice));
+    size_t off = 0;
+    CUDA_CHECK(cudaMemcpy(base + off, &raygenRec, recSize, cudaMemcpyHostToDevice));
+    m_dRaygenRecord = (CUdeviceptr)(base + off);
+    off += recSize;
+    if (haveSplit) {
+        CUDA_CHECK(cudaMemcpy(base + off, &raygenSplitRec, recSize, cudaMemcpyHostToDevice));
+        m_dRaygenSplitRecord = (CUdeviceptr)(base + off);
+        off += recSize;
+    } else {
+        m_dRaygenSplitRecord = 0;
+    }
+    CUDA_CHECK(cudaMemcpy(base + off, &missR, recSize, cudaMemcpyHostToDevice)); off += recSize;
+    CUDA_CHECK(cudaMemcpy(base + off, &missS, recSize, cudaMemcpyHostToDevice)); off += recSize;
+    const CUdeviceptr hitBase = (CUdeviceptr)(base + off);
+    CUDA_CHECK(cudaMemcpy(base + off, &hitR,  recSize, cudaMemcpyHostToDevice)); off += recSize;
+    CUDA_CHECK(cudaMemcpy(base + off, &hitS,  recSize, cudaMemcpyHostToDevice)); off += recSize;
 
     std::memset(&m_sbt, 0, sizeof(m_sbt));
-    m_sbt.raygenRecord                = (CUdeviceptr)(base + 0 * recSize);
-    m_sbt.missRecordBase              = (CUdeviceptr)(base + 1 * recSize);
+    m_sbt.raygenRecord                = m_dRaygenRecord;  // default = regular raygen
+    m_sbt.missRecordBase              = (CUdeviceptr)(base + recSize * numRaygens);
     m_sbt.missRecordStrideInBytes     = (unsigned int)recSize;
     m_sbt.missRecordCount             = 2;
-    m_sbt.hitgroupRecordBase          = (CUdeviceptr)(base + 3 * recSize);
+    m_sbt.hitgroupRecordBase          = hitBase;
     m_sbt.hitgroupRecordStrideInBytes = (unsigned int)recSize;
     m_sbt.hitgroupRecordCount         = 2;
     return true;
@@ -408,6 +448,9 @@ void OptiXBackend::launchPathTrace(
     lp.enableEnvironment = enableEnvironment ? 1u : 0u;
     lp.handle  = m_gasHandle;
 
+    // Use the regular raygen (in case a previous call swapped to raygenSplit).
+    m_sbt.raygenRecord = m_dRaygenRecord;
+
     CUDA_CHECK(cudaMemcpyAsync(
         (void*)m_dLaunchParams, &lp, sizeof(lp),
         cudaMemcpyHostToDevice, m_stream));
@@ -419,6 +462,55 @@ void OptiXBackend::launchPathTrace(
         width, height, 1));
     CUDA_CHECK(cudaStreamSynchronize(m_stream));
 }
+
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+void OptiXBackend::launchPathTraceSplit(
+    const DeviceSceneData& scene,
+    const CameraParams& camera,
+    SplitSurfaceOutputs surfaces,
+    uint32_t width, uint32_t height,
+    uint32_t sampleIndex,
+    bool enableEnvironment,
+    uint32_t maxBounces,
+    uint32_t samplesPerPixel)
+{
+    if (!m_initialized || !m_gasHandle || !m_dRaygenSplitRecord) return;
+
+    LaunchParams lp;
+    std::memset(&lp, 0, sizeof(lp));
+    lp.scene   = scene;
+    lp.camera  = camera;
+    // accum/output/aux/gbuffer all unused by the split raygen — leave zeroed.
+    lp.splitDiffuseRadianceHitDist  = surfaces.diffuseRadianceHitDist;
+    lp.splitSpecularRadianceHitDist = surfaces.specularRadianceHitDist;
+    lp.splitNormalRoughness         = surfaces.normalRoughness;
+    lp.splitViewZ                   = surfaces.viewZ;
+    lp.splitMotionVectors           = surfaces.motionVectors;
+    lp.splitAlbedo                  = surfaces.albedo;
+    lp.splitEmissive                = surfaces.emissive;
+    lp.width       = width;
+    lp.height      = height;
+    lp.sampleIndex = sampleIndex;
+    lp.maxBounces  = maxBounces;
+    lp.spp         = samplesPerPixel < 1 ? 1 : samplesPerPixel;
+    lp.enableEnvironment = enableEnvironment ? 1u : 0u;
+    lp.handle      = m_gasHandle;
+
+    // Swap to the split raygen for this launch.
+    m_sbt.raygenRecord = m_dRaygenSplitRecord;
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        (void*)m_dLaunchParams, &lp, sizeof(lp),
+        cudaMemcpyHostToDevice, m_stream));
+
+    OPTIX_CHECK_VOID(optixLaunch(
+        m_pipeline, m_stream,
+        m_dLaunchParams, sizeof(LaunchParams),
+        &m_sbt,
+        width, height, 1));
+    CUDA_CHECK(cudaStreamSynchronize(m_stream));
+}
+#endif
 
 void OptiXBackend::traceOcclusionRays(
     const float3* /*d_origins*/,

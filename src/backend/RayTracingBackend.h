@@ -4,6 +4,10 @@
 #include "render/AuxBuffers.h"
 #include <cuda_runtime.h>
 
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+#include "render/PathTraceKernel.h"  // for SplitSurfaceOutputs
+#endif
+
 class Scene;
 
 class RayTracingBackend {
@@ -27,6 +31,23 @@ public:
         // bypasses `d_outputBuffer` and writes the HDR result there instead.
         PrimaryHitSurfaces gbufferSurfaces = {}
     ) = 0;
+
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+    // NRD modes: render demodulated diffuse + specular + g-buffer into the
+    // Vulkan-shared aux images. CUDA backend uses a SAH-BVH kernel; OptiX
+    // backend uses a dedicated split raygen with the same algorithm. Separate
+    // entry point so each backend can use its own acceleration structure
+    // (CUDA BVH vs OptiX GAS) without the caller knowing or caring.
+    virtual void launchPathTraceSplit(
+        const DeviceSceneData& scene,
+        const CameraParams& camera,
+        SplitSurfaceOutputs surfaces,
+        uint32_t width, uint32_t height,
+        uint32_t sampleIndex,
+        bool enableEnvironment,
+        uint32_t maxBounces,
+        uint32_t samplesPerPixel = 1) = 0;
+#endif
 
     // BDPT-ready: visibility test for connection strategies
     virtual void traceOcclusionRays(

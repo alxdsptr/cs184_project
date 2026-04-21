@@ -10,6 +10,7 @@
 #include <surface_indirect_functions.h>
 
 #include "backend/OptiXLaunchParams.h"
+#include "gpu/NRDHelpers.cuh"
 #include "core/Math.h"
 #include "core/Halton.h"
 #include "gpu/AreaLightGPU.h"
@@ -838,4 +839,644 @@ extern "C" __global__ void __anyhit__shadow()
     // Opaque hit: terminate.
     optixSetPayload_3(1);
     optixTerminateRay();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Split-output raygen (NRD).
+// Mirrors PathTraceKernelSplit.cu's algorithm but uses optixTrace + the same
+// hit/miss/anyhit programs as the regular raygen above. Writes 7 Vulkan-shared
+// surfaces (diff/spec radiance + g-buffer) instead of an HDR accum buffer.
+//
+// Per-pixel SPP averaging happens in this raygen (NRD wants the mean, and
+// averaging cuts single-sample bucket spikes that read as ripples after
+// temporal filtering). Each spp-loop iteration does one full path.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Lobe-only BRDF evaluators (port of bsdfDiffuseLobe / bsdfSpecularLobe in
+// PathTraceKernelSplit.cu). Used at the primary hit when forcing NEE/BSDF
+// to the picked bucket, so that diff_bucket * albedo + spec_bucket recovers
+// the full primary-hit radiance.
+static __forceinline__ __device__ float3 splitDiffuseLobe(
+    const float3& N, const float3& V, const float3& L,
+    const float3& albedo, float roughness, float metallic)
+{
+    (void)roughness;
+    float NdotL = fmaxf(dot(N, L), 0.0f);
+    float NdotV = fmaxf(dot(N, V), 0.0f);
+    if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0,0,0);
+    float3 H = normalize(V + L);
+    float LdotH = fmaxf(dot(L, H), 0.0f);
+    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, metallic);
+    float3 F  = fresnelSchlick_local(LdotH, F0);
+    float3 kd = (make_float3(1,1,1) - F) * (1.0f - metallic);
+    return kd * albedo * (1.0f / M_PI_F);
+}
+
+static __forceinline__ __device__ float3 splitSpecularLobe(
+    const float3& N, const float3& V, const float3& L,
+    const float3& albedo, float roughness, float metallic)
+{
+    float NdotL = fmaxf(dot(N, L), 0.0f);
+    float NdotV = fmaxf(dot(N, V), 0.0f);
+    if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0,0,0);
+    float3 H = normalize(V + L);
+    float NdotH = fmaxf(dot(N, H), 0.0f);
+    float LdotH = fmaxf(dot(L, H), 0.0f);
+    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, metallic);
+    float3 F  = fresnelSchlick_local(LdotH, F0);
+    float D_val = ggxD_local(NdotH, roughness);
+    float alpha = roughness * roughness;
+    float G_val = smithG1_GGX(NdotL, alpha) * smithG1_GGX(NdotV, alpha);
+    return F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
+}
+
+static __forceinline__ __device__ float3 materialDiffuseLobe_split(
+    const GPUMaterial& mat,
+    const float3& N, const float3& V, const float3& L, const float3& albedo)
+{
+    if (mat.pureDiffuse) {
+        float NdotL = fmaxf(dot(N, L), 0.0f);
+        float NdotV = fmaxf(dot(N, V), 0.0f);
+        if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0, 0, 0);
+        return albedo * (1.0f / M_PI_F);
+    }
+    return splitDiffuseLobe(N, V, L, albedo, mat.roughness, mat.metallic);
+}
+
+static __forceinline__ __device__ float3 materialSpecularLobe_split(
+    const GPUMaterial& mat,
+    const float3& N, const float3& V, const float3& L, const float3& albedo)
+{
+    if (mat.pureDiffuse) return make_float3(0, 0, 0);
+    return splitSpecularLobe(N, V, L, albedo, mat.roughness, mat.metallic);
+}
+
+// Per-contribution firefly clamp (luminance-bounded). RELAX is sensitive to
+// single-sample spikes that survive temporal filtering for many frames as
+// shimmering specks ("water ripples"); clamp each NEE / emissive contribution.
+static __forceinline__ __device__ float3 clampFirefly_split(float3 c, float maxLum) {
+    float lum = 0.2126f*c.x + 0.7152f*c.y + 0.0722f*c.z;
+    if (lum > maxLum && lum > 1e-7f) c = c * (maxLum / lum);
+    return c;
+}
+
+extern "C" __global__ void __raygen__path_trace_split()
+{
+    uint3 idx = optixGetLaunchIndex();
+    uint32_t x = idx.x;
+    uint32_t y = idx.y;
+    if (x >= params.width || y >= params.height) return;
+    uint32_t pixelIdx = y * params.width + x;
+
+    const DeviceSceneData& scene  = params.scene;
+    const CameraParams&    camera = params.camera;
+    uint32_t samplesPerPixel = params.spp < 1u ? 1u : params.spp;
+    uint32_t maxBounces      = params.maxBounces;
+    bool enableEnvironment   = params.enableEnvironment != 0;
+    OptixTraversableHandle handle = params.handle;
+
+    // Per-pixel accumulators across spp.
+    float3 demodDiffSum = make_float3(0, 0, 0);
+    float3 demodSpecSum = make_float3(0, 0, 0);
+    float3 emissiveSum  = make_float3(0, 0, 0);
+    float  diffHitSum = 0.0f; uint32_t diffHitCount = 0;
+    float  specHitSum = 0.0f; uint32_t specHitCount = 0;
+
+    bool   gbufferWritten = false;
+    float3 outPrimaryAlbedo    = make_float3(0, 0, 0);
+    float3 outPrimaryNormal    = make_float3(0, 1, 0);
+    float  outPrimaryRoughness = 1.0f;
+    float  outPrimaryViewZ     = 0.0f;
+    float2 outPrimaryMvPx      = make_float2(0.0f, 0.0f);
+
+    for (uint32_t s = 0; s < samplesPerPixel; s++) {
+        uint32_t rng = pcg32_seed(pixelIdx * 0x9E3779B9u + s,
+                                  params.sampleIndex * 0x85EBCA6Bu + s);
+
+        float jx = pcg32_float(rng) - 0.5f;
+        float jy = pcg32_float(rng) - 0.5f;
+        jx += camera.jitterOffset.x;
+        jy += camera.jitterOffset.y;
+
+        Ray ray = generateRay(x, y, params.width, params.height, camera, jx, jy);
+
+        float3 throughput      = make_float3(1, 1, 1);
+        float3 pathRadiance    = make_float3(0, 0, 0);
+        float3 emissiveContrib = make_float3(0, 0, 0);
+
+        // Per-sample primary-hit state for bucket classification.
+        bool haveGbuffer = false;
+        float3 primaryAlbedo    = make_float3(0, 0, 0);
+        float3 primaryNormal    = make_float3(0, 1, 0);
+        float  primaryRoughness = 1.0f;
+        float  primaryViewZ     = 0.0f;
+        float2 primaryMvPx      = make_float2(0.0f, 0.0f);
+        int    pickedBucket     = 0;       // 0 = diff, 1 = spec
+        float  bucketHitDist    = 0.0f;
+        bool   bucketHitDistSet = false;
+
+        bool firstBounce      = true;
+        bool lastBounceDelta  = false;
+        bool havePrevSurface  = false;
+        float3 prevSurfacePos = make_float3(0, 0, 0);
+        float prevBsdfPdf     = 1.0f;
+
+        for (uint32_t bounce = 0; bounce < maxBounces; bounce++) {
+            // Whether the primary lobe override is active this iteration.
+            bool primaryLobeOverride = false;
+
+            RadiancePayload rp = traceRadianceRay(
+                handle, ray.origin, ray.direction, ray.tmin, ray.tmax);
+            bool didHit = (rp.hit != 0);
+
+            if (!didHit) {
+                if (enableEnvironment) {
+                    bool shForThisBounce = (bounce > 0) && !lastBounceDelta;
+                    float3 envColor = sampleEnvironmentForBounce(
+                        ray.direction, scene.envMapTex,
+                        scene.d_shEnvCoeffs, scene.envUseSH != 0,
+                        !shForThisBounce);
+                    float envLum = 0.2126f*envColor.x + 0.7152f*envColor.y + 0.0722f*envColor.z;
+                    if (envLum > 20.0f) envColor = envColor * (20.0f / envLum);
+                    pathRadiance += clampFirefly_split(throughput * envColor, 10.0f);
+                }
+                // Sky pixel sentinel viewZ — only the first sample's miss wins.
+                if (firstBounce && !haveGbuffer) {
+                    primaryViewZ = 1.0e6f;
+                    primaryMvPx  = make_float2(0.0f, 0.0f);
+                    // Don't set haveGbuffer — sky pixels don't contribute to
+                    // diff/spec bucket and must not trigger the demodulation
+                    // path below. We still want a sentinel viewZ written, so
+                    // capture it via outPrimary fields directly.
+                    if (!gbufferWritten) {
+                        outPrimaryViewZ = primaryViewZ;
+                        outPrimaryMvPx  = primaryMvPx;
+                        // Leave normal/roughness/albedo at their defaults.
+                    }
+                }
+                break;
+            }
+
+            // Reconstruct hit record from payload + scene buffers.
+            HitRecord hit;
+            hit.t              = rp.tHit;
+            hit.primitiveIndex = (int)rp.primIdx;
+            float baryU = rp.baryU;
+            float baryV = rp.baryV;
+            float baryW = 1.0f - baryU - baryV;
+
+            uint32_t triIdx = rp.primIdx;
+            uint32_t i0 = scene.d_indices[triIdx * 3 + 0];
+            uint32_t i1 = scene.d_indices[triIdx * 3 + 1];
+            uint32_t i2 = scene.d_indices[triIdx * 3 + 2];
+            float3 v0 = scene.d_positions[i0];
+            float3 v1 = scene.d_positions[i1];
+            float3 v2 = scene.d_positions[i2];
+            hit.position = v0 * baryW + v1 * baryU + v2 * baryV;
+
+            float3 geomN = normalize(cross(v1 - v0, v2 - v0));
+            hit.shadingNormal = geomN;
+            hit.normal        = geomN;
+            hit.frontFace = (dot(ray.direction, geomN) < 0.0f);
+            hit.uv = make_float2(baryU, baryV);
+            hit.materialIndex = scene.d_materialIndices ? scene.d_materialIndices[triIdx] : -1;
+
+            GPUMaterial mat;
+            if (hit.materialIndex >= 0 && (uint32_t)hit.materialIndex < scene.materialCount)
+                mat = scene.d_materials[hit.materialIndex];
+            else {
+                mat.albedo = make_float3(0.8f, 0.2f, 0.8f);
+                mat.roughness = 0.5f; mat.metallic = 0.0f;
+                mat.emission = make_float3(0,0,0); mat.emissionStrength = 0.0f;
+                mat.ior = 1.5f; mat.transmission = 0.0f;
+                mat.albedoTex = 0; mat.metallicRoughTex = 0;
+                mat.emissiveTex = 0; mat.normalTex = 0; mat.specularGlossTex = 0;
+                mat.useSpecularGlossiness = 0; mat.specularGlossAlphaIsGlossiness = 0;
+                mat.useFBXCustomPacking = 0; mat.useFBXUEPacking = 0;
+                mat.specularColor = make_float3(1.0f, 1.0f, 1.0f);
+                mat.glossiness = 0.5f; mat.pureDiffuse = 0;
+            }
+
+            float2 texUV = make_float2(0.0f, 0.0f);
+            if (scene.d_uvs) {
+                float2 uv0 = scene.d_uvs[i0];
+                float2 uv1 = scene.d_uvs[i1];
+                float2 uv2 = scene.d_uvs[i2];
+                texUV = uv0 * baryW + uv1 * baryU + uv2 * baryV;
+            }
+
+            float3 albedo = mat.albedo;
+            if (mat.albedoTex != 0) {
+                float4 tc = tex2D<float4>(mat.albedoTex, texUV.x, texUV.y);
+                albedo = make_float3(tc.x, tc.y, tc.z);
+            }
+            if (mat.metallicRoughTex != 0) {
+                float4 mr = tex2D<float4>(mat.metallicRoughTex, texUV.x, texUV.y);
+                mat.roughness = mat.roughness * mr.y;
+                mat.metallic  = mat.metallic  * mr.z;
+            }
+            // SG remap (mirrors regular OptiX raygen).
+            if (mat.useSpecularGlossiness) {
+                if (mat.useFBXCustomPacking && mat.specularGlossTex != 0) {
+                    float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
+                    float B = clampf(sg.z, 0.0f, 1.0f);
+                    float G = clampf(sg.y, 0.0f, 1.0f);
+                    albedo = mat.specularColor;
+                    mat.metallic = B; mat.roughness = G;
+                } else if (mat.useFBXUEPacking && mat.specularGlossTex != 0) {
+                    float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
+                    float G = clampf(sg.y, 0.0f, 1.0f);
+                    float B = clampf(sg.z, 0.0f, 1.0f);
+                    mat.metallic = B; mat.roughness = 1.0f - G;
+                } else {
+                    float3 specRGB = mat.specularColor;
+                    float  alphaG  = 1.0f;
+                    if (mat.specularGlossTex != 0) {
+                        float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
+                        specRGB = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
+                        alphaG  = sg.w;
+                    }
+                    float specLum = 0.2126f * specRGB.x + 0.7152f * specRGB.y + 0.0722f * specRGB.z;
+                    specLum = clampf(specLum, 0.0f, 1.0f);
+                    float specStrength = sqrtf(specLum);
+                    float F0_target = 0.04f + 0.56f * specStrength;
+                    mat.metallic = clampf((F0_target - 0.04f) / 0.96f, 0.0f, 1.0f);
+                    float gloss = mat.specularGlossAlphaIsGlossiness
+                                    ? (mat.glossiness * alphaG) : specStrength;
+                    mat.roughness = 1.0f - clampf(gloss, 0.0f, 0.95f);
+                }
+            }
+            mat.roughness = fmaxf(mat.roughness, 0.045f);
+            mat.metallic  = clampf(mat.metallic, 0.0f, 1.0f);
+
+            float3 emissiveColor = mat.emission;
+            if (mat.emissiveTex != 0) {
+                float4 et = tex2D<float4>(mat.emissiveTex, texUV.x, texUV.y);
+                emissiveColor = make_float3(et.x, et.y, et.z);
+            }
+
+            float3 N = hit.shadingNormal;
+            if (scene.d_normals) {
+                float3 n0 = scene.d_normals[i0];
+                float3 n1 = scene.d_normals[i1];
+                float3 n2 = scene.d_normals[i2];
+                N = normalize(n0 * baryW + n1 * baryU + n2 * baryV);
+            }
+            if (mat.transmission <= 0.0f && mat.normalTex != 0 && scene.d_tangents) {
+                float4 t0 = scene.d_tangents[i0];
+                float4 t1 = scene.d_tangents[i1];
+                float4 t2 = scene.d_tangents[i2];
+                float4 tangent = t0 * baryW + t1 * baryU + t2 * baryV;
+                N = applyNormalMap(N, tangent, mat.normalTex, texUV);
+            }
+            if (mat.transmission <= 0.0f) {
+                if (dot(N, ray.direction) > 0) N = -N;
+            }
+
+            // Primary-hit g-buffer capture + bucket classification.
+            if (firstBounce) {
+                primaryAlbedo    = albedo;
+                primaryNormal    = N;
+                primaryRoughness = mat.roughness;
+                primaryViewZ     = nrd_helpers::computeViewZ(hit.position, camera.position, camera.forward);
+                primaryMvPx      = nrd_helpers::computeMotionVectorPx(
+                    hit.position, camera.viewProjMatrix, camera.prevViewProjMatrix,
+                    params.width, params.height);
+
+                float3 V = -ray.direction;
+                float specProb = materialSpecProb(mat, N, V, albedo);
+                pickedBucket = (pcg32_float(rng) < specProb) ? 1 : 0;
+                float pickedP = (pickedBucket == 1) ? specProb : (1.0f - specProb);
+                throughput = throughput * (1.0f / fmaxf(pickedP, 1e-4f));
+
+                haveGbuffer = true;
+                firstBounce = false;
+                primaryLobeOverride = true;
+            }
+
+            // Glass / transmissive (delta BSDF — never affects bucket classification).
+            if (mat.transmission > 0.0f) {
+                bool entering = hit.frontFace;
+                float3 Nglass = entering ? N : -N;
+                if (dot(Nglass, ray.direction) > 0.0f) Nglass = -Nglass;
+                float eta = (entering ? 1.0f : mat.ior) / (entering ? mat.ior : 1.0f);
+                float cosI = fmaxf(dot(-ray.direction, Nglass), 0.0f);
+                float Fr = fresnelDielectric(cosI, eta);
+                float3 newDir;
+                if (pcg32_float(rng) < Fr) {
+                    newDir = normalize(ray.direction - Nglass * (2.0f * dot(ray.direction, Nglass)));
+                } else if (!refractDir(ray.direction, Nglass, eta, newDir)) {
+                    newDir = normalize(ray.direction - Nglass * (2.0f * dot(ray.direction, Nglass)));
+                }
+                if (!entering) {
+                    float lum = 0.2126f*albedo.x + 0.7152f*albedo.y + 0.0722f*albedo.z;
+                    if (lum < 0.9f) throughput = throughput * albedo;
+                }
+                float3 off = (dot(newDir, Nglass) > 0.0f) ? Nglass : -Nglass;
+                ray.origin = hit.position + off * 0.002f;
+                ray.direction = newDir;
+                ray.tmin = 0.001f; ray.tmax = 1e30f;
+                lastBounceDelta = true;
+                prevSurfacePos = hit.position; prevBsdfPdf = 1.0f; havePrevSurface = true;
+                if (bounce >= 6 && pcg32_float(rng) > 0.9f) break;
+                continue;
+            }
+
+            // First indirect surface distance (drives RELAX spatial filter radius).
+            if (!bucketHitDistSet && bounce == 1) {
+                bucketHitDist = hit.t;
+                bucketHitDistSet = true;
+            }
+
+            bool isEmissive = mat.emissionStrength > 0.0f &&
+                (emissiveColor.x > 0.0f || emissiveColor.y > 0.0f || emissiveColor.z > 0.0f);
+            if (isEmissive) {
+                float3 Le = emissiveColor * mat.emissionStrength;
+                float weight = 1.0f;
+                if (bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
+                    int ali = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
+                    if (ali >= 0 && scene.d_areaLights && scene.areaLightCount > 0) {
+                        GPUAreaLight light = scene.d_areaLights[ali];
+                        float3 toL = hit.position - prevSurfacePos;
+                        float d2 = fmaxf(dot(toL, toL), 1e-6f);
+                        float3 wi = normalize(toL);
+                        float lNdot = fmaxf(dot(light.normal, -wi), 0.0f);
+                        if (lNdot > 0.0f) {
+                            float pTri = light.weight / fmaxf(scene.areaLightTotalWeight, 1e-7f);
+                            float pArea = pTri / fmaxf(light.area, 1e-7f);
+                            float pLight = pArea * d2 / fmaxf(lNdot, 1e-7f);
+                            weight = powerHeuristic(prevBsdfPdf, pLight);
+                        }
+                    }
+                }
+                if (bounce == 0) {
+                    emissiveContrib = Le * weight;   // Primary emissive — separate image.
+                } else {
+                    pathRadiance += clampFirefly_split(throughput * Le * weight, 10.0f);
+                }
+                if (mat.emissiveTex == 0) break;
+            }
+
+            // NEE area lights.
+            if (scene.d_areaLights && scene.areaLightCount > 0 &&
+                scene.d_areaLightCDF && scene.areaLightTotalWeight > 0.0f)
+            {
+                uint32_t li = sampleAreaLightIndex(scene.d_areaLightCDF, scene.areaLightCount,
+                                                   pcg32_float(rng));
+                GPUAreaLight light = scene.d_areaLights[li];
+                float r1 = pcg32_float(rng), r2 = pcg32_float(rng);
+                float su = sqrtf(r1);
+                float b0 = 1.0f - su;
+                float b1 = su * (1.0f - r2);
+                float b2 = su * r2;
+                float3 lp = light.v0 * b0
+                          + (light.v0 + light.e1) * b1
+                          + (light.v0 + light.e2) * b2;
+                float3 toL = lp - hit.position;
+                float d2 = fmaxf(dot(toL, toL), 1e-6f);
+                float d  = sqrtf(d2);
+                float3 Ld = toL * (1.0f / d);
+                float NdotL = fmaxf(dot(N, Ld), 0.0f);
+                float lNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
+                if (NdotL > 0.0f && lNdot > 0.0f) {
+                    float3 shadowOrigin = hit.position + N * 0.001f;
+                    float shadowTmax = fmaxf(d - 0.002f, 0.001f);
+                    float3 st = traceShadowRay(handle, shadowOrigin, Ld, 0.001f, shadowTmax);
+                    float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
+                    if (slum > 1e-6f) {
+                        float pTri = light.weight / scene.areaLightTotalWeight;
+                        float pArea = pTri / fmaxf(light.area, 1e-7f);
+                        float pdfOmega = pArea * d2 / fmaxf(lNdot, 1e-7f);
+                        float3 V = -ray.direction;
+                        float3 brdf;
+                        float pdfBs;
+                        if (primaryLobeOverride) {
+                            if (pickedBucket == 0) {
+                                brdf  = materialDiffuseLobe_split(mat, N, V, Ld, albedo);
+                                pdfBs = bsdfDiffusePdf(NdotL);
+                            } else {
+                                brdf  = materialSpecularLobe_split(mat, N, V, Ld, albedo);
+                                pdfBs = bsdfSpecularPdf(N, V, Ld, mat.roughness);
+                            }
+                        } else {
+                            brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
+                            float spP = materialSpecProb(mat, N, V, albedo);
+                            pdfBs = materialMixturePdf(mat, N, V, Ld, spP);
+                        }
+                        float w = powerHeuristic(pdfOmega, pdfBs);
+                        float3 Le = sampleAreaLightLe(light, b0, b1, b2);
+                        float3 neeContrib = throughput * st * brdf * Le *
+                                            (NdotL / fmaxf(pdfOmega, 1e-7f)) * w;
+                        pathRadiance += clampFirefly_split(neeContrib, 10.0f);
+                    }
+                }
+            }
+
+            // Point lights (delta emitters; sampled in addition to area lights).
+            if (scene.d_pointLights && scene.pointLightCount > 0) {
+                float3 V = -ray.direction;
+                float3 direct = make_float3(0,0,0);
+                for (uint32_t li = 0; li < scene.pointLightCount; li++) {
+                    GPUPointLight light = scene.d_pointLights[li];
+                    float3 toL = light.position - hit.position;
+                    float d2 = fmaxf(dot(toL, toL), 1e-6f);
+                    float d  = sqrtf(d2);
+                    float3 Ld = toL * (1.0f / d);
+                    float NdotL = fmaxf(dot(N, Ld), 0.0f);
+                    if (NdotL <= 0.0f) continue;
+                    float3 shadowOrigin = hit.position + N * 0.001f;
+                    float shadowTmax = fmaxf(d - 0.002f, 0.001f);
+                    float3 st = traceShadowRay(handle, shadowOrigin, Ld, 0.001f, shadowTmax);
+                    float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
+                    if (slum < 1e-6f) continue;
+                    float attenDen = light.constantAttenuation
+                                   + light.linearAttenuation  * d
+                                   + light.quadraticAttenuation * d2;
+                    float atten = 1.0f / fmaxf(attenDen, 1e-4f);
+                    float3 Li = light.color * (light.intensity * atten);
+                    float3 brdf;
+                    if (primaryLobeOverride) {
+                        brdf = (pickedBucket == 0)
+                            ? materialDiffuseLobe_split(mat, N, V, Ld, albedo)
+                            : materialSpecularLobe_split(mat, N, V, Ld, albedo);
+                    } else {
+                        brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
+                    }
+                    direct += clampFirefly_split(brdf * st * Li * NdotL, 10.0f);
+                }
+                pathRadiance += throughput * direct;
+            }
+
+            // BSDF sampling for next bounce. Forced lobe at primary hit.
+            float3 V = -ray.direction;
+            float specProb = materialSpecProb(mat, N, V, albedo);
+            float3 newDir;
+            bool sampleSpecular;
+            if (primaryLobeOverride) {
+                sampleSpecular = (pickedBucket == 1);
+            } else {
+                sampleSpecular = (pcg32_float(rng) < specProb);
+            }
+            if (sampleSpecular) {
+                float a = mat.roughness * mat.roughness;
+                float u1 = pcg32_float(rng), u2 = pcg32_float(rng);
+                float cosT = sqrtf((1.0f - u1) / (1.0f + (a*a - 1.0f)*u1 + 1e-7f));
+                float sinT = sqrtf(fmaxf(0.0f, 1.0f - cosT*cosT));
+                float phi  = 2.0f * M_PI_F * u2;
+                float3 lH  = make_float3(sinT*cosf(phi), cosT, sinT*sinf(phi));
+                float3 T, B; buildONB(N, T, B);
+                float3 H = localToWorld(lH, T, N, B);
+                newDir = normalize(ray.direction - H * (2.0f * dot(ray.direction, H)));
+                lastBounceDelta = false;
+            } else {
+                float u1 = pcg32_float(rng), u2 = pcg32_float(rng);
+                float dummy;
+                float3 lD = sampleCosineHemisphere(u1, u2, dummy);
+                float3 T, B; buildONB(N, T, B);
+                newDir = localToWorld(lD, T, N, B);
+                lastBounceDelta = false;
+            }
+            float NdotLn = dot(N, newDir);
+            if (NdotLn < 1e-6f) break;
+            float pdf;
+            float3 brdf;
+            if (primaryLobeOverride) {
+                if (pickedBucket == 0) {
+                    pdf  = bsdfDiffusePdf(NdotLn);
+                    brdf = materialDiffuseLobe_split(mat, N, V, newDir, albedo);
+                } else {
+                    pdf  = bsdfSpecularPdf(N, V, newDir, mat.roughness);
+                    brdf = materialSpecularLobe_split(mat, N, V, newDir, albedo);
+                }
+            } else {
+                pdf  = materialMixturePdf(mat, N, V, newDir, specProb);
+                brdf = materialBsdfEvaluate(mat, N, V, newDir, albedo);
+            }
+            if (pdf < 1e-7f) break;
+            throughput = throughput * brdf * (NdotLn / (pdf + 1e-7f));
+            prevSurfacePos = hit.position; prevBsdfPdf = pdf; havePrevSurface = true;
+            if (bounce >= 2) {
+                float lum = 0.2126f*throughput.x + 0.7152f*throughput.y + 0.0722f*throughput.z;
+                float p = fminf(fmaxf(lum, 0.05f), 0.95f);
+                if (pcg32_float(rng) >= p) break;
+                throughput = throughput * (1.0f / p);
+            }
+            ray.origin    = hit.position + N * 0.001f;
+            ray.direction = newDir;
+            ray.tmin      = 0.001f;
+            ray.tmax      = 1e30f;
+        } // end bounce loop
+
+        // Sanitize + clamp per channel (matches CUDA split kernel).
+        if (isnan(pathRadiance.x) || isnan(pathRadiance.y) || isnan(pathRadiance.z) ||
+            isinf(pathRadiance.x) || isinf(pathRadiance.y) || isinf(pathRadiance.z)) {
+            pathRadiance = make_float3(0,0,0);
+        }
+        pathRadiance.x = fminf(fmaxf(pathRadiance.x, 0.0f), 15.0f);
+        pathRadiance.y = fminf(fmaxf(pathRadiance.y, 0.0f), 15.0f);
+        pathRadiance.z = fminf(fmaxf(pathRadiance.z, 0.0f), 15.0f);
+
+        // Demodulate by albedo (NRD wants irradiance — composite remultiplies).
+        float3 demodDiff = make_float3(0,0,0);
+        float3 demodSpec = make_float3(0,0,0);
+        if (haveGbuffer) {
+            if (pickedBucket == 0) {
+                float3 invA = make_float3(
+                    1.0f / fmaxf(primaryAlbedo.x, 1e-3f),
+                    1.0f / fmaxf(primaryAlbedo.y, 1e-3f),
+                    1.0f / fmaxf(primaryAlbedo.z, 1e-3f));
+                demodDiff = pathRadiance * invA;
+            } else {
+                demodSpec = pathRadiance;
+            }
+        }
+
+        demodDiffSum = demodDiffSum + demodDiff;
+        demodSpecSum = demodSpecSum + demodSpec;
+        emissiveSum  = emissiveSum  + emissiveContrib;
+        if (haveGbuffer && bucketHitDistSet) {
+            if (pickedBucket == 0) { diffHitSum += bucketHitDist; diffHitCount++; }
+            else                    { specHitSum += bucketHitDist; specHitCount++; }
+        }
+        if (!gbufferWritten && haveGbuffer) {
+            outPrimaryAlbedo    = primaryAlbedo;
+            outPrimaryNormal    = primaryNormal;
+            outPrimaryRoughness = primaryRoughness;
+            outPrimaryViewZ     = primaryViewZ;
+            outPrimaryMvPx      = primaryMvPx;
+            gbufferWritten = true;
+        }
+    } // end spp loop
+
+    // Average per-pixel radiance across spp.
+    float invSpp = 1.0f / (float)samplesPerPixel;
+    float3 demodDiffAvg = demodDiffSum * invSpp;
+    float3 demodSpecAvg = demodSpecSum * invSpp;
+    float3 emissiveAvg  = emissiveSum  * invSpp;
+    float diffHitAvg = diffHitCount > 0 ? (diffHitSum / (float)diffHitCount) : 0.0f;
+    float specHitAvg = specHitCount > 0 ? (specHitSum / (float)specHitCount) : 0.0f;
+
+    float4 diffTexel = nrd_helpers::packRadianceHitDist(demodDiffAvg, diffHitAvg);
+    float4 specTexel = nrd_helpers::packRadianceHitDist(demodSpecAvg, specHitAvg);
+    float4 normTexel = nrd_helpers::packNormalRoughness(outPrimaryNormal, outPrimaryRoughness);
+    float4 albTexel  = make_float4(
+        fminf(fmaxf(outPrimaryAlbedo.x, 0.0f), 1.0f),
+        fminf(fmaxf(outPrimaryAlbedo.y, 0.0f), 1.0f),
+        fminf(fmaxf(outPrimaryAlbedo.z, 0.0f), 1.0f),
+        1.0f);
+    float4 emTexel = make_float4(emissiveAvg.x, emissiveAvg.y, emissiveAvg.z, 1.0f);
+
+    // surf2Dwrite needs sizeof(T) bytes at a byte offset. RGBA16F is 8 bytes →
+    // pack into ushort4 carrying four halves.
+    auto packHalf4 = [](float4 v) -> ushort4 {
+        __half hx = __float2half(v.x);
+        __half hy = __float2half(v.y);
+        __half hz = __float2half(v.z);
+        __half hw = __float2half(v.w);
+        ushort4 r;
+        r.x = *reinterpret_cast<unsigned short*>(&hx);
+        r.y = *reinterpret_cast<unsigned short*>(&hy);
+        r.z = *reinterpret_cast<unsigned short*>(&hz);
+        r.w = *reinterpret_cast<unsigned short*>(&hw);
+        return r;
+    };
+
+    if (params.splitDiffuseRadianceHitDist) {
+        ushort4 p = packHalf4(diffTexel);
+        surf2Dwrite<ushort4>(p, params.splitDiffuseRadianceHitDist, x * 8, y);
+    }
+    if (params.splitSpecularRadianceHitDist) {
+        ushort4 p = packHalf4(specTexel);
+        surf2Dwrite<ushort4>(p, params.splitSpecularRadianceHitDist, x * 8, y);
+    }
+    if (params.splitNormalRoughness) {
+        uchar4 nr;
+        nr.x = (unsigned char)(normTexel.x * 255.0f + 0.5f);
+        nr.y = (unsigned char)(normTexel.y * 255.0f + 0.5f);
+        nr.z = (unsigned char)(normTexel.z * 255.0f + 0.5f);
+        nr.w = (unsigned char)(normTexel.w * 255.0f + 0.5f);
+        surf2Dwrite<uchar4>(nr, params.splitNormalRoughness, x * 4, y);
+    }
+    if (params.splitViewZ)
+        surf2Dwrite<float>(outPrimaryViewZ, params.splitViewZ, x * 4, y);
+    if (params.splitMotionVectors) {
+        __half hx = __float2half(outPrimaryMvPx.x);
+        __half hy = __float2half(outPrimaryMvPx.y);
+        ushort2 packed;
+        packed.x = *reinterpret_cast<unsigned short*>(&hx);
+        packed.y = *reinterpret_cast<unsigned short*>(&hy);
+        surf2Dwrite<ushort2>(packed, params.splitMotionVectors, x * 4, y);
+    }
+    if (params.splitAlbedo) {
+        uchar4 a4;
+        a4.x = (unsigned char)(albTexel.x * 255.0f + 0.5f);
+        a4.y = (unsigned char)(albTexel.y * 255.0f + 0.5f);
+        a4.z = (unsigned char)(albTexel.z * 255.0f + 0.5f);
+        a4.w = 255;
+        surf2Dwrite<uchar4>(a4, params.splitAlbedo, x * 4, y);
+    }
+    if (params.splitEmissive) {
+        ushort4 p = packHalf4(emTexel);
+        surf2Dwrite<ushort4>(p, params.splitEmissive, x * 8, y);
+    }
 }
