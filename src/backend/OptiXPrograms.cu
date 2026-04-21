@@ -940,25 +940,24 @@ static __forceinline__ __device__ ushort2 packHalf2_split(float x, float y) {
     return r;
 }
 
+// Workaround: surf2Dwrite<uchar4> in OptiX-compiled device code emits a
+// PTX store that faults with "misaligned address" on Ampere+ (verified on
+// RTX 4070, OptiX 9.0). Writing the same 4 bytes as a uint32_t works.
+// Same byte layout (LE: byte0=r, byte1=g, byte2=b, byte3=a).
+static __forceinline__ __device__ uint32_t packRGBA8(float r, float g, float b, float a) {
+    uint32_t br = (uint32_t)(fminf(fmaxf(r, 0.0f), 1.0f) * 255.0f + 0.5f);
+    uint32_t bg = (uint32_t)(fminf(fmaxf(g, 0.0f), 1.0f) * 255.0f + 0.5f);
+    uint32_t bb = (uint32_t)(fminf(fmaxf(b, 0.0f), 1.0f) * 255.0f + 0.5f);
+    uint32_t ba = (uint32_t)(fminf(fmaxf(a, 0.0f), 1.0f) * 255.0f + 0.5f);
+    return (ba << 24) | (bb << 16) | (bg << 8) | br;
+}
+
 extern "C" __global__ void __raygen__path_trace_split()
 {
     uint3 idx = optixGetLaunchIndex();
     uint32_t x = idx.x;
     uint32_t y = idx.y;
     if (x >= params.width || y >= params.height) return;
-
-    // ── DIAGNOSTIC LEVEL 10: write RGBA8 as uint (pack manually).
-    // OptiX device codegen for surf2Dwrite<uchar4> appears to mis-emit a
-    // misaligned PTX instruction. Writing as uint32_t (same byte layout)
-    // works around it.
-    if (params.splitAlbedo) {
-        uint32_t packed = ((uint32_t)255 << 24) | ((uint32_t)50 << 16) |
-                          ((uint32_t)100 << 8) | (uint32_t)200;
-        surf2Dwrite<uint32_t>(packed, params.splitAlbedo, x * 4, y);
-    }
-    return;
-    // ── Real body below (currently unreachable due to early return above).
-    {
     uint32_t pixelIdx = y * params.width + x;
 
     const DeviceSceneData& scene  = params.scene;
@@ -1468,12 +1467,8 @@ extern "C" __global__ void __raygen__path_trace_split()
         surf2Dwrite<ushort4>(p, params.splitSpecularRadianceHitDist, x * 8, y);
     }
     if (params.splitNormalRoughness) {
-        uchar4 nr;
-        nr.x = (unsigned char)(normTexel.x * 255.0f + 0.5f);
-        nr.y = (unsigned char)(normTexel.y * 255.0f + 0.5f);
-        nr.z = (unsigned char)(normTexel.z * 255.0f + 0.5f);
-        nr.w = (unsigned char)(normTexel.w * 255.0f + 0.5f);
-        surf2Dwrite<uchar4>(nr, params.splitNormalRoughness, x * 4, y);
+        uint32_t packed = packRGBA8(normTexel.x, normTexel.y, normTexel.z, normTexel.w);
+        surf2Dwrite<uint32_t>(packed, params.splitNormalRoughness, x * 4, y);
     }
     if (params.splitViewZ)
         surf2Dwrite<float>(outPrimaryViewZ, params.splitViewZ, x * 4, y);
@@ -1482,16 +1477,11 @@ extern "C" __global__ void __raygen__path_trace_split()
         surf2Dwrite<ushort2>(packed, params.splitMotionVectors, x * 4, y);
     }
     if (params.splitAlbedo) {
-        uchar4 a4;
-        a4.x = (unsigned char)(albTexel.x * 255.0f + 0.5f);
-        a4.y = (unsigned char)(albTexel.y * 255.0f + 0.5f);
-        a4.z = (unsigned char)(albTexel.z * 255.0f + 0.5f);
-        a4.w = 255;
-        surf2Dwrite<uchar4>(a4, params.splitAlbedo, x * 4, y);
+        uint32_t packed = packRGBA8(albTexel.x, albTexel.y, albTexel.z, 1.0f);
+        surf2Dwrite<uint32_t>(packed, params.splitAlbedo, x * 4, y);
     }
     if (params.splitEmissive) {
         ushort4 p = packHalf4_split(emTexel);
         surf2Dwrite<ushort4>(p, params.splitEmissive, x * 8, y);
     }
-    } // end DIAGNOSTIC unreachable block
 }
