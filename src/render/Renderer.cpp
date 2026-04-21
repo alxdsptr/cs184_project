@@ -388,10 +388,13 @@ void Renderer::shutdown() {
 void Renderer::setDLSSQuality(DLSSQuality q) {
     if (q == m_dlssQuality) return;
     m_dlssQuality = q;
-    // If we're currently in NRDDLSS, reinitialize to pick the new quality's
-    // render resolution.
-    if (m_mode == Mode::NRDDLSS && m_display) {
-        setMode(Mode::NRDDLSS, m_display);
+    // Re-init the active DLSS-using mode so DLSS picks the new quality's
+    // render resolution. setMode() short-circuits on (mode==current); bounce
+    // through Native to force a full teardown + rebuild. Cheap (few ms).
+    if ((m_mode == Mode::NRDDLSS || m_mode == Mode::DLSSOnly) && m_display) {
+        Mode prev = m_mode;
+        setMode(Mode::Native, m_display);
+        setMode(prev,         m_display);
     }
 }
 

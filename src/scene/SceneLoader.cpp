@@ -564,9 +564,15 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         // Skip lights that the COLLADA file marks as area lights via the CGL
         // <extra> extension — those are provided by an emissive mesh elsewhere
         // in the scene, and loading them here would double-count the emitter.
-        if (!colladaCGLAreaLights.empty() &&
-            colladaCGLAreaLights.count(aiL->mName.C_Str()) > 0) {
-            LOG_INFO("Skipping point light '%s': COLLADA marks it as CGL area light",
+        // If the file contains ANY CGL area-light markers we skip every point
+        // light in the file: name matching against Assimp's aiLight::mName is
+        // unreliable across Assimp versions (it may hold the light id, the
+        // instancing node's id, or the node's name), and .dae files that use
+        // the CGL extension are authored so the real illumination comes from
+        // emissive mesh geometry — keeping the point light on top double-lit
+        // the scene (visible on CBbunny.dae as a washed-out look).
+        if (!colladaCGLAreaLights.empty()) {
+            LOG_INFO("Skipping point light '%s': COLLADA file uses CGL area-light extension",
                      aiL->mName.C_Str());
             continue;
         }
