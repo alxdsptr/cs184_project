@@ -947,9 +947,12 @@ extern "C" __global__ void __raygen__path_trace_split()
     uint32_t y = idx.y;
     if (x >= params.width || y >= params.height) return;
 
-    // ── DIAGNOSTIC LEVEL 2: do absolutely nothing. If THIS still crashes,
-    // the bug is not in the raygen body — it's in the SBT, the pipeline
-    // link, or how the second raygen program group itself is configured.
+    // ── DIAGNOSTIC LEVEL 3: only test viewZ surface write (R32F = simplest).
+    // If this works → surface object is valid, format alignment is OK for R32F.
+    // If this crashes → bug is in surf2Dwrite for R32F or this surface.
+    if (params.splitViewZ) {
+        surf2Dwrite<float>(2.0f, params.splitViewZ, x * 4, y);
+    }
     return;
     // ── Real body below (currently unreachable due to early return above).
     {
