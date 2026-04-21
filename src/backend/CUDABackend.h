@@ -16,7 +16,8 @@ public:
         uint32_t sampleIndex,
         bool enableEnvironment,
         uint32_t maxBounces,
-        uint32_t samplesPerPixel = 1
+        uint32_t samplesPerPixel = 1,
+        PrimaryHitSurfaces gbufferSurfaces = {}
     ) override;
     void traceOcclusionRays(
         const float3* d_origins,

@@ -15,7 +15,8 @@ void launchPathTraceKernel(
     uint32_t sampleIndex,
     bool enableEnvironment,
     uint32_t maxBounces,
-    uint32_t samplesPerPixel = 1  // spp per kernel invocation
+    uint32_t samplesPerPixel = 1,  // spp per kernel invocation
+    PrimaryHitSurfaces gbufferSurfaces = {}  // optional Vulkan-shared writes for DLSSOnly
 );
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED

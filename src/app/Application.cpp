@@ -225,6 +225,7 @@ bool Application::init(uint32_t width, uint32_t height, const std::string& title
         Renderer::Mode rm = Renderer::Mode::Native;
         if (m_initialMode == 1) rm = Renderer::Mode::NRDOnly;
         else if (m_initialMode == 2) rm = Renderer::Mode::NRDDLSS;
+        else if (m_initialMode == 3) rm = Renderer::Mode::DLSSOnly;
         LOG_INFO("Applying initial renderer mode: %d", m_initialMode);
         m_renderer.setMode(rm, &m_display);
     }
@@ -237,7 +238,7 @@ bool Application::loadScene(const std::string& path) {
     m_textures.freeAll();
 
     m_scene = Scene{};
-    if (!SceneLoader::load(path, m_scene)) {
+    if (!SceneLoader::load(path, m_scene, m_sgMode)) {
         LOG_ERROR("Failed to load scene: %s", path.c_str());
         return false;
     }

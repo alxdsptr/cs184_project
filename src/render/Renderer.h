@@ -23,9 +23,10 @@ class VulkanSharedAuxBuffers;
 class Renderer {
 public:
     enum class Mode {
-        Native,    // = today's behaviour (CUDA tonemap, direct blit)
-        NRDOnly,   // denoise with NRD, composite+tonemap in Vulkan
-        NRDDLSS,   // NRD → composite linear HDR → DLSS upscale → tonemap
+        Native,     // = today's behaviour (CUDA tonemap, direct blit)
+        NRDOnly,    // denoise with NRD, composite+tonemap in Vulkan
+        NRDDLSS,    // NRD → composite linear HDR → DLSS upscale → tonemap
+        DLSSOnly,   // path tracer → HDR interop → DLSS upscale → tonemap (no NRD)
     };
 
     Renderer();
@@ -74,7 +75,12 @@ public:
 private:
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
     // Mode init / teardown helpers.
-    bool initNrdPath(VulkanDisplay* display, uint32_t renderW, uint32_t renderH);
+    // `withNrd=false` skips NRD itself but still allocates the shared aux
+    // images + LDR framebuffer + composite pass — used by DLSSOnly mode where
+    // the path tracer writes HDR directly into the shared interop image and
+    // DLSS upscales it without going through any denoiser.
+    bool initNrdPath(VulkanDisplay* display, uint32_t renderW, uint32_t renderH,
+                     bool withNrd = true);
     void shutdownNrdPath();
     bool initDlssPath(VulkanDisplay* display, uint32_t outputW, uint32_t outputH);
     void shutdownDlssPath();
@@ -82,6 +88,8 @@ private:
     // into the active command buffer just before the swapchain blit.
     static void prePresentTrampoline(VkCommandBuffer cmd, void* user);
     void        recordPrePresent(VkCommandBuffer cmd);
+    // DLSSOnly fast path: HDR interop image → DLSS upscale → tonemap.
+    void        recordDlssOnlyPrePresent(VkCommandBuffer cmd);
 #endif
 
     AccumulationBuffer m_accumBuffer;

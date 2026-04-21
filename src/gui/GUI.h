@@ -14,7 +14,7 @@ public:
 
     void beginFrame();
     // Optional `renderMode` / `dlssQuality` appear as GUI controls when non-null.
-    // `renderMode`: 0 = Native, 1 = NRD only, 2 = NRD + DLSS.
+    // `renderMode`: 0 = Native, 1 = NRD only, 2 = NRD + DLSS, 3 = DLSS only.
     // `dlssQuality`: 0 = Perf, 1 = Balanced, 2 = Quality, 3 = DLAA.
     // `renderResW/H` are informational readouts (the render resolution DLSS
     // picked). Callers may pass 0.

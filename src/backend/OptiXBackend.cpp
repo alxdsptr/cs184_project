@@ -387,7 +387,8 @@ void OptiXBackend::launchPathTrace(
     uint32_t sampleIndex,
     bool enableEnvironment,
     uint32_t maxBounces,
-    uint32_t samplesPerPixel)
+    uint32_t samplesPerPixel,
+    PrimaryHitSurfaces gbufferSurfaces)
 {
     if (!m_initialized || !m_gasHandle) return;
 
@@ -398,6 +399,7 @@ void OptiXBackend::launchPathTrace(
     lp.accum   = d_accumBuffer;
     lp.output  = d_outputBuffer;
     lp.aux     = auxBuffers;
+    lp.gbuffer = gbufferSurfaces;
     lp.width   = width;
     lp.height  = height;
     lp.sampleIndex = sampleIndex;

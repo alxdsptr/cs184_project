@@ -20,7 +20,12 @@ public:
         uint32_t sampleIndex,
         bool enableEnvironment,
         uint32_t maxBounces,
-        uint32_t samplesPerPixel = 1
+        uint32_t samplesPerPixel = 1,
+        // DLSSOnly: also write motion/viewZ/HDR into Vulkan-shared surfaces.
+        // All-zero (default) → Native behaviour: only the CUDA buffers are
+        // written. When `gbufferSurfaces.hdrColor` is non-zero, the kernel
+        // bypasses `d_outputBuffer` and writes the HDR result there instead.
+        PrimaryHitSurfaces gbufferSurfaces = {}
     ) = 0;
 
     // BDPT-ready: visibility test for connection strategies

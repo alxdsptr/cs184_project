@@ -15,7 +15,7 @@ int main(int argc, char** argv) {
     uint32_t maxBounces = 8;
     uint32_t samples = 1;
     uint32_t samplesPerFrame = 1;  // spp per realtime frame (independent of `-s`)
-    int initialMode = -1;  // -1=default, 0=Native, 1=NRDOnly, 2=NRDDLSS
+    int initialMode = -1;  // -1=default, 0=Native, 1=NRDOnly, 2=NRDDLSS, 3=DLSSOnly
     int backendKind = 0;   // 0=CUDA, 1=OptiX
     SGWorkflowMode sgMode = SGWorkflowMode::Off;
 

@@ -19,6 +19,12 @@ struct LaunchParams {
     float4*         output;
     AuxBufferPtrs   aux;
 
+    // Optional Vulkan-shared surfaces written at the primary hit. Used in
+    // DLSSOnly / NRD modes so DLSS / NRD can read motion / viewZ as VkImages
+    // without an extra copy. When `gbuffer.hdrColor != 0`, the raygen writes
+    // the per-pixel HDR result there in addition to (or instead of) `output`.
+    PrimaryHitSurfaces gbuffer;
+
     unsigned int    width;
     unsigned int    height;
     unsigned int    sampleIndex;

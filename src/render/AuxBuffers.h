@@ -9,6 +9,16 @@ struct AuxBufferPtrs {
     float3* d_normal        = nullptr;
 };
 
+// Optional CUDA-Vulkan interop surfaces written at the primary hit. Used in
+// DLSSOnly mode (and NRD modes via the split kernel) so DLSS / NRD can read
+// motion / viewZ as VkImages without an extra copy. If a field is 0, the
+// corresponding write is skipped — Native mode passes all zeros.
+struct PrimaryHitSurfaces {
+    cudaSurfaceObject_t motionVectors = 0;  // RG16F, pixel-space delta
+    cudaSurfaceObject_t viewZ         = 0;  // R32F,  linear meters
+    cudaSurfaceObject_t hdrColor      = 0;  // RGBA16F, accumulated HDR (replaces d_outputBuffer when set)
+};
+
 class AuxBuffers {
 public:
     void init(uint32_t width, uint32_t height);
