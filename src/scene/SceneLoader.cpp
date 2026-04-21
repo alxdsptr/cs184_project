@@ -418,15 +418,26 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
             mat.emission = make_float3(1.0f, 1.0f, 1.0f);
 
             const DecodedEmissiveTex& dt = getDecodedEmissive(mat.emissiveTexPath);
-            if (dt.valid && dt.avgLum > 1e-6f) {
-                float strength = kTargetTexturedEmissiveLum / dt.avgLum;
+            // Normalise against the MAX RGB channel, not luminance. A saturated
+            // red/blue texture has tiny luminance (R and B are weighted 0.21
+            // and 0.07 in Rec.709), so matching luminance would demand a huge
+            // strength and blow the dominant channel way past a neutral white
+            // lamp of the same perceptual brightness — Bistro's pink/red
+            // string lights end up visibly brighter than white ones. Using
+            // max(R,G,B) keeps the brightest channel at a consistent level
+            // across hues, which matches the "no channel hotter than X"
+            // expectation artists actually have.
+            float normMetric = std::max(dt.avgRGB.x,
+                                        std::max(dt.avgRGB.y, dt.avgRGB.z));
+            if (dt.valid && normMetric > 1e-6f) {
+                float strength = kTargetTexturedEmissiveLum / normMetric;
                 strength = std::max(kMinEmissionStrength,
                                     std::min(kMaxEmissionStrength, strength));
                 mat.emissionStrength = strength;
                 LOG_INFO("Material '%s': adaptive emissionStrength=%.2f "
-                         "(avgTexLum=%.4f, target=%.2f)",
-                         materialName.c_str(), strength, dt.avgLum,
-                         kTargetTexturedEmissiveLum);
+                         "(avgMaxRGB=%.4f, avgLum=%.4f, target=%.2f)",
+                         materialName.c_str(), strength, normMetric,
+                         dt.avgLum, kTargetTexturedEmissiveLum);
             } else if (dt.valid && dt.avgLum <= 1e-6f) {
                 // Texture is entirely black — the material isn't actually
                 // emissive even though the FBX tagged it so. Skip it rather
