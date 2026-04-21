@@ -420,7 +420,24 @@ void VulkanDisplay::createSwapchain() {
     m_width  = extent.width;
     m_height = extent.height;
 
+    // Prefer MAILBOX (tear-free, no frame-rate cap) over FIFO (hard vsync cap).
+    // MAILBOX is optional, so query and fall back to FIFO (always supported).
+    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    uint32_t pmCount = 0;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(m_physicalDevice, m_surface, &pmCount, nullptr);
+    std::vector<VkPresentModeKHR> pms(pmCount);
+    vkGetPhysicalDeviceSurfacePresentModesKHR(m_physicalDevice, m_surface, &pmCount, pms.data());
+    for (auto pm : pms) {
+        if (pm == VK_PRESENT_MODE_MAILBOX_KHR) { presentMode = pm; break; }
+    }
+    LOG_INFO("Swapchain present mode: %s",
+             presentMode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : "FIFO");
+
+    // MAILBOX needs ≥3 images to actually decouple render rate from refresh rate.
     m_minImageCount = caps.minImageCount + 1;
+    if (presentMode == VK_PRESENT_MODE_MAILBOX_KHR && m_minImageCount < 3) {
+        m_minImageCount = 3;
+    }
     if (caps.maxImageCount > 0 && m_minImageCount > caps.maxImageCount) {
         m_minImageCount = caps.maxImageCount;
     }
@@ -436,7 +453,7 @@ void VulkanDisplay::createSwapchain() {
     sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     sci.preTransform     = caps.currentTransform;
     sci.compositeAlpha   = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    sci.presentMode      = VK_PRESENT_MODE_FIFO_KHR;  // vsync; guaranteed available
+    sci.presentMode      = presentMode;
     sci.clipped          = VK_TRUE;
 
     VK_CHECK(vkCreateSwapchainKHR(m_device, &sci, nullptr, &m_swapchain));
