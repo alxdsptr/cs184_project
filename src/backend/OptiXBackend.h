@@ -34,6 +34,18 @@ public:
         PrimaryHitSurfaces gbufferSurfaces = {}
     ) override;
 
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+    void launchPathTraceSplit(
+        const DeviceSceneData& scene,
+        const CameraParams& camera,
+        SplitSurfaceOutputs surfaces,
+        uint32_t width, uint32_t height,
+        uint32_t sampleIndex,
+        bool enableEnvironment,
+        uint32_t maxBounces,
+        uint32_t samplesPerPixel = 1) override;
+#endif
+
     void traceOcclusionRays(
         const float3* d_origins,
         const float3* d_targets,
