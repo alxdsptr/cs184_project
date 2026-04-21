@@ -267,10 +267,12 @@ bool Application::loadScene(const std::string& path) {
         mat.normalTexObj        = loadCachedTexture(mat.normalTexPath,        /*sRGB=*/false);
         mat.metallicRoughTexObj = loadCachedTexture(mat.metallicRoughTexPath, /*sRGB=*/false);
         mat.emissiveTexObj      = loadCachedTexture(mat.emissiveTexPath,      /*sRGB=*/true);
-        // Specular-gloss texture: RGB is sRGB-authored F0 colour, A is linear
-        // glossiness. CUDA hw sRGB only decodes RGB and leaves A linear, so a
-        // single sRGB read serves both correctly.
-        mat.specularGlossTexObj = loadCachedTexture(mat.specularGlossTexPath, /*sRGB=*/true);
+        // Specular-gloss texture: legacy FBX (.dds) authors F0 in linear, not
+        // sRGB. Loading as sRGB pushes slightly chromatic dielectric F0s into
+        // saturated colours after Fresnel boost (the "purple pipes" symptom).
+        // Alpha is glossiness, also linear — so a single linear binding is
+        // correct for both channels.
+        mat.specularGlossTexObj = loadCachedTexture(mat.specularGlossTexPath, /*sRGB=*/false);
     }
 
     // Back-fill emissive texture handles on area lights so NEE can fetch
