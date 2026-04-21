@@ -8,6 +8,7 @@
 struct DeviceSceneData {
     float3*      d_positions      = nullptr;
     float3*      d_normals        = nullptr;
+    float4*      d_tangents       = nullptr; // xyz = tangent, w = bitangent sign
     float2*      d_uvs            = nullptr;
     uint32_t*    d_indices         = nullptr;
     GPUMaterial* d_materials       = nullptr;

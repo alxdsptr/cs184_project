@@ -43,6 +43,19 @@ static void processNode(
                 mesh.uvs[v] = make_float2(aiM->mTextureCoords[0][v].x, aiM->mTextureCoords[0][v].y);
         }
 
+        // Tangents (computed by aiProcess_CalcTangentSpace). Pack handedness
+        // into .w so the kernel can reconstruct B = sign * cross(N, T).
+        if (aiM->HasTangentsAndBitangents()) {
+            mesh.tangents.resize(aiM->mNumVertices);
+            for (unsigned v = 0; v < aiM->mNumVertices; v++) {
+                float3 t = toFloat3(aiM->mTangents[v]);
+                float3 b = toFloat3(aiM->mBitangents[v]);
+                float3 n = aiM->HasNormals() ? toFloat3(aiM->mNormals[v]) : make_float3(0,1,0);
+                float sign = (dot(cross(n, t), b) < 0.0f) ? -1.0f : 1.0f;
+                mesh.tangents[v] = make_float4(t.x, t.y, t.z, sign);
+            }
+        }
+
         // Indices
         for (unsigned f = 0; f < aiM->mNumFaces; f++) {
             const aiFace& face = aiM->mFaces[f];

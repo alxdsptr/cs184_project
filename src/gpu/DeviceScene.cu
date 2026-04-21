@@ -27,6 +27,7 @@ void DeviceScene::upload(const Scene& scene) {
     // Flatten all meshes into contiguous arrays
     std::vector<float3>   allPositions;
     std::vector<float3>   allNormals;
+    std::vector<float4>   allTangents;
     std::vector<float2>   allUVs;
     std::vector<uint32_t> allIndices;
     std::vector<int>      allMatIndices; // per-triangle
@@ -34,6 +35,7 @@ void DeviceScene::upload(const Scene& scene) {
 
     allPositions.reserve(totalVerts);
     allNormals.reserve(totalVerts);
+    allTangents.reserve(totalVerts);
     allUVs.reserve(totalVerts);
     allIndices.reserve(totalTris * 3);
     allMatIndices.reserve(totalTris);
@@ -53,6 +55,15 @@ void DeviceScene::upload(const Scene& scene) {
         } else {
             for (size_t j = 0; j < mesh.positions.size(); j++)
                 allNormals.push_back(make_float3(0, 1, 0));
+        }
+
+        // Tangents: w=0 marks "no tangent" so the kernel can fall back to
+        // the geometric normal when a mesh lacks UVs/tangents.
+        if (!mesh.tangents.empty()) {
+            for (auto& t : mesh.tangents) allTangents.push_back(t);
+        } else {
+            for (size_t j = 0; j < mesh.positions.size(); j++)
+                allTangents.push_back(make_float4(1, 0, 0, 0));
         }
 
         if (!mesh.uvs.empty()) {
@@ -102,6 +113,11 @@ void DeviceScene::upload(const Scene& scene) {
     CUDA_CHECK(cudaMalloc(&m_data.d_normals, totalVerts * sizeof(float3)));
     CUDA_CHECK(cudaMemcpy(m_data.d_normals, allNormals.data(),
                            totalVerts * sizeof(float3), cudaMemcpyHostToDevice));
+
+    // Upload tangents
+    CUDA_CHECK(cudaMalloc(&m_data.d_tangents, totalVerts * sizeof(float4)));
+    CUDA_CHECK(cudaMemcpy(m_data.d_tangents, allTangents.data(),
+                           totalVerts * sizeof(float4), cudaMemcpyHostToDevice));
 
     // Upload UVs
     CUDA_CHECK(cudaMalloc(&m_data.d_uvs, totalVerts * sizeof(float2)));
@@ -206,6 +222,7 @@ void DeviceScene::upload(const Scene& scene) {
 void DeviceScene::free() {
     if (m_data.d_positions)       { cudaFree(m_data.d_positions); }
     if (m_data.d_normals)         { cudaFree(m_data.d_normals); }
+    if (m_data.d_tangents)        { cudaFree(m_data.d_tangents); }
     if (m_data.d_uvs)             { cudaFree(m_data.d_uvs); }
     if (m_data.d_indices)         { cudaFree(m_data.d_indices); }
     if (m_data.d_materials)       { cudaFree(m_data.d_materials); }
