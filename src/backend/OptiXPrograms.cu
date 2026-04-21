@@ -946,6 +946,42 @@ extern "C" __global__ void __raygen__path_trace_split()
     uint32_t x = idx.x;
     uint32_t y = idx.y;
     if (x >= params.width || y >= params.height) return;
+
+    // ── DIAGNOSTIC: minimal raygen body. Write constant test values into the
+    // 7 split surfaces and return. If THIS crashes, the SBT / LaunchParams
+    // setup is broken (not the split raygen body). If it succeeds (no crash,
+    // and the screen shows uniform debug colors), the bug is in the full
+    // raygen logic below — bisect from there.
+    if (params.splitDiffuseRadianceHitDist) {
+        ushort4 p = packHalf4_split(make_float4(0.5f, 0.0f, 0.0f, 1.0f));
+        surf2Dwrite<ushort4>(p, params.splitDiffuseRadianceHitDist, x * 8, y);
+    }
+    if (params.splitSpecularRadianceHitDist) {
+        ushort4 p = packHalf4_split(make_float4(0.0f, 0.5f, 0.0f, 1.0f));
+        surf2Dwrite<ushort4>(p, params.splitSpecularRadianceHitDist, x * 8, y);
+    }
+    if (params.splitNormalRoughness) {
+        uchar4 nr = make_uchar4(128, 255, 128, 128);
+        surf2Dwrite<uchar4>(nr, params.splitNormalRoughness, x * 4, y);
+    }
+    if (params.splitViewZ) {
+        surf2Dwrite<float>(2.0f, params.splitViewZ, x * 4, y);
+    }
+    if (params.splitMotionVectors) {
+        ushort2 packed = packHalf2_split(0.0f, 0.0f);
+        surf2Dwrite<ushort2>(packed, params.splitMotionVectors, x * 4, y);
+    }
+    if (params.splitAlbedo) {
+        uchar4 a4 = make_uchar4(200, 200, 200, 255);
+        surf2Dwrite<uchar4>(a4, params.splitAlbedo, x * 4, y);
+    }
+    if (params.splitEmissive) {
+        ushort4 p = packHalf4_split(make_float4(0.0f, 0.0f, 0.0f, 1.0f));
+        surf2Dwrite<ushort4>(p, params.splitEmissive, x * 8, y);
+    }
+    return;
+    // ── Real body below (currently unreachable due to early return above).
+    {
     uint32_t pixelIdx = y * params.width + x;
 
     const DeviceSceneData& scene  = params.scene;
@@ -1480,4 +1516,5 @@ extern "C" __global__ void __raygen__path_trace_split()
         ushort4 p = packHalf4_split(emTexel);
         surf2Dwrite<ushort4>(p, params.splitEmissive, x * 8, y);
     }
+    } // end DIAGNOSTIC unreachable block
 }

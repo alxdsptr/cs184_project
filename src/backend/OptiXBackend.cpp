@@ -496,12 +496,8 @@ void OptiXBackend::launchPathTraceSplit(
     lp.enableEnvironment = enableEnvironment ? 1u : 0u;
     lp.handle      = m_gasHandle;
 
-    // DIAGNOSTIC: temporarily run the regular raygen to see if it's the SBT
-    // / LaunchParams setup that crashes vs the split raygen body itself. Swap
-    // the next two lines to test:
-    //   m_sbt.raygenRecord = m_dRaygenSplitRecord;  // real split raygen
-    m_sbt.raygenRecord = m_dRaygenRecord;            // diagnostic: regular raygen
-    LOG_INFO("DIAG: launchPathTraceSplit using REGULAR raygen (diagnostic)");
+    // Swap to the split raygen for this launch.
+    m_sbt.raygenRecord = m_dRaygenSplitRecord;
 
     CUDA_CHECK(cudaMemcpyAsync(
         (void*)m_dLaunchParams, &lp, sizeof(lp),
