@@ -108,9 +108,7 @@ __device__ inline float3 materialDiffuseLobe(
         if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0, 0, 0);
         return albedo * (1.0f / M_PI_F);
     }
-    if (mat.useSpecularGlossiness) {
-        return bsdfDiffuseLobeSG(N, V, L, albedo, mat.specularColor);
-    }
+    // SG materials are remapped to MR per-pixel before reaching here.
     return bsdfDiffuseLobe(N, V, L, albedo, mat.roughness, mat.metallic);
 }
 
@@ -119,9 +117,6 @@ __device__ inline float3 materialSpecularLobe(
     const float3& N, const float3& V, const float3& L, const float3& albedo)
 {
     if (mat.pureDiffuse) return make_float3(0, 0, 0);
-    if (mat.useSpecularGlossiness) {
-        return bsdfSpecularLobeSG(N, V, L, mat.roughness, mat.specularColor);
-    }
     return bsdfSpecularLobe(N, V, L, albedo, mat.roughness, mat.metallic);
 }
 
@@ -272,15 +267,22 @@ __global__ void pathTraceKernelSplit(
             mat.roughness = mat.roughness * mr.y;
             mat.metallic = mat.metallic * mr.z;
         }
-        if (mat.useSpecularGlossiness && mat.specularGlossTex != 0) {
-            float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
-            mat.specularColor = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
+        // SG → MR per-pixel remap (see PathTraceKernel.cu for rationale).
+        if (mat.useSpecularGlossiness) {
+            float3 specRGB = mat.specularColor;
+            float  alphaG  = 1.0f;
+            if (mat.specularGlossTex != 0) {
+                float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
+                specRGB = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
+                alphaG  = sg.w;
+            }
+            float metallicFromSpec = fmaxf(specRGB.x, fmaxf(specRGB.y, specRGB.z));
+            mat.metallic = clampf(metallicFromSpec, 0.0f, 1.0f);
+            albedo = lerp(albedo, specRGB, mat.metallic);
             float gloss = mat.specularGlossAlphaIsGlossiness
-                            ? (mat.glossiness * sg.w)
+                            ? (mat.glossiness * alphaG)
                             :  mat.glossiness;
             mat.roughness = 1.0f - gloss;
-        } else if (mat.useSpecularGlossiness) {
-            mat.roughness = 1.0f - mat.glossiness;
         }
         mat.roughness = fmaxf(mat.roughness, 0.045f);
         mat.metallic = clampf(mat.metallic, 0.0f, 1.0f);
