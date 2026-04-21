@@ -15,6 +15,7 @@ struct GPUMaterial {
     int    useSpecularGlossiness;   // nonzero = use SG workflow (F0 from specularColor/Tex)
     int    specularGlossAlphaIsGlossiness; // nonzero = sample tex.a as per-pixel glossiness
     int    useFBXCustomPacking;     // nonzero = C4D-style packing: G=roughness, B=spec strength
+    int    useFBXUEPacking;         // nonzero = UE-style packing: G=glossiness, B=metallic mask
     float3 specularColor;           // F0 multiplier (used when useSpecularGlossiness != 0)
     float  glossiness;              // 1 - roughness multiplier
     cudaTextureObject_t albedoTex;

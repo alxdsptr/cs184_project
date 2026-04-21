@@ -241,6 +241,7 @@ __global__ void pathTraceKernelSplit(
             mat.useSpecularGlossiness = 0;
             mat.specularGlossAlphaIsGlossiness = 0;
             mat.useFBXCustomPacking = 0;
+            mat.useFBXUEPacking = 0;
             mat.specularColor = make_float3(1.0f, 1.0f, 1.0f);
             mat.glossiness = 0.5f;
             mat.specularGlossTex = 0;
@@ -277,6 +278,12 @@ __global__ void pathTraceKernelSplit(
                 albedo = mat.specularColor;
                 mat.metallic = B;
                 mat.roughness = G;
+            } else if (mat.useFBXUEPacking && mat.specularGlossTex != 0) {
+                float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
+                float G = clampf(sg.y, 0.0f, 1.0f);
+                float B = clampf(sg.z, 0.0f, 1.0f);
+                mat.metallic  = B;
+                mat.roughness = 1.0f - G;
             } else {
                 float3 specRGB = mat.specularColor;
                 float  alphaG  = 1.0f;
