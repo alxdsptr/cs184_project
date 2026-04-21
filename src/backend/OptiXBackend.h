@@ -56,6 +56,7 @@ private:
     OptixDeviceContext      m_ctx            = nullptr;
     OptixModule             m_module         = nullptr;
     OptixProgramGroup       m_pgRaygen       = nullptr;
+    OptixProgramGroup       m_pgRaygenSplit  = nullptr;  // NRD split-output raygen
     OptixProgramGroup       m_pgMissRadiance = nullptr;
     OptixProgramGroup       m_pgMissShadow   = nullptr;
     OptixProgramGroup       m_pgHitRadiance  = nullptr;
@@ -64,6 +65,11 @@ private:
 
     CUdeviceptr             m_sbtRecordsBuf  = 0;
     OptixShaderBindingTable m_sbt{};
+    // Device pointers for the two raygen records inside m_sbtRecordsBuf —
+    // launchPathTrace / launchPathTraceSplit swap `m_sbt.raygenRecord`
+    // between them depending on which raygen they want to launch.
+    CUdeviceptr             m_dRaygenRecord       = 0;
+    CUdeviceptr             m_dRaygenSplitRecord  = 0;
 
     CUdeviceptr             m_gasOutput      = 0;
     OptixTraversableHandle  m_gasHandle      = 0;

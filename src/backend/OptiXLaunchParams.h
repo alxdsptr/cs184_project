@@ -25,6 +25,18 @@ struct LaunchParams {
     // the per-pixel HDR result there in addition to (or instead of) `output`.
     PrimaryHitSurfaces gbuffer;
 
+    // Used only by the dedicated `__raygen__path_trace_split` raygen (NRD).
+    // All-zero in the regular raygen launch. Layout/semantics match
+    // SplitSurfaceOutputs in render/PathTraceKernel.h. We don't include that
+    // header here to avoid forcing PATHTRACER_NRD_DLSS_ENABLED on every TU.
+    cudaSurfaceObject_t splitDiffuseRadianceHitDist;   // RGBA16F
+    cudaSurfaceObject_t splitSpecularRadianceHitDist;  // RGBA16F
+    cudaSurfaceObject_t splitNormalRoughness;          // RGBA8_UNORM (NRD packed)
+    cudaSurfaceObject_t splitViewZ;                    // R32F (linear, positive in front)
+    cudaSurfaceObject_t splitMotionVectors;            // RG16F (pixel-space prev−curr)
+    cudaSurfaceObject_t splitAlbedo;                   // RGBA8_UNORM (demodulation factor)
+    cudaSurfaceObject_t splitEmissive;                 // RGBA16F (linear HDR)
+
     unsigned int    width;
     unsigned int    height;
     unsigned int    sampleIndex;

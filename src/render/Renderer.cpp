@@ -134,6 +134,8 @@ void Renderer::renderFrame(
     }
 
     // ── NRDOnly / NRDDLSS: split-output path-trace into Vulkan-shared aux images.
+    // Goes through the backend (CUDA SAH-BVH / OptiX GAS) so OptiX-only scenes
+    // (no CUDA BVH built) still work.
     SplitSurfaceOutputs surf{};
     if (m_sharedAux) {
         SharedAuxSurfaces s = m_sharedAux->surfaces();
@@ -145,7 +147,7 @@ void Renderer::renderFrame(
         surf.albedo                  = s.albedo;
         surf.emissive                = s.emissive;
     }
-    launchPathTraceKernelSplit(
+    backend->launchPathTraceSplit(
         scene, camera, surf,
         m_renderWidth, m_renderHeight, sampleIndex,
         enableEnvironment, maxBounces, samplesPerFrame);

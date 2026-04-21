@@ -140,6 +140,31 @@ void CUDABackend::launchPathTrace(
     );
 }
 
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+void CUDABackend::launchPathTraceSplit(
+    const DeviceSceneData& scene,
+    const CameraParams& camera,
+    SplitSurfaceOutputs surfaces,
+    uint32_t width, uint32_t height,
+    uint32_t sampleIndex,
+    bool enableEnvironment,
+    uint32_t maxBounces,
+    uint32_t samplesPerPixel)
+{
+    // Patch in CUDA SAH-BVH (the split kernel uses scene.d_bvhNodes directly,
+    // mirroring launchPathTrace above). The DeviceScene the renderer passes in
+    // does not carry the BVH pointer — the backend owns it.
+    DeviceSceneData patchedScene = scene;
+    patchedScene.d_bvhNodes   = m_bvhNodes;
+    patchedScene.bvhRootIndex = m_bvhRoot;
+
+    launchPathTraceKernelSplit(
+        patchedScene, camera, surfaces,
+        width, height, sampleIndex, enableEnvironment, maxBounces,
+        samplesPerPixel);
+}
+#endif
+
 void CUDABackend::traceOcclusionRays(
     const float3* d_origins,
     const float3* d_targets,
