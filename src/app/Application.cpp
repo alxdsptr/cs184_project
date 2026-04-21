@@ -273,7 +273,17 @@ bool Application::loadScene(const std::string& path) {
         // saturated colours after Fresnel boost (the "purple pipes" symptom).
         // Alpha is glossiness, also linear — so a single linear binding is
         // correct for both channels.
-        mat.specularGlossTexObj = loadCachedTexture(mat.specularGlossTexPath, /*sRGB=*/false);
+        // Skip the upload entirely when the material didn't opt into the
+        // Specular-Glossiness workflow (sgMode Off, or sgMode on but the
+        // material failed the detection in SceneLoader). The kernel only
+        // reads specularGlossTex when useSpecularGlossiness is true, so
+        // loading it in any other case is dead weight — which matters on
+        // asset-heavy scenes like Bistro that push the 8 GB envelope.
+        if (mat.useSpecularGlossiness) {
+            mat.specularGlossTexObj = loadCachedTexture(mat.specularGlossTexPath, /*sRGB=*/false);
+        } else {
+            mat.specularGlossTexObj = 0;
+        }
     }
 
     // Back-fill emissive texture handles on area lights so NEE can fetch
