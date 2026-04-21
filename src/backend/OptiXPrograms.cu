@@ -297,7 +297,10 @@ extern "C" __global__ void __raygen__path_trace()
         float3 throughput = make_float3(1, 1, 1);
         float3 radiance   = make_float3(0, 0, 0);
         bool firstBounce  = true;
-        bool lastBounceSpecular = false;
+        // True only when the previous bounce used a *delta* BSDF (perfect
+        // mirror / glass refraction). See PathTraceKernel.cu for the longer
+        // comment: Cook-Torrance specular is NOT delta and must not set this.
+        bool lastBounceDelta = false;
         bool havePrevSurface = false;
         float3 prevSurfacePos = make_float3(0, 0, 0);
         float prevBsdfPdf = 1.0f;
@@ -476,7 +479,7 @@ extern "C" __global__ void __raygen__path_trace()
                 ray.tmin      = 0.001f;
                 ray.tmax      = 1e30f;
 
-                lastBounceSpecular = true;
+                lastBounceDelta = true;   // glass is delta
                 prevSurfacePos = hit.position;
                 prevBsdfPdf = 1.0f;
                 havePrevSurface = true;
@@ -496,7 +499,7 @@ extern "C" __global__ void __raygen__path_trace()
                 float3 Le = emissiveColor * mat.emissionStrength;
                 float weight = 1.0f;
                 bool isAreaLight = false;
-                if (bounce > 0 && havePrevSurface && !lastBounceSpecular && scene.d_triangleAreaLightIndex) {
+                if (bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
                     int areaLightIndex = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
                     if (areaLightIndex >= 0 && scene.d_areaLights && scene.areaLightCount > 0) {
                         isAreaLight = true;
@@ -574,7 +577,11 @@ extern "C" __global__ void __raygen__path_trace()
                                     (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
                     }
                 }
-            } else if (scene.d_pointLights && scene.pointLightCount > 0) {
+            }
+
+            // Point lights are delta emitters — always sampled, regardless of
+            // whether area lights also exist. See PathTraceKernel.cu comment.
+            if (scene.d_pointLights && scene.pointLightCount > 0) {
                 float3 direct = make_float3(0.0f, 0.0f, 0.0f);
                 float3 V = -ray.direction;
                 for (uint32_t li = 0; li < scene.pointLightCount; li++) {
@@ -624,7 +631,8 @@ extern "C" __global__ void __raygen__path_trace()
                 float3 H = localToWorld(localH, T, N, B);
                 newDir = ray.direction - H * (2.0f * dot(ray.direction, H));
                 newDir = normalize(newDir);
-                lastBounceSpecular = true;
+                // Cook-Torrance specular lobe is NOT delta — MIS is valid.
+                lastBounceDelta = false;
             } else {
                 float u1 = pcg32_float(rng);
                 float u2 = pcg32_float(rng);
@@ -633,7 +641,7 @@ extern "C" __global__ void __raygen__path_trace()
                 float3 T, B;
                 buildONB(N, T, B);
                 newDir = localToWorld(localDir, T, N, B);
-                lastBounceSpecular = false;
+                lastBounceDelta = false;
             }
 
             float NdotL_new = dot(N, newDir);

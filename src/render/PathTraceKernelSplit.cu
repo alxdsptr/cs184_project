@@ -202,7 +202,10 @@ __global__ void pathTraceKernelSplit(
     bool  bucketHitDistSet = false;
 
     bool firstBounce = true;
-    bool lastBounceSpecular = false;
+    // True only when the previous bounce used a *delta* BSDF (perfect mirror /
+    // glass refraction). See PathTraceKernel.cu for the longer comment — the
+    // short version: Cook-Torrance specular is NOT delta and must not set this.
+    bool lastBounceDelta = false;
     bool havePrevSurface = false;
     float3 prevSurfacePos = make_float3(0, 0, 0);
     float prevBsdfPdf = 1.0f;
@@ -344,7 +347,7 @@ __global__ void pathTraceKernelSplit(
             ray.origin = hit.position + off * 0.002f;
             ray.direction = newDir;
             ray.tmin = 0.001f; ray.tmax = 1e30f;
-            lastBounceSpecular = true;
+            lastBounceDelta = true;   // glass is delta
             prevSurfacePos = hit.position; prevBsdfPdf = 1.0f; havePrevSurface = true;
             if (bounce >= 6 && pcg32_float(rng) > 0.9f) break;
             continue;
@@ -366,7 +369,7 @@ __global__ void pathTraceKernelSplit(
         if (isEmissive) {
             float3 Le = emissiveColor * mat.emissionStrength;
             float weight = 1.0f;
-            if (bounce > 0 && havePrevSurface && !lastBounceSpecular && scene.d_triangleAreaLightIndex) {
+            if (bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
                 int ali = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
                 if (ali >= 0 && scene.d_areaLights && scene.areaLightCount > 0) {
                     GPUAreaLight light = scene.d_areaLights[ali];
@@ -459,7 +462,11 @@ __global__ void pathTraceKernelSplit(
                     pathRadiance += clampFirefly(neeContrib, 10.0f);
                 }
             }
-        } else if (scene.d_pointLights && scene.pointLightCount > 0) {
+        }
+
+        // Point lights are delta emitters (see PathTraceKernel.cu comment).
+        // Sample them in addition to area lights, not as an alternative.
+        if (scene.d_pointLights && scene.pointLightCount > 0) {
             float3 V = -ray.direction;
             float3 direct = make_float3(0,0,0);
             for (uint32_t li = 0; li < scene.pointLightCount; li++) {
@@ -531,14 +538,15 @@ __global__ void pathTraceKernelSplit(
             float3 T, B; buildONB(N, T, B);
             float3 H = localToWorld(lH, T, N, B);
             newDir = normalize(ray.direction - H * (2.0f * dot(ray.direction, H)));
-            lastBounceSpecular = true;
+            // Cook-Torrance specular lobe is NOT delta — MIS is valid.
+            lastBounceDelta = false;
         } else {
             float u1 = pcg32_float(rng), u2 = pcg32_float(rng);
             float dummy;
             float3 lD = sampleCosineHemisphere(u1, u2, dummy);
             float3 T, B; buildONB(N, T, B);
             newDir = localToWorld(lD, T, N, B);
-            lastBounceSpecular = false;
+            lastBounceDelta = false;
         }
         float NdotLn = dot(N, newDir);
         if (NdotLn < 1e-6f) break;
