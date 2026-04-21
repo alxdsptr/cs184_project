@@ -327,7 +327,13 @@ __global__ void pathTraceKernel(
     float3 throughput = make_float3(1, 1, 1);
     float3 radiance   = make_float3(0, 0, 0);
     bool firstBounce  = true;
-    bool lastBounceSpecular = false;
+    // True only when the previous bounce used a *delta* BSDF (perfect mirror /
+    // glass refraction) whose sampling pdf is a Dirac. In that case we cannot
+    // MIS the next emissive hit with light-sampling (the latter has pdf = 0 in
+    // the delta direction), so weight defaults to 1. Cook-Torrance specular
+    // lobes are NOT delta — they have a finite roughness and a real pdf — so
+    // this flag stays false after GGX sampling, letting MIS do its job.
+    bool lastBounceDelta = false;
     bool havePrevSurface = false;
     float3 prevSurfacePos = make_float3(0.0f, 0.0f, 0.0f);
     float prevBsdfPdf = 1.0f;
@@ -530,7 +536,7 @@ __global__ void pathTraceKernel(
             ray.tmin      = 0.001f;
             ray.tmax      = 1e30f;
 
-            lastBounceSpecular = true;
+            lastBounceDelta = true;   // glass refraction/reflection is delta
             prevSurfacePos = hit.position;
             prevBsdfPdf = 1.0f;
             havePrevSurface = true;
@@ -558,7 +564,7 @@ __global__ void pathTraceKernel(
             // via the area light CDF). Texture-emitter triangles are now
             // registered too, so MIS applies uniformly.
             bool isAreaLight = false;
-            if (bounce > 0 && havePrevSurface && !lastBounceSpecular && scene.d_triangleAreaLightIndex) {
+            if (bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
                 int areaLightIndex = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
                 if (areaLightIndex >= 0 && scene.d_areaLights && scene.areaLightCount > 0) {
                     isAreaLight = true;
@@ -676,7 +682,14 @@ __global__ void pathTraceKernel(
                     radiance += throughput * shadowTransmittance * brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
                 }
             }
-        } else if (scene.d_pointLights && scene.pointLightCount > 0) {
+        }
+
+        // Point lights are delta emitters: BSDF-sampling can never hit them,
+        // so they are always sampled independently (no MIS, no area-light
+        // exclusivity). Bistro puts its main illumination on 4 point lights
+        // in addition to emissive mesh geometry — gating this branch behind
+        // "no area lights" would drop those entirely.
+        if (scene.d_pointLights && scene.pointLightCount > 0) {
             float3 direct = make_float3(0.0f, 0.0f, 0.0f);
             float3 V = -ray.direction;
 
@@ -767,7 +780,8 @@ __global__ void pathTraceKernel(
 
             newDir = ray.direction - H * (2.0f * dot(ray.direction, H));
             newDir = normalize(newDir);
-            lastBounceSpecular = true;
+            // Cook-Torrance specular lobe is NOT a delta — MIS is valid.
+            lastBounceDelta = false;
         } else {
             // Cosine-weighted hemisphere sampling (diffuse)
             float u1 = pcg32_float(rng);
@@ -777,7 +791,7 @@ __global__ void pathTraceKernel(
             float3 T, B;
             buildONB(N, T, B);
             newDir = localToWorld(localDir, T, N, B);
-            lastBounceSpecular = false;
+            lastBounceDelta = false;
         }
 
         float NdotL_new = dot(N, newDir);
