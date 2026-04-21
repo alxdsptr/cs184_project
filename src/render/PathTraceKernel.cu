@@ -377,6 +377,7 @@ __global__ void pathTraceKernel(
             mat.emissionStrength = 0.0f;
             mat.useSpecularGlossiness = 0;
             mat.specularGlossAlphaIsGlossiness = 0;
+            mat.useFBXCustomPacking = 0;
             mat.specularColor = make_float3(1.0f, 1.0f, 1.0f);
             mat.glossiness = 0.5f;
             mat.specularGlossTex = 0;
@@ -432,39 +433,59 @@ __global__ void pathTraceKernel(
         // diffuse as the surface becomes more metallic — the exact behaviour
         // we want for polished stone / brushed metal.
         if (mat.useSpecularGlossiness) {
-            float3 specRGB = mat.specularColor;
-            float  alphaG  = 1.0f;
-            if (mat.specularGlossTex != 0) {
+            if (mat.useFBXCustomPacking && mat.specularGlossTex != 0) {
+                // C4D-style packing: G = roughness, B = per-material spec
+                // strength scaling the material's specularColor up from the
+                // dielectric baseline. R/A are unused.
                 float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
-                specRGB = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
-                alphaG  = sg.w;
-            }
-            float specLum = 0.2126f * specRGB.x + 0.7152f * specRGB.y + 0.0722f * specRGB.z;
-            specLum = clampf(specLum, 0.0f, 1.0f);
+                float B = clampf(sg.z, 0.0f, 1.0f);
+                float G = clampf(sg.y, 0.0f, 1.0f);
 
-            // sqrt curve: even mid-luminance spec gives a noticeable polish,
-            // matching how artists usually paint these masks.
-            float specStrength = sqrtf(specLum);
-
-            // Target F0 ranges from dielectric baseline (0.04) to ~0.6 for the
-            // brightest spec values — well into "polished metal" territory but
-            // capped below pure mirror to leave headroom for the BaseColor tint
-            // visible in the diffuse lobe.
-            float F0_target = 0.04f + 0.56f * specStrength;
-            mat.metallic = clampf((F0_target - 0.04f) / 0.96f, 0.0f, 1.0f);
-
-            // When alpha carries glossiness data, use it (modulated by the
-            // material factor). When it doesn't, let spec luminance directly
-            // drive glossiness so bright-spec areas show clear reflections;
-            // the scalar `glossiness` factor only acts as an upper bound /
-            // global trim.
-            float gloss;
-            if (mat.specularGlossAlphaIsGlossiness) {
-                gloss = mat.glossiness * alphaG;
+                // Encode F0 = lerp(0.04, specularColor, B) through the
+                // metallic+albedo path so the rest of the BRDF stays untouched.
+                // F0_mr = lerp(0.04, albedo, metallic). Picking albedo := specColor
+                // and metallic := B reproduces the desired F0 exactly while still
+                // routing diffuse through (1-F)*(1-metallic)*albedo, which fades
+                // diffuse on highly reflective pixels — the right behaviour for
+                // polished surfaces.
+                albedo = mat.specularColor;
+                mat.metallic = B;
+                mat.roughness = G;
             } else {
-                gloss = specStrength;
+                float3 specRGB = mat.specularColor;
+                float  alphaG  = 1.0f;
+                if (mat.specularGlossTex != 0) {
+                    float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
+                    specRGB = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
+                    alphaG  = sg.w;
+                }
+                float specLum = 0.2126f * specRGB.x + 0.7152f * specRGB.y + 0.0722f * specRGB.z;
+                specLum = clampf(specLum, 0.0f, 1.0f);
+
+                // sqrt curve: even mid-luminance spec gives a noticeable polish,
+                // matching how artists usually paint these masks.
+                float specStrength = sqrtf(specLum);
+
+                // Target F0 ranges from dielectric baseline (0.04) to ~0.6 for the
+                // brightest spec values — well into "polished metal" territory but
+                // capped below pure mirror to leave headroom for the BaseColor tint
+                // visible in the diffuse lobe.
+                float F0_target = 0.04f + 0.56f * specStrength;
+                mat.metallic = clampf((F0_target - 0.04f) / 0.96f, 0.0f, 1.0f);
+
+                // When alpha carries glossiness data, use it (modulated by the
+                // material factor). When it doesn't, let spec luminance directly
+                // drive glossiness so bright-spec areas show clear reflections;
+                // the scalar `glossiness` factor only acts as an upper bound /
+                // global trim.
+                float gloss;
+                if (mat.specularGlossAlphaIsGlossiness) {
+                    gloss = mat.glossiness * alphaG;
+                } else {
+                    gloss = specStrength;
+                }
+                mat.roughness = 1.0f - clampf(gloss, 0.0f, 0.95f);
             }
-            mat.roughness = 1.0f - clampf(gloss, 0.0f, 0.95f);
         }
 
         // Clamp roughness/metallic to stable ranges for BRDF sampling/evaluation

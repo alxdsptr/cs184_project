@@ -32,6 +32,13 @@ struct PBRMaterial {
     // every shaded pixel to a perfect mirror.
     bool   specularGlossAlphaIsGlossiness = false;
 
+    // C4D-exported FBX assets (e.g. MEASURE_SEVEN) pack the spec map as
+    //   R = 255 (unused), G = roughness, B = per-material specular strength,
+    //   A = 255 (unused)
+    // This is non-standard and must be interpreted explicitly: F0 is built by
+    // lerp(0.04, specularColor, B) and roughness is read from G directly.
+    bool   useFBXCustomPacking = false;
+
     std::string albedoTexPath;
     std::string normalTexPath;
     std::string metallicRoughTexPath;
