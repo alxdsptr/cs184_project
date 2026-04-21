@@ -85,6 +85,8 @@ private:
     bool m_useSHEnvIrradiance = true;
     bool m_prevSHKeyDown = false;
     bool m_prevF12Down = false;
+    bool m_prevF1Down = false;
+    bool m_showGui = true;
     bool m_prevSpeedDownKey = false;
     bool m_prevSpeedUpKey = false;
     uint32_t m_maxBounces = 8;
