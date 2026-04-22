@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <string>
 #include <memory>
+#include <vector>
 
 struct GLFWwindow;
 
@@ -103,6 +104,20 @@ private:
     // Normal-map debug visualization. 0 = off; 1 = perturbed N; 2 = tangent
     // handedness; 3 = back-face-after-perturb flag. See DeviceSceneData.
     int m_debugNormalViz = 0;
+    // Master switch for tangent-space normal maps. Off = interpolated vertex
+    // normals only. Mapped to DeviceSceneData::enableNormalMap each frame.
+    bool m_enableNormalMap = true;
+    // Normal-arrow debug overlay. When on, a sparse grid of world-space
+    // (position, perturbed N) pairs is captured by the kernel, read back, and
+    // drawn over the path-traced image by ImGui.
+    bool    m_showNormalArrows = false;
+    int     m_normalArrowStride = 24;   // one arrow every 24x24 pixels
+    float   m_normalArrowLength = 0.25f; // world-space arrow length
+    float4* m_d_debugArrows  = nullptr;
+    size_t  m_debugArrowCapacityPairs = 0;  // #(pos,N) pairs currently allocated
+    std::vector<float4> m_h_debugArrows;    // host-side copy, 2*N entries
+    int     m_debugArrowGridW = 0;
+    int     m_debugArrowGridH = 0;
     int m_initialMode = -1;  // -1 = leave as default (Native)
     bool m_guiEnabled = true;
     double m_pendingScrollY = 0.0;

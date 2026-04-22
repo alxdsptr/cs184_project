@@ -600,7 +600,7 @@ __global__ void pathTraceKernel(
         // normal dives back through the horizon.
         float3 debugNPreFlip = N;
         const float3 debugRayDir = ray.direction;
-        if (mat.normalTex != 0 && scene.d_tangents && isOpaque) {
+        if (mat.normalTex != 0 && scene.d_tangents && isOpaque && scene.enableNormalMap) {
             float4 t0 = scene.d_tangents[i0];
             float4 t1 = scene.d_tangents[i1];
             float4 t2 = scene.d_tangents[i2];
@@ -609,6 +609,30 @@ __global__ void pathTraceKernel(
             debugNormalMapped = true;
             N = applyNormalMap(N, tangent, mat.normalTex, texUV);
             debugNPreFlip = N;
+        }
+
+        // Debug: publish (position, perturbed N) into the sparse arrow grid.
+        // Only the first sample of the first bounce writes, and only for the
+        // pixel that lands on a grid cell (x % stride == 0 && y % stride == 0
+        // ... matching how we size the buffer on the host). This way the
+        // overlay shows deterministic positions — no flickering between spp.
+        if (firstBounce && s == 0 && scene.d_debugArrows &&
+            scene.debugArrowStride > 0)
+        {
+            uint32_t stride = (uint32_t)scene.debugArrowStride;
+            if ((x % stride) == 0 && (y % stride) == 0) {
+                uint32_t gx = x / stride;
+                uint32_t gy = y / stride;
+                uint32_t idx = gy * (uint32_t)scene.debugArrowWidth + gx;
+                if ((int)gx < scene.debugArrowWidth &&
+                    (int)gy < scene.debugArrowHeight)
+                {
+                    scene.d_debugArrows[2u * idx + 0u] =
+                        make_float4(hit.position.x, hit.position.y, hit.position.z, 1.0f);
+                    scene.d_debugArrows[2u * idx + 1u] =
+                        make_float4(N.x, N.y, N.z, 0.0f);
+                }
+            }
         }
 
         // Primary-hit debug visualization. Runs only on the first bounce of

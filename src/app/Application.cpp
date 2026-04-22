@@ -435,10 +435,56 @@ void Application::renderSceneSample(uchar4* d_pbo, bool timeHeadless) {
         sceneData.d_shEnvCoeffs = m_d_shEnvCoeffs;
         sceneData.envUseSH = (m_useSHEnvIrradiance && m_d_shEnvCoeffs) ? 1 : 0;
         sceneData.debugNormalViz = m_debugNormalViz;
+        sceneData.enableNormalMap = m_enableNormalMap ? 1 : 0;
+
+        // Debug normal arrows: resize device buffer to match the current
+        // window + stride, pre-clear validity flags, and hand the pointer to
+        // the kernel. After the render we copy the samples back so the GUI
+        // overlay can draw them.
+        if (m_showNormalArrows && m_normalArrowStride > 0) {
+            int stride = m_normalArrowStride;
+            int gridW = (int)((m_width  + stride - 1) / stride);
+            int gridH = (int)((m_height + stride - 1) / stride);
+            size_t neededPairs = (size_t)gridW * (size_t)gridH;
+            if (neededPairs > m_debugArrowCapacityPairs) {
+                if (m_d_debugArrows) cudaFree(m_d_debugArrows);
+                m_d_debugArrows = nullptr;
+                CUDA_CHECK(cudaMalloc(&m_d_debugArrows,
+                                      sizeof(float4) * 2 * neededPairs));
+                m_debugArrowCapacityPairs = neededPairs;
+            }
+            // Zero-fill so stale "valid=1" from previous frames don't linger
+            // in cells whose primary ray missed this frame.
+            CUDA_CHECK(cudaMemset(m_d_debugArrows, 0,
+                                  sizeof(float4) * 2 * neededPairs));
+            m_debugArrowGridW = gridW;
+            m_debugArrowGridH = gridH;
+            sceneData.d_debugArrows    = m_d_debugArrows;
+            sceneData.debugArrowStride = stride;
+            sceneData.debugArrowWidth  = gridW;
+            sceneData.debugArrowHeight = gridH;
+        } else {
+            sceneData.d_debugArrows    = nullptr;
+            sceneData.debugArrowStride = 0;
+            m_debugArrowGridW = 0;
+            m_debugArrowGridH = 0;
+        }
+
         m_renderer.renderFrame(camParams, sceneData, m_backend.get(), d_pbo,
                                m_enableEnvironment, m_maxBounces,
                                m_samplesPerFrame,
                                &m_display, m_frameIndex);
+
+        // Read back the sparse arrow samples for the GUI overlay to draw.
+        if (m_showNormalArrows && m_d_debugArrows && m_debugArrowGridW > 0) {
+            size_t nPairs = (size_t)m_debugArrowGridW * (size_t)m_debugArrowGridH;
+            m_h_debugArrows.resize(2 * nPairs);
+            CUDA_CHECK(cudaMemcpy(m_h_debugArrows.data(), m_d_debugArrows,
+                                  sizeof(float4) * 2 * nPairs,
+                                  cudaMemcpyDeviceToHost));
+        } else if (!m_h_debugArrows.empty()) {
+            m_h_debugArrows.clear();
+        }
     } else {
         CUDA_CHECK(cudaMemset(d_pbo, 40, m_width * m_height * sizeof(uchar4)));
     }
@@ -596,7 +642,23 @@ void Application::runGui() {
                 sizeof(m_envMapPathBuf),
                 envMapLoadRequested,
                 modePtr, qualityPtr, rrW, rrH,
-                &m_debugNormalViz);
+                &m_debugNormalViz,
+                &m_enableNormalMap,
+                &m_showNormalArrows,
+                &m_normalArrowStride,
+                &m_normalArrowLength);
+
+            // Arrow overlay renders under/over the same ImGui frame.
+            if (m_showNormalArrows && !m_h_debugArrows.empty() &&
+                m_debugArrowGridW > 0 && m_debugArrowGridH > 0)
+            {
+                CameraParams camForOverlay = m_camera.getParams(m_frameIndex);
+                m_gui.drawNormalArrowsOverlay(
+                    m_h_debugArrows.data(),
+                    m_debugArrowGridW, m_debugArrowGridH,
+                    camForOverlay, m_width, m_height,
+                    m_normalArrowLength);
+            }
         }
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
@@ -670,6 +732,11 @@ void Application::shutdown() {
     m_renderer.shutdown();
     m_textures.freeAll();
     freeShEnvDevice();
+    if (m_d_debugArrows) {
+        cudaFree(m_d_debugArrows);
+        m_d_debugArrows = nullptr;
+        m_debugArrowCapacityPairs = 0;
+    }
     m_gui.shutdown();
     m_display.shutdown();
     glfwDestroyWindow(m_window);

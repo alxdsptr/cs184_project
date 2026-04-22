@@ -1,9 +1,11 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <vector_types.h>  // for float4
 
 struct GLFWwindow;
 class VulkanDisplay;
+struct CameraParams;
 
 class GUI {
 public:
@@ -29,7 +31,27 @@ public:
                 uint32_t renderResH = 0,
                 // Normal-map debug viz. 0 = off, 1 = perturbed N, 2 = tangent
                 // handedness, 3 = back-face-after-perturbation flag.
-                int* debugNormalViz = nullptr);
+                int* debugNormalViz = nullptr,
+                // Master switch for normal maps (off = interpolated N only).
+                bool* enableNormalMap = nullptr,
+                // Normal-arrow overlay toggle + its parameters.
+                bool* showNormalArrows = nullptr,
+                int*  normalArrowStride = nullptr,
+                float* normalArrowLength = nullptr);
+
+    // Draw a sparse normal-arrow overlay on top of the path-traced image.
+    // Call this once per frame between beginFrame() and endFrame(), only
+    // when showNormalArrows is on. `arrows` is laid out as 2*N float4s:
+    //   [2*i + 0].xyz = world pos,  .w = valid flag (1 = sample captured)
+    //   [2*i + 1].xyz = world normal
+    // `gridW/gridH` is the sample grid extent (width = ceil(screenW/stride)).
+    // `camera` provides the world→clip matrix for projection.
+    void drawNormalArrowsOverlay(
+        const float4* arrows, int gridW, int gridH,
+        const CameraParams& camera,
+        uint32_t screenW, uint32_t screenH,
+        float arrowLengthWorld);
+
     void endFrame();
     void shutdown();
 

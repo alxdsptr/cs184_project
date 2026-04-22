@@ -1,4 +1,6 @@
 #include "gui/GUI.h"
+#include "core/Camera.h"
+#include "core/Math.h"
 #include "display/VulkanDisplay.h"
 #include "util/Log.h"
 
@@ -9,6 +11,8 @@
 #include <vulkan/vulkan.h>
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
+
+#include <cmath>
 
 static void imguiVulkanCheck(VkResult err) {
     if (err != VK_SUCCESS) {
@@ -73,7 +77,11 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
                  int* dlssQuality,
                  uint32_t renderResW,
                  uint32_t renderResH,
-                 int* debugNormalViz) {
+                 int* debugNormalViz,
+                 bool* enableNormalMap,
+                 bool* showNormalArrows,
+                 int*  normalArrowStride,
+                 float* normalArrowLength) {
     bool changed = false;
     loadEnvMapRequested = false;
 
@@ -127,9 +135,16 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
         }
     }
 
-    if (debugNormalViz) {
+    if (debugNormalViz || enableNormalMap || showNormalArrows) {
         ImGui::Separator();
-        ImGui::Text("Debug: Normal Map Viz");
+        ImGui::Text("Normal Map / Debug");
+    }
+    if (enableNormalMap) {
+        if (ImGui::Checkbox("Enable normal maps", enableNormalMap)) {
+            changed = true;
+        }
+    }
+    if (debugNormalViz) {
         // Mutually-exclusive checkboxes: at most one debug mode active at a
         // time. Toggling any of them flags `changed=true` so the renderer
         // resets accumulation (debug output is deterministic but the accum
@@ -137,17 +152,31 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
         bool vizN    = (*debugNormalViz == 1);
         bool vizHand = (*debugNormalViz == 2);
         bool vizBack = (*debugNormalViz == 3);
-        if (ImGui::Checkbox("Perturbed normal (RGB)", &vizN)) {
+        if (ImGui::Checkbox("Viz: perturbed normal (RGB)", &vizN)) {
             *debugNormalViz = vizN ? 1 : 0;
             changed = true;
         }
-        if (ImGui::Checkbox("Tangent handedness", &vizHand)) {
+        if (ImGui::Checkbox("Viz: tangent handedness", &vizHand)) {
             *debugNormalViz = vizHand ? 2 : 0;
             changed = true;
         }
-        if (ImGui::Checkbox("Back-face after perturb", &vizBack)) {
+        if (ImGui::Checkbox("Viz: back-face after perturb", &vizBack)) {
             *debugNormalViz = vizBack ? 3 : 0;
             changed = true;
+        }
+    }
+    if (showNormalArrows) {
+        // Overlay doesn't touch the path-traced accum buffer, so toggling it
+        // doesn't need to reset accumulation — just enabling/disabling the
+        // draw in this GUI call.
+        ImGui::Checkbox("Overlay: normal arrows", showNormalArrows);
+        if (*showNormalArrows) {
+            if (normalArrowStride) {
+                ImGui::SliderInt("Arrow stride (px)", normalArrowStride, 4, 128);
+            }
+            if (normalArrowLength) {
+                ImGui::SliderFloat("Arrow length", normalArrowLength, 0.02f, 5.0f, "%.2f");
+            }
         }
     }
 
@@ -161,6 +190,74 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
 
     ImGui::End();
     return changed;
+}
+
+// Project a world-space point through the viewProj matrix, returning whether
+// the point is in front of the camera. `outScreen` is filled only when the
+// point projects. `screenW/H` are the target pixel extents.
+static bool projectToScreen(const float4x4& viewProj,
+                            float3 worldPos,
+                            uint32_t screenW, uint32_t screenH,
+                            ImVec2& outScreen)
+{
+    float x = viewProj.m[0][0]*worldPos.x + viewProj.m[0][1]*worldPos.y + viewProj.m[0][2]*worldPos.z + viewProj.m[0][3];
+    float y = viewProj.m[1][0]*worldPos.x + viewProj.m[1][1]*worldPos.y + viewProj.m[1][2]*worldPos.z + viewProj.m[1][3];
+    float w = viewProj.m[3][0]*worldPos.x + viewProj.m[3][1]*worldPos.y + viewProj.m[3][2]*worldPos.z + viewProj.m[3][3];
+    if (w < 1e-4f) return false;  // behind or at the camera
+    float ndcX = x / w;
+    float ndcY = y / w;
+    outScreen = ImVec2(
+        (ndcX * 0.5f + 0.5f) * (float)screenW,
+        (1.0f - (ndcY * 0.5f + 0.5f)) * (float)screenH);
+    return true;
+}
+
+void GUI::drawNormalArrowsOverlay(
+    const float4* arrows, int gridW, int gridH,
+    const CameraParams& camera,
+    uint32_t screenW, uint32_t screenH,
+    float arrowLengthWorld)
+{
+    if (!arrows || gridW <= 0 || gridH <= 0) return;
+
+    // ImGui background draw list sits underneath any windows but on top of
+    // the blitted path-traced image — perfect for our purpose. Window coords
+    // match framebuffer coords here because we haven't applied DPI scaling.
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const ImU32 colTail = IM_COL32(255, 230, 60, 220);   // yellow stem
+    const ImU32 colTip  = IM_COL32(255, 80,  80, 255);   // red arrowhead tick
+
+    const int total = gridW * gridH;
+    for (int i = 0; i < total; ++i) {
+        float4 pos = arrows[2*i + 0];
+        float4 nrm = arrows[2*i + 1];
+        if (pos.w < 0.5f) continue;  // ray missed — no sample here
+
+        float3 p0 = make_float3(pos.x, pos.y, pos.z);
+        float3 p1 = make_float3(
+            pos.x + nrm.x * arrowLengthWorld,
+            pos.y + nrm.y * arrowLengthWorld,
+            pos.z + nrm.z * arrowLengthWorld);
+
+        ImVec2 s0, s1;
+        if (!projectToScreen(camera.viewProjMatrix, p0, screenW, screenH, s0)) continue;
+        if (!projectToScreen(camera.viewProjMatrix, p1, screenW, screenH, s1)) continue;
+
+        // Stem
+        dl->AddLine(s0, s1, colTail, 1.5f);
+        // Small perpendicular tick at the tip to make orientation unambiguous
+        // without computing a proper 3D arrowhead.
+        float dx = s1.x - s0.x;
+        float dy = s1.y - s0.y;
+        float len = std::sqrt(dx*dx + dy*dy);
+        if (len > 1e-3f) {
+            float px = -dy / len * 4.0f;
+            float py =  dx / len * 4.0f;
+            dl->AddLine(ImVec2(s1.x - px, s1.y - py),
+                        ImVec2(s1.x + px, s1.y + py),
+                        colTip, 1.5f);
+        }
+    }
 }
 
 void GUI::endFrame() {

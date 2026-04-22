@@ -46,6 +46,24 @@ struct DeviceSceneData {
     // tangent handedness (green=+1, blue=-1, red=drifted); 3 = back-face flag
     // after normal-map perturbation (red if dot(N, rayDir) > 0).
     int      debugNormalViz = 0;
+
+    // Master switch for tangent-space normal mapping. When 0, the kernel
+    // ignores every material's normalTex and shades against the interpolated
+    // vertex normal. Handy for A/B-ing the effect of normal maps.
+    int      enableNormalMap = 1;
+
+    // Debug normal-arrow overlay: sparse grid of (position, shading-normal)
+    // samples captured at the primary hit. Laid out as N float4 pairs:
+    //   [2*i + 0].xyz = world-space position,    .w = valid flag (1=hit, 0=miss)
+    //   [2*i + 1].xyz = world-space perturbed N, .w = unused
+    // `debugArrowStride` is the pixel stride between sample cells on both
+    // axes (e.g. 24 → one arrow every 24×24 pixels). Capacity is
+    // ceil(W/stride) * ceil(H/stride). When d_debugArrows is null or
+    // debugArrowStride <= 0 the kernel writes nothing.
+    float4*  d_debugArrows     = nullptr;
+    int      debugArrowStride  = 0;
+    int      debugArrowWidth   = 0;   // ceil(W/stride)
+    int      debugArrowHeight  = 0;   // ceil(H/stride)
 };
 
 class Scene;
