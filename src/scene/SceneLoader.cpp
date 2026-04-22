@@ -618,13 +618,13 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         // which halves every contribution relative to the physically-expected
         // 1/d^2. Normalise to the standard inverse-square law when the file's
         // only non-zero coefficient is quadratic and it is >1.
-        if (light.constantAttenuation <= 0.0f
-            && light.linearAttenuation <= 0.0f
-            && light.quadraticAttenuation > 1.0f) {
-            LOG_INFO("Light '%s': normalising quadratic attenuation %.3f -> 1.0",
-                     aiL->mName.C_Str(), light.quadraticAttenuation);
-            light.quadraticAttenuation = 1.0f;
-        }
+        // if (light.constantAttenuation <= 0.0f
+        //     && light.linearAttenuation <= 0.0f
+        //     && light.quadraticAttenuation > 1.0f) {
+        //     LOG_INFO("Light '%s': normalising quadratic attenuation %.3f -> 1.0",
+        //              aiL->mName.C_Str(), light.quadraticAttenuation);
+        //     light.quadraticAttenuation = 1.0f;
+        // }
 
         scene.getLights().push_back(light);
     }
