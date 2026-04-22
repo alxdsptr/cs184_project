@@ -571,14 +571,36 @@ __global__ void pathTraceKernel(
             float3 n2 = scene.d_normals[i2];
             N = normalize(n0 * baryW + n1 * baryU + n2 * baryV);
         }
-        // Normal mapping: skip for glass so refraction stays on the geometric
-        // surface. For opaque surfaces, perturb before the back-face flip so
-        // the flip considers the perturbed orientation.
+
+        // Back-face flip FIRST (on the clean geometric/interpolated N), THEN
+        // normal-map perturbation. Rationale: a strong normal map at grazing
+        // angles can push the perturbed N across the horizon so
+        // `dot(N_perturbed, rayDir) > 0` even though we genuinely hit the
+        // front face. Flipping after perturbation would then mirror the
+        // shading normal into the surface, producing black spots / inverted
+        // highlights. Flipping first, based on the geometry, is unambiguous;
+        // `applyNormalMap` below rebuilds T/B from the flipped N, so the whole
+        // TBN frame comes along.
+        //
+        // Glass is excluded from the flip AND from normal mapping — refraction
+        // stays on the true geometric surface.
+        const bool isOpaque = (mat.transmission <= 0.0f);
+        const bool backFacing = isOpaque && (dot(N, ray.direction) > 0.0f);
+        if (backFacing) N = -N;
+
         // Capture the interpolated tangent handedness so the debug-viz branch
         // below can colour-code UV-seam drift. -2 = "no normal map applied".
         float debugHandedness = -2.0f;
         bool  debugNormalMapped = false;
-        if (mat.transmission <= 0.0f && mat.normalTex != 0 && scene.d_tangents) {
+        // Debug viz #3 (back-face-after-perturb) now detects a different —
+        // but still interesting — failure: a perturbed N that flips to the
+        // wrong side of the geometric surface even after we pre-aligned N.
+        // This indicates `ts.z < 0` (bogus tangent-space normal, blue channel
+        // below 0.5) or T/B drift strong enough that the reconstructed world
+        // normal dives back through the horizon.
+        float3 debugNPreFlip = N;
+        const float3 debugRayDir = ray.direction;
+        if (mat.normalTex != 0 && scene.d_tangents && isOpaque) {
             float4 t0 = scene.d_tangents[i0];
             float4 t1 = scene.d_tangents[i1];
             float4 t2 = scene.d_tangents[i2];
@@ -586,15 +608,7 @@ __global__ void pathTraceKernel(
             debugHandedness = tangent.w;
             debugNormalMapped = true;
             N = applyNormalMap(N, tangent, mat.normalTex, texUV);
-        }
-        // Capture pre-flip N for the back-face debug viz — we want to see
-        // whether perturbation pushed N to the wrong side of the surface.
-        const float3 debugNPreFlip = N;
-        const float3 debugRayDir = ray.direction;
-        // For glass, preserve the original normal orientation (frontFace is the ground truth).
-        // For opaque surfaces, flip to face the ray as before.
-        if (mat.transmission <= 0.0f) {
-            if (dot(N, ray.direction) > 0) N = -N;
+            debugNPreFlip = N;
         }
 
         // Primary-hit debug visualization. Runs only on the first bounce of
@@ -632,10 +646,13 @@ __global__ void pathTraceKernel(
                     }
                 }
             } else if (scene.debugNormalViz == 3) {
-                // Back-face-after-perturbation flag. Red = perturbed N points
-                // away from the camera (dot(N_pre_flip, rayDir) > 0), i.e.
-                // the flip will mirror the shading normal — a sign the TBN
-                // perturbation pushed past the horizon. Green = front-facing.
+                // Back-face-after-perturbation flag. Now that we flip BEFORE
+                // perturbation, the geometric N is always front-facing at
+                // this point; any `dot(N_perturbed, rayDir) > 0` here means
+                // the normal map pushed the shading frame *back* through the
+                // horizon — typically a bad tangent-space normal (ts.z < 0)
+                // or extreme T/B drift. Red = problematic, green = fine,
+                // grey = no normal map on this pixel.
                 if (!debugNormalMapped) {
                     debugColor = make_float3(0.1f, 0.1f, 0.1f);
                 } else {
