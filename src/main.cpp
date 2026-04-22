@@ -10,6 +10,7 @@ int main(int argc, char** argv) {
     std::string scenePath;
     std::string outputPath;
     std::string envMapPath;
+    std::string cameraPath;
     uint32_t width = 1280;
     uint32_t height = 720;
     uint32_t maxBounces = 8;
@@ -72,6 +73,8 @@ int main(int argc, char** argv) {
             }
         } else if (arg == "-f" && i + 1 < argc) {
             outputPath = argv[++i];
+        } else if (arg == "--camera" && i + 1 < argc) {
+            cameraPath = argv[++i];
         } else if (arg == "-r" && i + 2 < argc) {
             int parsedWidth = std::atoi(argv[++i]);
             int parsedHeight = std::atoi(argv[++i]);
@@ -106,6 +109,9 @@ int main(int argc, char** argv) {
     app.setEmissiveTargetLum(emissiveTargetLum);
     if (!outputPath.empty()) {
         app.setHeadlessOutput(outputPath, samples);
+    }
+    if (!cameraPath.empty()) {
+        app.loadCameraFile(cameraPath);
     }
 
     if (!app.init(width, height, "CUDA Path Tracer", outputPath.empty())) {

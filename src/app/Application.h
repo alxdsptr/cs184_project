@@ -35,6 +35,7 @@ public:
     void setEmissiveTargetLum(float v) { m_emissiveTargetLum = v; }
     void setHeadlessOutput(const std::string& outputPath, uint32_t sampleCount);
     void setEnvMap(const std::string& path);
+    void loadCameraFile(const std::string& path) { m_cameraFilePath = path; }
 
 private:
     static void glfwScrollCallback(GLFWwindow* window, double xoffset, double yoffset);
@@ -96,12 +97,14 @@ private:
     bool m_prevSpeedUpKey = false;
     bool m_prevF2Down = false;
     bool m_prevF3Down = false;
+    bool m_prevF4Down = false;
     uint32_t m_maxBounces = 8;
     uint32_t m_samplesPerFrame = 1;
     int m_initialMode = -1;  // -1 = leave as default (Native)
     bool m_guiEnabled = true;
     double m_pendingScrollY = 0.0;
     std::string m_headlessOutputPath;
+    std::string m_cameraFilePath;
     uint32_t m_targetSamples = 1;
     double m_headlessRenderMs = 0.0;
     double m_headlessTotalMs = 0.0;

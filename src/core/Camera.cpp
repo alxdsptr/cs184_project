@@ -1,6 +1,10 @@
 #include "core/Camera.h"
 #include "core/Halton.h"
+#include "util/Log.h"
 #include <cmath>
+#include <fstream>
+#include <sstream>
+#include <string>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -103,6 +107,59 @@ void Camera::lockMovementFrame() {
     m_lockedRight   = m_right;
     m_lockedUp      = m_up;
     m_frameLocked   = true;
+}
+
+bool Camera::saveToFile(const std::string& path) const {
+    std::ofstream out(path);
+    if (!out.is_open()) {
+        LOG_ERROR("Camera::saveToFile: could not open '%s' for writing", path.c_str());
+        return false;
+    }
+    out << "# path_tracer camera v1\n";
+    out << "position " << m_position.x << " " << m_position.y << " " << m_position.z << "\n";
+    out << "yaw " << m_yaw << "\n";
+    out << "pitch " << m_pitch << "\n";
+    out << "fov_deg " << m_fovDeg << "\n";
+    out << "aspect " << m_aspect << "\n";
+    out << "near " << m_nearPlane << "\n";
+    out << "far " << m_farPlane << "\n";
+    return out.good();
+}
+
+bool Camera::loadFromFile(const std::string& path) {
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        LOG_ERROR("Camera::loadFromFile: could not open '%s'", path.c_str());
+        return false;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream iss(line);
+        std::string key;
+        iss >> key;
+        if (key == "position") {
+            iss >> m_position.x >> m_position.y >> m_position.z;
+        } else if (key == "yaw") {
+            iss >> m_yaw;
+        } else if (key == "pitch") {
+            iss >> m_pitch;
+        } else if (key == "fov_deg") {
+            iss >> m_fovDeg;
+        } else if (key == "aspect") {
+            iss >> m_aspect;
+        } else if (key == "near") {
+            iss >> m_nearPlane;
+        } else if (key == "far") {
+            iss >> m_farPlane;
+        }
+    }
+    rebuildMatrices();
+    m_prevViewProj = mat4_multiply(m_projMatrix, m_viewMatrix);
+    m_prevViewMatrix = m_viewMatrix;
+    m_prevProjMatrix = m_projMatrix;
+    m_moved = true;
+    return true;
 }
 
 void Camera::rebuildMatrices() {

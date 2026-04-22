@@ -1,6 +1,7 @@
 #pragma once
 #include "core/Types.h"
 #include "core/Math.h"
+#include <string>
 
 struct CameraParams {
     float3   position;
@@ -57,6 +58,9 @@ public:
     void lockMovementFrame();
     void unlockMovementFrame() { m_frameLocked = false; }
     bool isMovementFrameLocked() const { return m_frameLocked; }
+
+    bool saveToFile(const std::string& path) const;
+    bool loadFromFile(const std::string& path);
 
 private:
     void rebuildMatrices();

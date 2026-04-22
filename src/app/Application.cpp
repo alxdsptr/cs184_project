@@ -313,6 +313,12 @@ bool Application::loadScene(const std::string& path) {
         m_camera.setClipPlanes(sceneCamera.nearPlane, sceneCamera.farPlane);
     }
 
+    if (!m_cameraFilePath.empty()) {
+        if (m_camera.loadFromFile(m_cameraFilePath)) {
+            LOG_INFO("Loaded camera from: %s", m_cameraFilePath.c_str());
+        }
+    }
+
     m_renderer.resetAccumulation();
     return true;
 }
@@ -511,6 +517,21 @@ void Application::runGui() {
             LOG_INFO("Movement frame: FREE");
         }
         m_prevF3Down = f3Down;
+
+        // F4 exports the current camera state to a file that can later be
+        // passed back via --camera on the next run.
+        bool f4Down = glfwGetKey(m_window, GLFW_KEY_F4) == GLFW_PRESS;
+        if (f4Down && !m_prevF4Down) {
+            std::filesystem::create_directories("cameras");
+            std::ostringstream name;
+            name << "cameras/camera_" << std::setw(6) << std::setfill('0') << m_frameIndex << ".txt";
+            if (m_camera.saveToFile(name.str())) {
+                LOG_INFO("Saved camera: %s", name.str().c_str());
+            } else {
+                LOG_ERROR("Failed to save camera: %s", name.str().c_str());
+            }
+        }
+        m_prevF4Down = f4Down;
 
         // 'H' toggles SH environment irradiance shortcut (only takes effect
         // when an env map is loaded and its SH has been precomputed).
