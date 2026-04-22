@@ -82,13 +82,19 @@ private:
 
     // Debug: visualise point lights as on-screen boxes and allow click-toggle.
     bool m_debugShowPointLights = false;
+    bool m_debugShowEmissiveMeshes = false;
     bool m_skipEmissiveInNEE = false;
     DebugHeatmapMode m_heatmapMode = DebugHeatmapMode::Off;
     // Mirror of each point light's enabled flag (CPU side). Size matches
     // m_scene.getLights() after loadScene. Toggles here trigger a tiny
     // re-upload to the device via RayTracingBackend::updatePointLightsEnabled.
     std::vector<unsigned char> m_pointLightEnabled;
+    // Mirror of each emissive-mesh enabled flag. Size matches
+    // m_scene.getEmissiveMeshes(). Toggles push a ranged flag update to the
+    // device area-light array.
+    std::vector<unsigned char> m_emissiveMeshEnabled;
     void syncPointLightEnabled();
+    void syncEmissiveMeshEnabled(size_t meshIdx);
 
     // HDR environment map
     cudaTextureObject_t m_envMapTex = 0;

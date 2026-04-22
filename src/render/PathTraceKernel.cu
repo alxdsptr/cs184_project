@@ -755,6 +755,16 @@ __global__ void pathTraceKernel(
 
         bool isEmissive = mat.emissionStrength > 0.0f &&
                           (emissiveColor.x > 0.0f || emissiveColor.y > 0.0f || emissiveColor.z > 0.0f);
+        // Respect the runtime emissive-mesh toggle: if this triangle is a
+        // registered area light that the user disabled, treat it as if it
+        // emitted nothing (geometry still visible via reflection/env light).
+        if (isEmissive && scene.d_triangleAreaLightIndex && scene.d_areaLights) {
+            int ali = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
+            if (ali >= 0 && (uint32_t)ali < scene.areaLightCount &&
+                !scene.d_areaLights[ali].enabled) {
+                isEmissive = false;
+            }
+        }
         if (isEmissive) {
             float3 Le = emissiveColor * mat.emissionStrength;
             float weight = 1.0f;
@@ -819,6 +829,11 @@ __global__ void pathTraceKernel(
                 pcg32_float(rng));
 
             GPUAreaLight light = scene.d_areaLights[lightIndex];
+            // Skip this NEE sample entirely if the user disabled the emissive
+            // mesh this triangle belongs to. The CDF still weights it, so on
+            // average that fraction of NEE samples is wasted — acceptable for
+            // a debug feature; proper solution would rebuild the CDF.
+            if (light.enabled) {
 
             float r1 = pcg32_float(rng);
             float r2 = pcg32_float(rng);
@@ -908,6 +923,7 @@ __global__ void pathTraceKernel(
                     }
                 }
             }
+            } // end if (light.enabled)
         }
 
         // Point lights are delta emitters: BSDF-sampling can never hit them,

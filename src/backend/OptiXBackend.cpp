@@ -405,7 +405,7 @@ bool OptiXBackend::buildGAS(const DeviceSceneData& data) {
     return true;
 }
 
-void OptiXBackend::buildAccelerationStructure(const Scene& scene) {
+void OptiXBackend::buildAccelerationStructure(Scene& scene) {
     if (!m_initialized) {
         LOG_ERROR("OptiXBackend: buildAccelerationStructure called before init");
         return;

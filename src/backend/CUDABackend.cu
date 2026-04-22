@@ -7,7 +7,7 @@
 #include "util/CudaCheck.h"
 #include "util/Log.h"
 
-void CUDABackend::buildAccelerationStructure(const Scene& scene) {
+void CUDABackend::buildAccelerationStructure(Scene& scene) {
     // Upload geometry + materials to GPU
     m_deviceScene.upload(scene);
     auto data = m_deviceScene.getData();

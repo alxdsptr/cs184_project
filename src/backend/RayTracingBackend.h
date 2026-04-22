@@ -14,7 +14,7 @@ class Scene;
 class RayTracingBackend {
 public:
     virtual ~RayTracingBackend() = default;
-    virtual void buildAccelerationStructure(const Scene& scene) = 0;
+    virtual void buildAccelerationStructure(Scene& scene) = 0;
     virtual void launchPathTrace(
         const DeviceSceneData& scene,
         const CameraParams& camera,
@@ -67,4 +67,8 @@ public:
     // that don't support it still compile; CUDA backend overrides.
     virtual void updatePointLightsEnabled(const bool* /*enabledFlags*/,
                                           uint32_t /*count*/) {}
+    // Toggle an emissive mesh (contiguous range of area lights) on/off.
+    virtual void updateAreaLightRangeEnabled(uint32_t /*start*/,
+                                             uint32_t /*count*/,
+                                             bool /*enabled*/) {}
 };

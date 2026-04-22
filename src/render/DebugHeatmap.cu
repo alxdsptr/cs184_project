@@ -134,7 +134,6 @@ void launchDebugHeatmapKernel(
     debugHeatmapKernel<<<grid, block>>>(
         buffers.d_pointLight, buffers.d_areaLight,
         buffers.d_environment, buffers.d_indirect,
-        buffers.d_byEmitter,
         d_ldrOutput, width, height, invN, mode, exposure);
     CUDA_CHECK(cudaGetLastError());
 }

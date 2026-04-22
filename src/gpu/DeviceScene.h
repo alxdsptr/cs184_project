@@ -44,7 +44,9 @@ class Scene;
 
 class DeviceScene {
 public:
-    void upload(const Scene& scene);
+    // Non-const: upload writes per-mesh emissive-range metadata back into the
+    // Scene (so the UI can draw AABBs and toggle individual emissive meshes).
+    void upload(Scene& scene);
     void free();
     DeviceSceneData getData() const { return m_data; }
 
@@ -52,6 +54,11 @@ public:
     // point-light array is tiny. Used by the debug picker to toggle lights
     // at runtime without reuploading the full scene.
     void updatePointLightsEnabled(const bool* enabledFlags, uint32_t count);
+
+    // Rewrite the `enabled` flag on a contiguous range of GPU area lights
+    // (one logical emissive mesh). `start + count` must be within
+    // d_areaLights. Used by the debug emissive-mesh toggle.
+    void updateAreaLightRangeEnabled(uint32_t start, uint32_t count, bool enabled);
 
 private:
     DeviceSceneData m_data;

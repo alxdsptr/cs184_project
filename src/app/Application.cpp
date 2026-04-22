@@ -306,6 +306,13 @@ bool Application::loadScene(const std::string& path) {
     for (size_t i = 0; i < scenePointLights.size(); i++) {
         m_pointLightEnabled[i] = scenePointLights[i].enabled ? 1u : 0u;
     }
+    // Same for emissive meshes (populated by DeviceScene::upload during
+    // m_backend->buildAccelerationStructure above).
+    const auto& emissiveMeshes = m_scene.getEmissiveMeshes();
+    m_emissiveMeshEnabled.assign(emissiveMeshes.size(), 1u);
+    for (size_t i = 0; i < emissiveMeshes.size(); i++) {
+        m_emissiveMeshEnabled[i] = emissiveMeshes[i].enabled ? 1u : 0u;
+    }
 
     std::string ext = lowerString(std::filesystem::path(path).extension().string());
     const SceneCamera& sceneCamera = m_scene.getCamera();
@@ -396,6 +403,16 @@ void Application::processInput() {
         m_lastMouseX = mx;
         m_lastMouseY = my;
     }
+}
+
+void Application::syncEmissiveMeshEnabled(size_t meshIdx) {
+    if (!m_backend) return;
+    const auto& meshes = m_scene.getEmissiveMeshes();
+    if (meshIdx >= meshes.size() || meshIdx >= m_emissiveMeshEnabled.size()) return;
+    const auto& info = meshes[meshIdx];
+    bool on = (m_emissiveMeshEnabled[meshIdx] != 0);
+    m_backend->updateAreaLightRangeEnabled(info.areaLightStart, info.areaLightCount, on);
+    m_renderer.resetAccumulation();
 }
 
 void Application::syncPointLightEnabled() {
@@ -620,6 +637,7 @@ void Application::runGui() {
                 sizeof(m_envMapPathBuf),
                 envMapLoadRequested,
                 m_debugShowPointLights,
+                m_debugShowEmissiveMeshes,
                 m_skipEmissiveInNEE,
                 heatmapModeInt,
                 modePtr, qualityPtr, rrW, rrH);
@@ -678,6 +696,75 @@ void Application::runGui() {
                     mousePos.y >= bmin.y && mousePos.y <= bmax.y) {
                     m_pointLightEnabled[i] = enabled ? 0u : 1u;
                     syncPointLightEnabled();
+                }
+            }
+        }
+
+        // Emissive-mesh debug overlay: project each mesh's AABB (8 corners) to
+        // screen space, draw a 2D bounding rect, and handle click-to-toggle.
+        // Unlike point lights, a single mesh can span a large screen area, so
+        // the click region is the screen-space rect of the projected AABB.
+        if (m_debugShowEmissiveMeshes && m_sceneLoaded && !m_emissiveMeshEnabled.empty()) {
+            const auto& emMeshes = m_scene.getEmissiveMeshes();
+            CameraParams cp = m_camera.getParams(m_frameIndex);
+            ImDrawList* dl = ImGui::GetForegroundDrawList();
+            const ImVec2 mousePos = ImGui::GetMousePos();
+            const bool clicked = !m_gui.wantCaptureMouse() &&
+                                 ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+            for (size_t i = 0; i < emMeshes.size() && i < m_emissiveMeshEnabled.size(); i++) {
+                const EmissiveMeshInfo& info = emMeshes[i];
+                // Project all 8 AABB corners; skip the mesh if every corner
+                // is behind the camera. Take the screen-space min/max of the
+                // surviving corners.
+                float3 corners[8] = {
+                    make_float3(info.bounds.bmin.x, info.bounds.bmin.y, info.bounds.bmin.z),
+                    make_float3(info.bounds.bmax.x, info.bounds.bmin.y, info.bounds.bmin.z),
+                    make_float3(info.bounds.bmin.x, info.bounds.bmax.y, info.bounds.bmin.z),
+                    make_float3(info.bounds.bmax.x, info.bounds.bmax.y, info.bounds.bmin.z),
+                    make_float3(info.bounds.bmin.x, info.bounds.bmin.y, info.bounds.bmax.z),
+                    make_float3(info.bounds.bmax.x, info.bounds.bmin.y, info.bounds.bmax.z),
+                    make_float3(info.bounds.bmin.x, info.bounds.bmax.y, info.bounds.bmax.z),
+                    make_float3(info.bounds.bmax.x, info.bounds.bmax.y, info.bounds.bmax.z),
+                };
+                float minX = 1e30f, minY = 1e30f, maxX = -1e30f, maxY = -1e30f;
+                int anyInFront = 0;
+                for (int c = 0; c < 8; c++) {
+                    if (dot(corners[c] - cp.position, cp.forward) <= 0.0f) continue;
+                    anyInFront++;
+                    float3 clip = mat4_transformPoint(cp.viewProjMatrix, corners[c]);
+                    float sx = (clip.x * 0.5f + 0.5f) * (float)m_width;
+                    float sy = (1.0f - (clip.y * 0.5f + 0.5f)) * (float)m_height;
+                    if (sx < minX) minX = sx;
+                    if (sy < minY) minY = sy;
+                    if (sx > maxX) maxX = sx;
+                    if (sy > maxY) maxY = sy;
+                }
+                if (anyInFront == 0) continue;
+
+                // Fully off-screen bounding box — skip (avoids drawing boxes
+                // for meshes the user can't see anyway).
+                if (maxX < 0 || minX > (float)m_width ||
+                    maxY < 0 || minY > (float)m_height) continue;
+
+                bool enabled = (m_emissiveMeshEnabled[i] != 0);
+                ImU32 color = enabled
+                    ? IM_COL32(255, 120, 200, 220)   // on: magenta — distinct from point-light amber
+                    : IM_COL32(120, 120, 120, 180); // off: grey
+
+                ImVec2 bmin(minX, minY);
+                ImVec2 bmax(maxX, maxY);
+                dl->AddRect(bmin, bmax, color, 3.0f, 0, 2.0f);
+
+                char label[48];
+                snprintf(label, sizeof(label), "E%zu mat=%d%s",
+                         i, info.materialIndex, enabled ? "" : " (off)");
+                dl->AddText(ImVec2(bmin.x, bmin.y - 14.0f), color, label);
+
+                if (clicked &&
+                    mousePos.x >= bmin.x && mousePos.x <= bmax.x &&
+                    mousePos.y >= bmin.y && mousePos.y <= bmax.y) {
+                    m_emissiveMeshEnabled[i] = enabled ? 0u : 1u;
+                    syncEmissiveMeshEnabled(i);
                 }
             }
         }

@@ -597,6 +597,15 @@ extern "C" __global__ void __raygen__path_trace()
 
             bool isEmissive = mat.emissionStrength > 0.0f &&
                               (emissiveColor.x > 0.0f || emissiveColor.y > 0.0f || emissiveColor.z > 0.0f);
+            // Runtime emissive-mesh toggle: disabled area-light triangles
+            // emit nothing (geometry still visible via reflection).
+            if (isEmissive && scene.d_triangleAreaLightIndex && scene.d_areaLights) {
+                int aliToggle = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
+                if (aliToggle >= 0 && (uint32_t)aliToggle < scene.areaLightCount &&
+                    !scene.d_areaLights[aliToggle].enabled) {
+                    isEmissive = false;
+                }
+            }
             if (isEmissive) {
                 float3 Le = emissiveColor * mat.emissionStrength;
                 float weight = 1.0f;
@@ -636,6 +645,7 @@ extern "C" __global__ void __raygen__path_trace()
                     scene.d_areaLightCDF, scene.areaLightCount,
                     pcg32_float(rng));
                 GPUAreaLight light = scene.d_areaLights[lightIndex];
+                if (light.enabled) {
 
                 float r1 = pcg32_float(rng);
                 float r2 = pcg32_float(rng);
@@ -681,6 +691,7 @@ extern "C" __global__ void __raygen__path_trace()
                                     (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
                     }
                 }
+                } // end if (light.enabled)
             }
 
             // Point lights are delta emitters — always sampled, regardless of
@@ -1260,6 +1271,14 @@ extern "C" __global__ void __raygen__path_trace_split()
 
             bool isEmissive = mat.emissionStrength > 0.0f &&
                 (emissiveColor.x > 0.0f || emissiveColor.y > 0.0f || emissiveColor.z > 0.0f);
+            // Runtime emissive-mesh toggle (see the non-split raygen above).
+            if (isEmissive && scene.d_triangleAreaLightIndex && scene.d_areaLights) {
+                int aliToggle = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
+                if (aliToggle >= 0 && (uint32_t)aliToggle < scene.areaLightCount &&
+                    !scene.d_areaLights[aliToggle].enabled) {
+                    isEmissive = false;
+                }
+            }
             if (isEmissive) {
                 float3 Le = emissiveColor * mat.emissionStrength;
                 float weight = 1.0f;
@@ -1296,6 +1315,7 @@ extern "C" __global__ void __raygen__path_trace_split()
                 uint32_t li = sampleAreaLightIndex(scene.d_areaLightCDF, scene.areaLightCount,
                                                    pcg32_float(rng));
                 GPUAreaLight light = scene.d_areaLights[li];
+                if (light.enabled) {
                 float r1 = pcg32_float(rng), r2 = pcg32_float(rng);
                 float su = sqrtf(r1);
                 float b0 = 1.0f - su;
@@ -1342,6 +1362,7 @@ extern "C" __global__ void __raygen__path_trace_split()
                         pathRadiance += clampFirefly_split(neeContrib, 10.0f);
                     }
                 }
+                } // end if (light.enabled)
             }
 
             // Point lights (delta emitters; sampled in addition to area lights).

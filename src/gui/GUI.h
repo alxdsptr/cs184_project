@@ -24,6 +24,7 @@ public:
                 float& moveSpeed,
                 char* envMapPathBuf, size_t envMapPathBufSize, bool& loadEnvMapRequested,
                 bool& debugShowPointLights,
+                bool& debugShowEmissiveMeshes,
                 bool& skipEmissiveInNEE,
                 int& heatmapMode,
                 int* renderMode = nullptr,

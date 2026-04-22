@@ -3,13 +3,15 @@
 #include "util/CudaCheck.h"
 #include "util/Log.h"
 
-void DeviceScene::upload(const Scene& scene) {
+void DeviceScene::upload(Scene& scene) {
     free(); // release any prior data
 
     const auto& meshes = scene.getMeshes();
     const auto& materials = scene.getMaterials();
     const auto& lights = scene.getLights();
     const auto& areaLights = scene.getAreaLights();
+    auto& emissiveMeshes = scene.getEmissiveMeshes();
+    emissiveMeshes.clear();
 
     // Count totals
     uint32_t totalVerts = 0, totalTris = 0;
@@ -76,6 +78,11 @@ void DeviceScene::upload(const Scene& scene) {
         uint32_t triCount = (uint32_t)mesh.indices.size() / 3;
         for (auto idx : mesh.indices)
             allIndices.push_back(idx + vertexOffset);
+
+        // Snapshot the area-light index at the start of this mesh so we can
+        // record the [start, end) range of area lights produced by it.
+        const uint32_t meshAreaLightStart = areaLightIndex;
+
         for (uint32_t t = 0; t < triCount; t++) {
             allMatIndices.push_back(mesh.materialIndex);
             if (emissiveMesh && areaLightIndex < areaLights.size()) {
@@ -99,6 +106,20 @@ void DeviceScene::upload(const Scene& scene) {
             } else {
                 allAreaLightIndices.push_back(-1);
             }
+        }
+
+        // Record an EmissiveMeshInfo entry for this mesh if it actually
+        // produced any area lights (non-empty range). AABB is the world-space
+        // bound of the mesh positions; triangles are already in world space
+        // here (SceneLoader applies node transforms upstream).
+        if (emissiveMesh && areaLightIndex > meshAreaLightStart) {
+            EmissiveMeshInfo info;
+            info.areaLightStart = meshAreaLightStart;
+            info.areaLightCount = areaLightIndex - meshAreaLightStart;
+            info.materialIndex  = mesh.materialIndex;
+            info.enabled        = true;
+            for (const auto& p : mesh.positions) info.bounds.expand(p);
+            emissiveMeshes.push_back(info);
         }
 
         vertexOffset += (uint32_t)mesh.positions.size();
@@ -204,6 +225,7 @@ void DeviceScene::upload(const Scene& scene) {
             dst.uv2 = src.uv2;
             dst.emissiveTex = src.emissiveTexObj;
             dst.materialIndex = src.materialIndex;
+            dst.enabled = 1;
             totalWeight += src.weight;
             cdf[i] = totalWeight;
         }
@@ -242,6 +264,24 @@ void DeviceScene::updatePointLightsEnabled(const bool* enabledFlags, uint32_t co
     }
     CUDA_CHECK(cudaMemcpy(m_data.d_pointLights, tmp.data(),
                            count * sizeof(GPUPointLight), cudaMemcpyHostToDevice));
+}
+
+void DeviceScene::updateAreaLightRangeEnabled(uint32_t start, uint32_t count, bool enabled) {
+    if (!m_data.d_areaLights || count == 0) return;
+    if (start + count > m_data.areaLightCount) return;
+    // Pull the range from device, flip the flag, push it back. The area-light
+    // array is small and toggles are rare (user interaction), so a round-trip
+    // is fine — avoids needing a dedicated 1-word strided memset.
+    std::vector<GPUAreaLight> tmp(count);
+    CUDA_CHECK(cudaMemcpy(tmp.data(),
+                           m_data.d_areaLights + start,
+                           count * sizeof(GPUAreaLight),
+                           cudaMemcpyDeviceToHost));
+    for (auto& a : tmp) a.enabled = enabled ? 1 : 0;
+    CUDA_CHECK(cudaMemcpy(m_data.d_areaLights + start,
+                           tmp.data(),
+                           count * sizeof(GPUAreaLight),
+                           cudaMemcpyHostToDevice));
 }
 
 void DeviceScene::free() {

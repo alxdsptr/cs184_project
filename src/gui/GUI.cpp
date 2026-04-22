@@ -70,6 +70,7 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
                  float& moveSpeed,
                  char* envMapPathBuf, size_t envMapPathBufSize, bool& loadEnvMapRequested,
                  bool& debugShowPointLights,
+                 bool& debugShowEmissiveMeshes,
                  bool& skipEmissiveInNEE,
                  int& heatmapMode,
                  int* renderMode,
@@ -132,6 +133,7 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
     ImGui::Separator();
     ImGui::Text("Lighting Debug");
     ImGui::Checkbox("Show point lights (click box to toggle)", &debugShowPointLights);
+    ImGui::Checkbox("Show emissive meshes (click box to toggle)", &debugShowEmissiveMeshes);
     if (ImGui::Checkbox("Skip emissive in NEE", &skipEmissiveInNEE)) {
         changed = true;
     }

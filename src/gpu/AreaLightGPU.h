@@ -24,4 +24,8 @@ struct GPUAreaLight {
     // by the debug "by emitter" heatmap to group triangles belonging to the
     // same logical light (they all share the same emissive material).
     int materialIndex;
+
+    // 0 = disabled (NEE sampling skipped, direct BSDF hits emit zero). Set at
+    // runtime by the debug emissive-mesh toggle; defaults to 1 at upload.
+    int enabled;
 };

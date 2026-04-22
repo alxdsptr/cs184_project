@@ -410,6 +410,13 @@ __global__ void pathTraceKernelSplit(
 
         bool isEmissive = mat.emissionStrength > 0.0f &&
             (emissiveColor.x > 0.0f || emissiveColor.y > 0.0f || emissiveColor.z > 0.0f);
+        if (isEmissive && scene.d_triangleAreaLightIndex && scene.d_areaLights) {
+            int aliToggle = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
+            if (aliToggle >= 0 && (uint32_t)aliToggle < scene.areaLightCount &&
+                !scene.d_areaLights[aliToggle].enabled) {
+                isEmissive = false;
+            }
+        }
         if (isEmissive) {
             float3 Le = emissiveColor * mat.emissionStrength;
             float weight = 1.0f;
@@ -445,6 +452,7 @@ __global__ void pathTraceKernelSplit(
         {
             uint32_t li = sampleAreaLightIndex(scene.d_areaLightCDF, scene.areaLightCount, pcg32_float(rng));
             GPUAreaLight light = scene.d_areaLights[li];
+            if (light.enabled) {
             float r1 = pcg32_float(rng), r2 = pcg32_float(rng);
             float su = sqrtf(r1);
             float b0 = 1.0f - su;
@@ -508,6 +516,7 @@ __global__ void pathTraceKernelSplit(
                     pathRadiance += clampFirefly(neeContrib, 10.0f);
                 }
             }
+            } // end if (light.enabled)
         }
 
         // Point lights are delta emitters (see PathTraceKernel.cu comment).

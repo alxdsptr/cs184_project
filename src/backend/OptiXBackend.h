@@ -18,7 +18,7 @@ public:
     // back to CUDA backend).
     bool init(const std::string& optixirPath);
 
-    void buildAccelerationStructure(const Scene& scene) override;
+    void buildAccelerationStructure(Scene& scene) override;
 
     void launchPathTrace(
         const DeviceSceneData& scene,
@@ -61,6 +61,9 @@ public:
     }
     void updatePointLightsEnabled(const bool* enabledFlags, uint32_t count) override {
         m_deviceScene.updatePointLightsEnabled(enabledFlags, count);
+    }
+    void updateAreaLightRangeEnabled(uint32_t start, uint32_t count, bool enabled) override {
+        m_deviceScene.updateAreaLightRangeEnabled(start, count, enabled);
     }
 
 private:
