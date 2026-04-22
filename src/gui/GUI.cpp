@@ -142,6 +142,7 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
         "Area / emissive only",
         "Environment only",
         "Indirect-only bucket (empty)",
+        "By emitter (area-light material ID)",
     };
     if (ImGui::Combo("Light contribution heatmap", &heatmapMode,
                      heatmapItems, IM_ARRAYSIZE(heatmapItems))) {

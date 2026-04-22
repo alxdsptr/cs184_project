@@ -19,4 +19,9 @@ struct GPUAreaLight {
     float2 uv2;
 
     cudaTextureObject_t emissiveTex;  // 0 = no texture, use `emission` directly
+
+    // Source material index this area-light triangle was spawned from. Used
+    // by the debug "by emitter" heatmap to group triangles belonging to the
+    // same logical light (they all share the same emissive material).
+    int materialIndex;
 };

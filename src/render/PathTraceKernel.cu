@@ -302,6 +302,30 @@ __device__ inline uint32_t sampleAreaLightIndex(
     return (low >= count) ? (count - 1) : low;
 }
 
+// Map an integer emitter id to a distinctive RGB color. Used by the "by
+// emitter" debug heatmap to paint each logical light a unique hue. Hash
+// (xorshift-like) + a golden-ratio step in hue space gives well-separated
+// colors for small id counts without a precomputed palette.
+__device__ inline float3 emitterIdToColor(int id) {
+    if (id < 0) return make_float3(0.5f, 0.5f, 0.5f);
+    uint32_t h = (uint32_t)id;
+    h = (h ^ 61u) ^ (h >> 16);
+    h *= 9u;
+    h = h ^ (h >> 4);
+    h *= 0x27d4eb2du;
+    h = h ^ (h >> 15);
+    // Golden-ratio hue spread so sequential ids also look distinct.
+    float hue = fmodf((float)id * 0.61803398875f + (float)(h & 0xFFFF) / 65536.0f, 1.0f);
+    // HSV(hue, 1, 1) -> RGB.
+    float r = fabsf(hue * 6.0f - 3.0f) - 1.0f;
+    float g = 2.0f - fabsf(hue * 6.0f - 2.0f);
+    float b = 2.0f - fabsf(hue * 6.0f - 4.0f);
+    r = fminf(fmaxf(r, 0.0f), 1.0f);
+    g = fminf(fmaxf(g, 0.0f), 1.0f);
+    b = fminf(fmaxf(b, 0.0f), 1.0f);
+    return make_float3(r, g, b);
+}
+
 // ── Path Trace Kernel ────────────────────────────────────────
 __global__ void pathTraceKernel(
     DeviceSceneData scene,
@@ -340,6 +364,9 @@ __global__ void pathTraceKernel(
     float3 hmPointSum = make_float3(0, 0, 0);
     float3 hmAreaSum  = make_float3(0, 0, 0);
     float3 hmEnvSum   = make_float3(0, 0, 0);
+    // By-emitter accumulator: xyz = sum(color(id) * lum(contribution)),
+    // w = sum(lum(contribution)). Divide xyz/w at viz time.
+    float4 hmEmitterSum = make_float4(0, 0, 0, 0);
 
     // DLSSOnly publishes to `gbuffer.hdrColor`; in that path the sub-pixel
     // offset must exactly match `camera.jitterOffset` (Halton) — DLSS does
@@ -373,6 +400,7 @@ __global__ void pathTraceKernel(
     float3 hmPoint = make_float3(0, 0, 0);
     float3 hmArea  = make_float3(0, 0, 0);
     float3 hmEnv   = make_float3(0, 0, 0);
+    float4 hmEmitter = make_float4(0, 0, 0, 0);
     bool firstBounce  = true;
     // True only when the previous bounce used a *delta* BSDF (perfect mirror /
     // glass refraction) whose sampling pdf is a Dirac. In that case we cannot
@@ -762,7 +790,15 @@ __global__ void pathTraceKernel(
 
             float3 emContrib = throughput * Le * weight;
             radiance += emContrib;
-            if (heatmapActive) hmArea = hmArea + emContrib;
+            if (heatmapActive) {
+                hmArea = hmArea + emContrib;
+                float lum = 0.2126f*emContrib.x + 0.7152f*emContrib.y + 0.0722f*emContrib.z;
+                float3 col = emitterIdToColor(hit.materialIndex);
+                hmEmitter.x += col.x * lum;
+                hmEmitter.y += col.y * lum;
+                hmEmitter.z += col.z * lum;
+                hmEmitter.w += lum;
+            }
 
             // For textured emissives (e.g. light bulbs): continue the path so the
             // surface also reflects light and shows specular highlights / depth.
@@ -861,7 +897,15 @@ __global__ void pathTraceKernel(
                     float3 Le = sampleAreaLightLe(light, b0, b1, b2);
                     float3 neeContrib = throughput * shadowTransmittance * brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
                     radiance += neeContrib;
-                    if (heatmapActive) hmArea = hmArea + neeContrib;
+                    if (heatmapActive) {
+                        hmArea = hmArea + neeContrib;
+                        float lum = 0.2126f*neeContrib.x + 0.7152f*neeContrib.y + 0.0722f*neeContrib.z;
+                        float3 col = emitterIdToColor(light.materialIndex);
+                        hmEmitter.x += col.x * lum;
+                        hmEmitter.y += col.y * lum;
+                        hmEmitter.z += col.z * lum;
+                        hmEmitter.w += lum;
+                    }
                 }
             }
         }
@@ -1019,6 +1063,7 @@ __global__ void pathTraceKernel(
         hmPoint = make_float3(0,0,0);
         hmArea  = make_float3(0,0,0);
         hmEnv   = make_float3(0,0,0);
+        hmEmitter = make_float4(0,0,0,0);
     }
     float luminance = 0.2126f * radiance.x + 0.7152f * radiance.y + 0.0722f * radiance.z;
     float clampMax = 200.0f;
@@ -1031,6 +1076,10 @@ __global__ void pathTraceKernel(
             hmPoint = hmPoint * scale;
             hmArea  = hmArea  * scale;
             hmEnv   = hmEnv   * scale;
+            hmEmitter.x *= scale;
+            hmEmitter.y *= scale;
+            hmEmitter.z *= scale;
+            hmEmitter.w *= scale;
         }
     }
 
@@ -1039,10 +1088,15 @@ __global__ void pathTraceKernel(
             hmPointSum = hmPointSum + hmPoint;
             hmAreaSum  = hmAreaSum  + hmArea;
             hmEnvSum   = hmEnvSum   + hmEnv;
+            hmEmitterSum.x += hmEmitter.x;
+            hmEmitterSum.y += hmEmitter.y;
+            hmEmitterSum.z += hmEmitter.z;
+            hmEmitterSum.w += hmEmitter.w;
             // reset per-sample buckets for the next spp iteration
             hmPoint = make_float3(0,0,0);
             hmArea  = make_float3(0,0,0);
             hmEnv   = make_float3(0,0,0);
+            hmEmitter = make_float4(0,0,0,0);
         }
     } // end spp loop
 
@@ -1057,6 +1111,9 @@ __global__ void pathTraceKernel(
             + make_float4(hmAreaSum.x,  hmAreaSum.y,  hmAreaSum.z,  0.0f);
         heatmap.d_environment[pixelIdx] = heatmap.d_environment[pixelIdx]
             + make_float4(hmEnvSum.x,   hmEnvSum.y,   hmEnvSum.z,   0.0f);
+        if (heatmap.d_byEmitter) {
+            heatmap.d_byEmitter[pixelIdx] = heatmap.d_byEmitter[pixelIdx] + hmEmitterSum;
+        }
         // `d_indirect` intentionally left unwritten — every contribution site
         // is already categorised; an empty bucket reads as "no catch-all".
     }

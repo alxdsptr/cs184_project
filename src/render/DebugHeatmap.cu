@@ -1,4 +1,5 @@
 #include "render/DebugHeatmap.h"
+#include "core/Math.h"  // float3/float4 operator overloads
 #include "util/CudaCheck.h"
 
 void DebugHeatmapBuffers::init(uint32_t width, uint32_t height) {
@@ -9,6 +10,7 @@ void DebugHeatmapBuffers::init(uint32_t width, uint32_t height) {
     CUDA_CHECK(cudaMalloc(&m_ptrs.d_areaLight,   pixels * sizeof(float4)));
     CUDA_CHECK(cudaMalloc(&m_ptrs.d_environment, pixels * sizeof(float4)));
     CUDA_CHECK(cudaMalloc(&m_ptrs.d_indirect,    pixels * sizeof(float4)));
+    CUDA_CHECK(cudaMalloc(&m_ptrs.d_byEmitter,   pixels * sizeof(float4)));
     reset();
 }
 
@@ -25,6 +27,7 @@ void DebugHeatmapBuffers::reset() {
     CUDA_CHECK(cudaMemset(m_ptrs.d_areaLight,   0, bytes));
     CUDA_CHECK(cudaMemset(m_ptrs.d_environment, 0, bytes));
     CUDA_CHECK(cudaMemset(m_ptrs.d_indirect,    0, bytes));
+    CUDA_CHECK(cudaMemset(m_ptrs.d_byEmitter,   0, bytes));
 }
 
 void DebugHeatmapBuffers::free() {
@@ -32,10 +35,11 @@ void DebugHeatmapBuffers::free() {
     if (m_ptrs.d_areaLight)   { cudaFree(m_ptrs.d_areaLight);   m_ptrs.d_areaLight   = nullptr; }
     if (m_ptrs.d_environment) { cudaFree(m_ptrs.d_environment); m_ptrs.d_environment = nullptr; }
     if (m_ptrs.d_indirect)    { cudaFree(m_ptrs.d_indirect);    m_ptrs.d_indirect    = nullptr; }
+    if (m_ptrs.d_byEmitter)   { cudaFree(m_ptrs.d_byEmitter);   m_ptrs.d_byEmitter   = nullptr; }
     m_width = m_height = 0;
 }
 
-// ── Visualization kernel ──────────────────────────────────────────
+// -- Visualization kernel --
 __device__ inline uchar4 toLdr(float r, float g, float b) {
     auto sat = [] (float v) {
         v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
@@ -53,6 +57,7 @@ __global__ void debugHeatmapKernel(
     const float4* areaLight,
     const float4* environment,
     const float4* indirect,
+    const float4* byEmitter,
     uchar4*       output,
     uint32_t width, uint32_t height,
     float invN,
@@ -63,6 +68,19 @@ __global__ void debugHeatmapKernel(
     uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
     uint32_t idx = y * width + x;
+
+    // ByEmitter is stored as (sum color*lum, sum lum); handle separately.
+    if (mode == DebugHeatmapMode::ByEmitter) {
+        float4 be = byEmitter[idx];
+        float lumSum = fmaxf(be.w, 1e-6f);
+        // Luminance-weighted average emitter color; tonemap the *intensity*
+        // (per-sample mean luminance) so dim-but-dominant lights stay visible.
+        float3 avgColor = make_float3(be.x / lumSum, be.y / lumSum, be.z / lumSum);
+        float meanLum = lumSum * invN;
+        float bright = (meanLum * exposure) / (1.0f + meanLum * exposure);
+        output[idx] = toLdr(avgColor.x * bright, avgColor.y * bright, avgColor.z * bright);
+        return;
+    }
 
     float4 p = pointLight[idx]  * invN;
     float4 a = areaLight[idx]   * invN;
@@ -116,6 +134,7 @@ void launchDebugHeatmapKernel(
     debugHeatmapKernel<<<grid, block>>>(
         buffers.d_pointLight, buffers.d_areaLight,
         buffers.d_environment, buffers.d_indirect,
+        buffers.d_byEmitter,
         d_ldrOutput, width, height, invN, mode, exposure);
     CUDA_CHECK(cudaGetLastError());
 }

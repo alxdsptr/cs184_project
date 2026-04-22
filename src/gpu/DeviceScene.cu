@@ -203,6 +203,7 @@ void DeviceScene::upload(const Scene& scene) {
             dst.uv1 = src.uv1;
             dst.uv2 = src.uv2;
             dst.emissiveTex = src.emissiveTexObj;
+            dst.materialIndex = src.materialIndex;
             totalWeight += src.weight;
             cdf[i] = totalWeight;
         }
