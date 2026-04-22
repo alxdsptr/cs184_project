@@ -315,7 +315,8 @@ __global__ void pathTraceKernel(
     bool            enableEnvironment,
     uint32_t        maxBounces,
     uint32_t        samplesPerPixel,
-    PrimaryHitSurfaces gbuffer)
+    PrimaryHitSurfaces gbuffer,
+    bool            skipEmissiveInNEE)
 {
     uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -716,8 +717,14 @@ __global__ void pathTraceKernel(
             // Check if this triangle is a registered area light (NEE-sampleable
             // via the area light CDF). Texture-emitter triangles are now
             // registered too, so MIS applies uniformly.
+            //
+            // When NEE is disabled (skipEmissiveInNEE), skip the MIS weighting
+            // entirely — emissive surfaces are only reached via BSDF sampling,
+            // so their pdfBsdf is the full-strength contribution (weight = 1).
             bool isAreaLight = false;
-            if (bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
+            if (!skipEmissiveInNEE &&
+                bounce > 0 && havePrevSurface && !lastBounceDelta &&
+                scene.d_triangleAreaLightIndex) {
                 int areaLightIndex = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
                 if (areaLightIndex >= 0 && scene.d_areaLights && scene.areaLightCount > 0) {
                     isAreaLight = true;
@@ -749,7 +756,8 @@ __global__ void pathTraceKernel(
         }
 
         // Direct lighting from emissive triangle lights (next-event estimation).
-        if (scene.d_areaLights && scene.areaLightCount > 0 &&
+        if (!skipEmissiveInNEE &&
+            scene.d_areaLights && scene.areaLightCount > 0 &&
             scene.d_areaLightCDF && scene.areaLightTotalWeight > 0.0f) {
             uint32_t lightIndex = sampleAreaLightIndex(
                 scene.d_areaLightCDF, scene.areaLightCount,
@@ -848,6 +856,7 @@ __global__ void pathTraceKernel(
 
             for (uint32_t li = 0; li < scene.pointLightCount; li++) {
                 GPUPointLight light = scene.d_pointLights[li];
+                if (!light.enabled) continue;
 
                 float3 toLight = light.position - hit.position;
                 float dist2 = fmaxf(dot(toLight, toLight), 1e-6f);
@@ -1028,7 +1037,8 @@ void launchPathTraceKernel(
     bool enableEnvironment,
     uint32_t maxBounces,
     uint32_t samplesPerPixel,
-    PrimaryHitSurfaces gbufferSurfaces)
+    PrimaryHitSurfaces gbufferSurfaces,
+    bool skipEmissiveInNEE)
 {
     if (samplesPerPixel < 1) samplesPerPixel = 1;
     dim3 block(8, 8);
@@ -1036,6 +1046,6 @@ void launchPathTraceKernel(
     pathTraceKernel<<<grid, block>>>(
         scene, camera, d_accumBuffer, d_outputBuffer, auxBuffers,
         width, height, sampleIndex, enableEnvironment, maxBounces, samplesPerPixel,
-        gbufferSurfaces);
+        gbufferSurfaces, skipEmissiveInNEE);
     CUDA_CHECK(cudaGetLastError());
 }

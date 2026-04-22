@@ -44,6 +44,7 @@ struct LaunchParams {
     unsigned int    maxBounces;
     unsigned int    spp;
     unsigned int    enableEnvironment;
+    unsigned int    skipEmissiveInNEE;  // 1 = skip area-light NEE entirely
 
     OptixTraversableHandle handle;
 };

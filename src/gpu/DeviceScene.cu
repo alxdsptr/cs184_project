@@ -177,6 +177,7 @@ void DeviceScene::upload(const Scene& scene) {
             gpuLights[i].constantAttenuation = lights[i].constantAttenuation;
             gpuLights[i].linearAttenuation = lights[i].linearAttenuation;
             gpuLights[i].quadraticAttenuation = lights[i].quadraticAttenuation;
+            gpuLights[i].enabled = lights[i].enabled ? 1 : 0;
         }
 
         CUDA_CHECK(cudaMalloc(&m_data.d_pointLights, lights.size() * sizeof(GPUPointLight)));
@@ -224,6 +225,22 @@ void DeviceScene::upload(const Scene& scene) {
 
     LOG_INFO("GPU upload: %u vertices, %u triangles, %u materials, %u lights, %u area lights",
              totalVerts, totalTris, (uint32_t)materials.size(), (uint32_t)lights.size(), (uint32_t)areaLights.size());
+}
+
+void DeviceScene::updatePointLightsEnabled(const bool* enabledFlags, uint32_t count) {
+    if (!m_data.d_pointLights || count == 0 || count > m_data.pointLightCount) return;
+    // Narrow copy: one byte per light to the `enabled` field. The field's
+    // offset is stable (last member of GPUPointLight), so we just memcpy the
+    // integer values one-by-one. For the expected handful of point lights the
+    // loop cost is invisible.
+    std::vector<GPUPointLight> tmp(count);
+    CUDA_CHECK(cudaMemcpy(tmp.data(), m_data.d_pointLights,
+                           count * sizeof(GPUPointLight), cudaMemcpyDeviceToHost));
+    for (uint32_t i = 0; i < count; i++) {
+        tmp[i].enabled = enabledFlags[i] ? 1 : 0;
+    }
+    CUDA_CHECK(cudaMemcpy(m_data.d_pointLights, tmp.data(),
+                           count * sizeof(GPUPointLight), cudaMemcpyHostToDevice));
 }
 
 void DeviceScene::free() {

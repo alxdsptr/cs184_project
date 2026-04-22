@@ -48,6 +48,11 @@ public:
     void free();
     DeviceSceneData getData() const { return m_data; }
 
+    // Rewrite only the `enabled` flag of every point light. Cheap — the
+    // point-light array is tiny. Used by the debug picker to toggle lights
+    // at runtime without reuploading the full scene.
+    void updatePointLightsEnabled(const bool* enabledFlags, uint32_t count);
+
 private:
     DeviceSceneData m_data;
 };

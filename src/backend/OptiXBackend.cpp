@@ -428,7 +428,8 @@ void OptiXBackend::launchPathTrace(
     bool enableEnvironment,
     uint32_t maxBounces,
     uint32_t samplesPerPixel,
-    PrimaryHitSurfaces gbufferSurfaces)
+    PrimaryHitSurfaces gbufferSurfaces,
+    bool skipEmissiveInNEE)
 {
     if (!m_initialized || !m_gasHandle) return;
 
@@ -446,6 +447,7 @@ void OptiXBackend::launchPathTrace(
     lp.maxBounces  = maxBounces;
     lp.spp         = samplesPerPixel < 1 ? 1 : samplesPerPixel;
     lp.enableEnvironment = enableEnvironment ? 1u : 0u;
+    lp.skipEmissiveInNEE = skipEmissiveInNEE ? 1u : 0u;
     lp.handle  = m_gasHandle;
 
     // Use the regular raygen (in case a previous call swapped to raygenSplit).
@@ -472,7 +474,8 @@ void OptiXBackend::launchPathTraceSplit(
     uint32_t sampleIndex,
     bool enableEnvironment,
     uint32_t maxBounces,
-    uint32_t samplesPerPixel)
+    uint32_t samplesPerPixel,
+    bool skipEmissiveInNEE)
 {
     if (!m_initialized || !m_gasHandle || !m_dRaygenSplitRecord) return;
 
@@ -495,6 +498,7 @@ void OptiXBackend::launchPathTraceSplit(
     lp.maxBounces  = maxBounces;
     lp.spp         = samplesPerPixel < 1 ? 1 : samplesPerPixel;
     lp.enableEnvironment = enableEnvironment ? 1u : 0u;
+    lp.skipEmissiveInNEE = skipEmissiveInNEE ? 1u : 0u;
     lp.handle      = m_gasHandle;
 
     // Swap to the split raygen for this launch.

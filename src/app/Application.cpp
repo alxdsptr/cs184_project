@@ -300,6 +300,13 @@ bool Application::loadScene(const std::string& path) {
     m_sceneLoaded = true;
     m_renderer.resetAccumulation();
 
+    // Initialise debug-visualisation mirror of point-light enabled flags.
+    const auto& scenePointLights = m_scene.getLights();
+    m_pointLightEnabled.assign(scenePointLights.size(), 1u);
+    for (size_t i = 0; i < scenePointLights.size(); i++) {
+        m_pointLightEnabled[i] = scenePointLights[i].enabled ? 1u : 0u;
+    }
+
     std::string ext = lowerString(std::filesystem::path(path).extension().string());
     const SceneCamera& sceneCamera = m_scene.getCamera();
     float aspect = m_height > 0 ? (float)m_width / (float)m_height : 1.0f;
@@ -391,6 +398,21 @@ void Application::processInput() {
     }
 }
 
+void Application::syncPointLightEnabled() {
+    if (!m_backend || m_pointLightEnabled.empty()) return;
+    std::vector<bool> flags(m_pointLightEnabled.size());
+    for (size_t i = 0; i < flags.size(); i++) flags[i] = (m_pointLightEnabled[i] != 0);
+    // std::vector<bool> is packed — pass via a plain bool buffer.
+    std::vector<unsigned char> tmp(flags.size());
+    for (size_t i = 0; i < flags.size(); i++) tmp[i] = flags[i] ? 1 : 0;
+    // Cast away: updatePointLightsEnabled takes `const bool*`; bool/uchar
+    // match byte-wise on every platform we target.
+    m_backend->updatePointLightsEnabled(
+        reinterpret_cast<const bool*>(tmp.data()),
+        (uint32_t)tmp.size());
+    m_renderer.resetAccumulation();
+}
+
 void Application::freeShEnvDevice() {
     if (m_d_shEnvCoeffs) {
         cudaFree(m_d_shEnvCoeffs);
@@ -437,7 +459,8 @@ void Application::renderSceneSample(uchar4* d_pbo, bool timeHeadless) {
         m_renderer.renderFrame(camParams, sceneData, m_backend.get(), d_pbo,
                                m_enableEnvironment, m_maxBounces,
                                m_samplesPerFrame,
-                               &m_display, m_frameIndex);
+                               &m_display, m_frameIndex,
+                               m_skipEmissiveInNEE);
     } else {
         CUDA_CHECK(cudaMemset(d_pbo, 40, m_width * m_height * sizeof(uchar4)));
     }
@@ -594,7 +617,65 @@ void Application::runGui() {
                 m_envMapPathBuf,
                 sizeof(m_envMapPathBuf),
                 envMapLoadRequested,
+                m_debugShowPointLights,
+                m_skipEmissiveInNEE,
                 modePtr, qualityPtr, rrW, rrH);
+        }
+
+        // Point-light debug overlay: project each light to screen space, draw
+        // a box + label, and handle left-click-to-toggle. Implemented entirely
+        // via the ImGui foreground draw list so no extra render pass is needed.
+        if (m_debugShowPointLights && m_sceneLoaded && !m_pointLightEnabled.empty()) {
+            const auto& lights = m_scene.getLights();
+            CameraParams cp = m_camera.getParams(m_frameIndex);
+            ImDrawList* dl = ImGui::GetForegroundDrawList();
+            const ImVec2 mousePos = ImGui::GetMousePos();
+            const bool clicked = !m_gui.wantCaptureMouse() &&
+                                 ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+            for (size_t i = 0; i < lights.size() && i < m_pointLightEnabled.size(); i++) {
+                const PointLight& L = lights[i];
+                // Project light position to NDC.
+                float3 clip = mat4_transformPoint(cp.viewProjMatrix, L.position);
+                // A point behind the near plane has w <= 0; mat4_transformPoint
+                // already does the /w divide but also clamps — the cheapest
+                // reliable "is it in front of the camera" test is the dot with
+                // forward.
+                float3 toLight = L.position - cp.position;
+                if (dot(toLight, cp.forward) <= 0.0f) continue;
+
+                float sx = (clip.x * 0.5f + 0.5f) * (float)m_width;
+                float sy = (1.0f - (clip.y * 0.5f + 0.5f)) * (float)m_height;
+
+                // Size shrinks with distance so distant lights stay pickable but
+                // nearby ones don't swallow the screen. Clamp to sane bounds.
+                float dist = sqrtf(dot(toLight, toLight));
+                float sizePx = 40.0f / fmaxf(dist * 0.08f, 0.5f);
+                sizePx = clampf(sizePx, 8.0f, 60.0f);
+
+                ImVec2 bmin(sx - sizePx, sy - sizePx);
+                ImVec2 bmax(sx + sizePx, sy + sizePx);
+
+                bool enabled = (m_pointLightEnabled[i] != 0);
+                ImU32 color = enabled
+                    ? IM_COL32(255, 230, 80, 255)    // on: amber
+                    : IM_COL32(120, 120, 120, 200);  // off: grey
+
+                dl->AddRect(bmin, bmax, color, 2.0f, 0, 2.0f);
+                // Crosshair through the light centre.
+                dl->AddLine(ImVec2(sx - sizePx, sy), ImVec2(sx + sizePx, sy), color, 1.0f);
+                dl->AddLine(ImVec2(sx, sy - sizePx), ImVec2(sx, sy + sizePx), color, 1.0f);
+
+                char label[32];
+                snprintf(label, sizeof(label), "L%zu%s", i, enabled ? "" : " (off)");
+                dl->AddText(ImVec2(bmin.x, bmax.y + 2.0f), color, label);
+
+                if (clicked &&
+                    mousePos.x >= bmin.x && mousePos.x <= bmax.x &&
+                    mousePos.y >= bmin.y && mousePos.y <= bmax.y) {
+                    m_pointLightEnabled[i] = enabled ? 0u : 1u;
+                    syncPointLightEnabled();
+                }
+            }
         }
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED

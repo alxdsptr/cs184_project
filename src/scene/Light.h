@@ -8,4 +8,5 @@ struct PointLight {
     float  constantAttenuation  = 1.0f;
     float  linearAttenuation    = 0.0f;
     float  quadraticAttenuation = 0.0f;
+    bool   enabled = true;
 };

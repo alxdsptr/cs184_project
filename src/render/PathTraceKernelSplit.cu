@@ -140,7 +140,8 @@ __global__ void pathTraceKernelSplit(
     uint32_t              sampleIndex,
     bool                  enableEnvironment,
     uint32_t              maxBounces,
-    uint32_t              samplesPerPixel)
+    uint32_t              samplesPerPixel,
+    bool                  skipEmissiveInNEE)
 {
     uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -412,7 +413,8 @@ __global__ void pathTraceKernelSplit(
         if (isEmissive) {
             float3 Le = emissiveColor * mat.emissionStrength;
             float weight = 1.0f;
-            if (bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
+            if (!skipEmissiveInNEE &&
+                bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
                 int ali = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
                 if (ali >= 0 && scene.d_areaLights && scene.areaLightCount > 0) {
                     GPUAreaLight light = scene.d_areaLights[ali];
@@ -437,7 +439,8 @@ __global__ void pathTraceKernelSplit(
         }
 
         // NEE area lights.
-        if (scene.d_areaLights && scene.areaLightCount > 0 &&
+        if (!skipEmissiveInNEE &&
+            scene.d_areaLights && scene.areaLightCount > 0 &&
             scene.d_areaLightCDF && scene.areaLightTotalWeight > 0.0f)
         {
             uint32_t li = sampleAreaLightIndex(scene.d_areaLightCDF, scene.areaLightCount, pcg32_float(rng));
@@ -514,6 +517,7 @@ __global__ void pathTraceKernelSplit(
             float3 direct = make_float3(0,0,0);
             for (uint32_t li = 0; li < scene.pointLightCount; li++) {
                 GPUPointLight light = scene.d_pointLights[li];
+                if (!light.enabled) continue;
                 float3 toL = light.position - hit.position;
                 float d2 = fmaxf(dot(toL, toL), 1e-6f);
                 float d = sqrtf(d2);
@@ -762,14 +766,15 @@ void launchPathTraceKernelSplit(
     uint32_t sampleIndex,
     bool enableEnvironment,
     uint32_t maxBounces,
-    uint32_t samplesPerPixel)
+    uint32_t samplesPerPixel,
+    bool skipEmissiveInNEE)
 {
     if (samplesPerPixel < 1) samplesPerPixel = 1;
     dim3 block(8, 8);
     dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
     pathTraceKernelSplit<<<grid, block>>>(
         scene, camera, surfaces, width, height, sampleIndex,
-        enableEnvironment, maxBounces, samplesPerPixel);
+        enableEnvironment, maxBounces, samplesPerPixel, skipEmissiveInNEE);
     CUDA_CHECK(cudaGetLastError());
 }
 

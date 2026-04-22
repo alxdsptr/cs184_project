@@ -124,7 +124,8 @@ void CUDABackend::launchPathTrace(
     bool enableEnvironment,
     uint32_t maxBounces,
     uint32_t samplesPerPixel,
-    PrimaryHitSurfaces gbufferSurfaces)
+    PrimaryHitSurfaces gbufferSurfaces,
+    bool skipEmissiveInNEE)
 {
     // Patch in BVH data (since DeviceScene may not have it directly)
     DeviceSceneData patchedScene = scene;
@@ -136,7 +137,8 @@ void CUDABackend::launchPathTrace(
         d_accumBuffer, d_outputBuffer, auxBuffers,
         width, height, sampleIndex, enableEnvironment, maxBounces,
         samplesPerPixel,
-        gbufferSurfaces
+        gbufferSurfaces,
+        skipEmissiveInNEE
     );
 }
 
@@ -149,7 +151,8 @@ void CUDABackend::launchPathTraceSplit(
     uint32_t sampleIndex,
     bool enableEnvironment,
     uint32_t maxBounces,
-    uint32_t samplesPerPixel)
+    uint32_t samplesPerPixel,
+    bool skipEmissiveInNEE)
 {
     // Patch in CUDA SAH-BVH (the split kernel uses scene.d_bvhNodes directly,
     // mirroring launchPathTrace above). The DeviceScene the renderer passes in
@@ -161,7 +164,8 @@ void CUDABackend::launchPathTraceSplit(
     launchPathTraceKernelSplit(
         patchedScene, camera, surfaces,
         width, height, sampleIndex, enableEnvironment, maxBounces,
-        samplesPerPixel);
+        samplesPerPixel,
+        skipEmissiveInNEE);
 }
 #endif
 

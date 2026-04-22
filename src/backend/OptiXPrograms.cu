@@ -292,6 +292,7 @@ extern "C" __global__ void __raygen__path_trace()
     uint32_t samplesPerPixel = params.spp < 1u ? 1u : params.spp;
     uint32_t maxBounces = params.maxBounces;
     bool enableEnvironment = params.enableEnvironment != 0;
+    bool skipEmissiveInNEE = params.skipEmissiveInNEE != 0;
     OptixTraversableHandle handle = params.handle;
 
     float3 radianceSum = make_float3(0, 0, 0);
@@ -600,7 +601,8 @@ extern "C" __global__ void __raygen__path_trace()
                 float3 Le = emissiveColor * mat.emissionStrength;
                 float weight = 1.0f;
                 bool isAreaLight = false;
-                if (bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
+                if (!skipEmissiveInNEE &&
+                    bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
                     int areaLightIndex = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
                     if (areaLightIndex >= 0 && scene.d_areaLights && scene.areaLightCount > 0) {
                         isAreaLight = true;
@@ -627,7 +629,8 @@ extern "C" __global__ void __raygen__path_trace()
             }
 
             // Direct lighting NEE
-            if (scene.d_areaLights && scene.areaLightCount > 0 &&
+            if (!skipEmissiveInNEE &&
+                scene.d_areaLights && scene.areaLightCount > 0 &&
                 scene.d_areaLightCDF && scene.areaLightTotalWeight > 0.0f) {
                 uint32_t lightIndex = sampleAreaLightIndex(
                     scene.d_areaLightCDF, scene.areaLightCount,
@@ -687,6 +690,7 @@ extern "C" __global__ void __raygen__path_trace()
                 float3 V = -ray.direction;
                 for (uint32_t li = 0; li < scene.pointLightCount; li++) {
                     GPUPointLight light = scene.d_pointLights[li];
+                    if (!light.enabled) continue;
                     float3 toLight = light.position - hit.position;
                     float dist2 = fmaxf(dot(toLight, toLight), 1e-6f);
                     float dist = sqrtf(dist2);
@@ -989,6 +993,7 @@ extern "C" __global__ void __raygen__path_trace_split()
     uint32_t samplesPerPixel = params.spp < 1u ? 1u : params.spp;
     uint32_t maxBounces      = params.maxBounces;
     bool enableEnvironment   = params.enableEnvironment != 0;
+    bool skipEmissiveInNEE   = params.skipEmissiveInNEE != 0;
     OptixTraversableHandle handle = params.handle;
 
     // Per-pixel accumulators across spp.
@@ -1258,7 +1263,8 @@ extern "C" __global__ void __raygen__path_trace_split()
             if (isEmissive) {
                 float3 Le = emissiveColor * mat.emissionStrength;
                 float weight = 1.0f;
-                if (bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
+                if (!skipEmissiveInNEE &&
+                    bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
                     int ali = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
                     if (ali >= 0 && scene.d_areaLights && scene.areaLightCount > 0) {
                         GPUAreaLight light = scene.d_areaLights[ali];
@@ -1283,7 +1289,8 @@ extern "C" __global__ void __raygen__path_trace_split()
             }
 
             // NEE area lights.
-            if (scene.d_areaLights && scene.areaLightCount > 0 &&
+            if (!skipEmissiveInNEE &&
+                scene.d_areaLights && scene.areaLightCount > 0 &&
                 scene.d_areaLightCDF && scene.areaLightTotalWeight > 0.0f)
             {
                 uint32_t li = sampleAreaLightIndex(scene.d_areaLightCDF, scene.areaLightCount,
@@ -1343,6 +1350,7 @@ extern "C" __global__ void __raygen__path_trace_split()
                 float3 direct = make_float3(0,0,0);
                 for (uint32_t li = 0; li < scene.pointLightCount; li++) {
                     GPUPointLight light = scene.d_pointLights[li];
+                    if (!light.enabled) continue;
                     float3 toL = light.position - hit.position;
                     float d2 = fmaxf(dot(toL, toL), 1e-6f);
                     float d  = sqrtf(d2);

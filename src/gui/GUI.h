@@ -23,6 +23,8 @@ public:
                 float& exposure, int& toneMappingMode,
                 float& moveSpeed,
                 char* envMapPathBuf, size_t envMapPathBufSize, bool& loadEnvMapRequested,
+                bool& debugShowPointLights,
+                bool& skipEmissiveInNEE,
                 int* renderMode = nullptr,
                 int* dlssQuality = nullptr,
                 uint32_t renderResW = 0,

@@ -29,7 +29,8 @@ public:
         // All-zero (default) → Native behaviour: only the CUDA buffers are
         // written. When `gbufferSurfaces.hdrColor` is non-zero, the kernel
         // bypasses `d_outputBuffer` and writes the HDR result there instead.
-        PrimaryHitSurfaces gbufferSurfaces = {}
+        PrimaryHitSurfaces gbufferSurfaces = {},
+        bool skipEmissiveInNEE = false
     ) = 0;
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
@@ -46,7 +47,8 @@ public:
         uint32_t sampleIndex,
         bool enableEnvironment,
         uint32_t maxBounces,
-        uint32_t samplesPerPixel = 1) = 0;
+        uint32_t samplesPerPixel = 1,
+        bool skipEmissiveInNEE = false) = 0;
 #endif
 
     // BDPT-ready: visibility test for connection strategies
@@ -58,4 +60,9 @@ public:
     ) = 0;
 
     virtual DeviceSceneData getSceneData() const = 0;
+
+    // Runtime mutation of point-light enabled flags. Default no-op so backends
+    // that don't support it still compile; CUDA backend overrides.
+    virtual void updatePointLightsEnabled(const bool* /*enabledFlags*/,
+                                          uint32_t /*count*/) {}
 };

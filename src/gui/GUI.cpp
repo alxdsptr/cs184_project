@@ -69,6 +69,8 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
                  float& exposure, int& toneMappingMode,
                  float& moveSpeed,
                  char* envMapPathBuf, size_t envMapPathBufSize, bool& loadEnvMapRequested,
+                 bool& debugShowPointLights,
+                 bool& skipEmissiveInNEE,
                  int* renderMode,
                  int* dlssQuality,
                  uint32_t renderResW,
@@ -124,6 +126,13 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
         if (*renderMode != 0 && renderResW && renderResH) {
             ImGui::Text("Render res: %ux%u", renderResW, renderResH);
         }
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Lighting Debug");
+    ImGui::Checkbox("Show point lights (click box to toggle)", &debugShowPointLights);
+    if (ImGui::Checkbox("Skip emissive in NEE", &skipEmissiveInNEE)) {
+        changed = true;
     }
 
     ImGui::Separator();

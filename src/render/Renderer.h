@@ -49,7 +49,8 @@ public:
         uint32_t maxBounces,
         uint32_t samplesPerFrame,
         VulkanDisplay* display,
-        uint32_t frameIndex
+        uint32_t frameIndex,
+        bool skipEmissiveInNEE = false
     );
 
     // Mode plumbing (safe to call after init()).

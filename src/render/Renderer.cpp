@@ -68,7 +68,8 @@ void Renderer::renderFrame(
     uint32_t maxBounces,
     uint32_t samplesPerFrame,
     VulkanDisplay* display,
-    uint32_t frameIndex)
+    uint32_t frameIndex,
+    bool skipEmissiveInNEE)
 {
     uint32_t sampleIndex = m_accumBuffer.getSampleCount();
     if (samplesPerFrame < 1) samplesPerFrame = 1;
@@ -85,7 +86,9 @@ void Renderer::renderFrame(
             m_width, m_height, sampleIndex,
             enableEnvironment,
             maxBounces,
-            samplesPerFrame
+            samplesPerFrame,
+            PrimaryHitSurfaces{},
+            skipEmissiveInNEE
         );
         launchTonemapKernel(
             m_accumBuffer.getOutputBuffer(),
@@ -121,7 +124,8 @@ void Renderer::renderFrame(
             m_auxBuffers.getPtrs(),
             m_renderWidth, m_renderHeight, sampleIndex,
             enableEnvironment, maxBounces, samplesPerFrame,
-            gb);
+            gb,
+            skipEmissiveInNEE);
         m_accumBuffer.addSamples(samplesPerFrame);
 
         m_lastCamera = camera;
@@ -162,7 +166,8 @@ void Renderer::renderFrame(
     backend->launchPathTraceSplit(
         scene, cameraForSplit, surf,
         m_renderWidth, m_renderHeight, sampleIndex,
-        enableEnvironment, maxBounces, samplesPerFrame);
+        enableEnvironment, maxBounces, samplesPerFrame,
+        skipEmissiveInNEE);
     m_accumBuffer.incrementSamples();
 
     // Cache what the pre-present recorder needs; it runs inside present(),

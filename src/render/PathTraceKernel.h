@@ -16,7 +16,8 @@ void launchPathTraceKernel(
     bool enableEnvironment,
     uint32_t maxBounces,
     uint32_t samplesPerPixel = 1,  // spp per kernel invocation
-    PrimaryHitSurfaces gbufferSurfaces = {}  // optional Vulkan-shared writes for DLSSOnly
+    PrimaryHitSurfaces gbufferSurfaces = {},  // optional Vulkan-shared writes for DLSSOnly
+    bool skipEmissiveInNEE = false  // skip area-light NEE entirely when true
 );
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
@@ -58,6 +59,7 @@ void launchPathTraceKernelSplit(
     uint32_t sampleIndex,
     bool enableEnvironment,
     uint32_t maxBounces,
-    uint32_t samplesPerPixel = 1  // spp per kernel invocation; averages inside the kernel
+    uint32_t samplesPerPixel = 1,  // spp per kernel invocation; averages inside the kernel
+    bool skipEmissiveInNEE = false
 );
 #endif // PATHTRACER_NRD_DLSS_ENABLED

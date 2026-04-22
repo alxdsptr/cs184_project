@@ -8,4 +8,5 @@ struct GPUPointLight {
     float  constantAttenuation;
     float  linearAttenuation;
     float  quadraticAttenuation;
+    int    enabled;  // 0 = disabled (skip in NEE & overlay dims the marker)
 };

@@ -31,7 +31,8 @@ public:
         bool enableEnvironment,
         uint32_t maxBounces,
         uint32_t samplesPerPixel = 1,
-        PrimaryHitSurfaces gbufferSurfaces = {}
+        PrimaryHitSurfaces gbufferSurfaces = {},
+        bool skipEmissiveInNEE = false
     ) override;
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
@@ -43,7 +44,8 @@ public:
         uint32_t sampleIndex,
         bool enableEnvironment,
         uint32_t maxBounces,
-        uint32_t samplesPerPixel = 1) override;
+        uint32_t samplesPerPixel = 1,
+        bool skipEmissiveInNEE = false) override;
 #endif
 
     void traceOcclusionRays(
@@ -55,6 +57,9 @@ public:
 
     DeviceSceneData getSceneData() const override {
         return m_deviceScene.getData();
+    }
+    void updatePointLightsEnabled(const bool* enabledFlags, uint32_t count) override {
+        m_deviceScene.updatePointLightsEnabled(enabledFlags, count);
     }
 
 private:
