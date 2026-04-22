@@ -434,6 +434,7 @@ void Application::renderSceneSample(uchar4* d_pbo, bool timeHeadless) {
         sceneData.envMapTex = m_envMapTex;
         sceneData.d_shEnvCoeffs = m_d_shEnvCoeffs;
         sceneData.envUseSH = (m_useSHEnvIrradiance && m_d_shEnvCoeffs) ? 1 : 0;
+        sceneData.debugNormalViz = m_debugNormalViz;
         m_renderer.renderFrame(camParams, sceneData, m_backend.get(), d_pbo,
                                m_enableEnvironment, m_maxBounces,
                                m_samplesPerFrame,
@@ -594,7 +595,8 @@ void Application::runGui() {
                 m_envMapPathBuf,
                 sizeof(m_envMapPathBuf),
                 envMapLoadRequested,
-                modePtr, qualityPtr, rrW, rrH);
+                modePtr, qualityPtr, rrW, rrH,
+                &m_debugNormalViz);
         }
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED

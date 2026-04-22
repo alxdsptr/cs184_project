@@ -38,6 +38,14 @@ struct DeviceSceneData {
     // sampling.
     float3*  d_shEnvCoeffs = nullptr;
     int      envUseSH      = 0;
+
+    // Debug visualization mode for diagnosing normal-map issues. When non-zero,
+    // the path-trace kernel short-circuits at the primary hit and writes a
+    // false-colour image instead of tracing light transport. 0 = off (normal
+    // render); 1 = perturbed world-space normal as RGB; 2 = interpolated
+    // tangent handedness (green=+1, blue=-1, red=drifted); 3 = back-face flag
+    // after normal-map perturbation (red if dot(N, rayDir) > 0).
+    int      debugNormalViz = 0;
 };
 
 class Scene;

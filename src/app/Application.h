@@ -100,6 +100,9 @@ private:
     bool m_prevF4Down = false;
     uint32_t m_maxBounces = 8;
     uint32_t m_samplesPerFrame = 1;
+    // Normal-map debug visualization. 0 = off; 1 = perturbed N; 2 = tangent
+    // handedness; 3 = back-face-after-perturb flag. See DeviceSceneData.
+    int m_debugNormalViz = 0;
     int m_initialMode = -1;  // -1 = leave as default (Native)
     bool m_guiEnabled = true;
     double m_pendingScrollY = 0.0;

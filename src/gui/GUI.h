@@ -26,7 +26,10 @@ public:
                 int* renderMode = nullptr,
                 int* dlssQuality = nullptr,
                 uint32_t renderResW = 0,
-                uint32_t renderResH = 0);
+                uint32_t renderResH = 0,
+                // Normal-map debug viz. 0 = off, 1 = perturbed N, 2 = tangent
+                // handedness, 3 = back-face-after-perturbation flag.
+                int* debugNormalViz = nullptr);
     void endFrame();
     void shutdown();
 

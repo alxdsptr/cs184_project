@@ -72,7 +72,8 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
                  int* renderMode,
                  int* dlssQuality,
                  uint32_t renderResW,
-                 uint32_t renderResH) {
+                 uint32_t renderResH,
+                 int* debugNormalViz) {
     bool changed = false;
     loadEnvMapRequested = false;
 
@@ -123,6 +124,30 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
         }
         if (*renderMode != 0 && renderResW && renderResH) {
             ImGui::Text("Render res: %ux%u", renderResW, renderResH);
+        }
+    }
+
+    if (debugNormalViz) {
+        ImGui::Separator();
+        ImGui::Text("Debug: Normal Map Viz");
+        // Mutually-exclusive checkboxes: at most one debug mode active at a
+        // time. Toggling any of them flags `changed=true` so the renderer
+        // resets accumulation (debug output is deterministic but the accum
+        // buffer is still holding the previous mode's values).
+        bool vizN    = (*debugNormalViz == 1);
+        bool vizHand = (*debugNormalViz == 2);
+        bool vizBack = (*debugNormalViz == 3);
+        if (ImGui::Checkbox("Perturbed normal (RGB)", &vizN)) {
+            *debugNormalViz = vizN ? 1 : 0;
+            changed = true;
+        }
+        if (ImGui::Checkbox("Tangent handedness", &vizHand)) {
+            *debugNormalViz = vizHand ? 2 : 0;
+            changed = true;
+        }
+        if (ImGui::Checkbox("Back-face after perturb", &vizBack)) {
+            *debugNormalViz = vizBack ? 3 : 0;
+            changed = true;
         }
     }
 

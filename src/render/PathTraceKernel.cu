@@ -574,17 +574,86 @@ __global__ void pathTraceKernel(
         // Normal mapping: skip for glass so refraction stays on the geometric
         // surface. For opaque surfaces, perturb before the back-face flip so
         // the flip considers the perturbed orientation.
+        // Capture the interpolated tangent handedness so the debug-viz branch
+        // below can colour-code UV-seam drift. -2 = "no normal map applied".
+        float debugHandedness = -2.0f;
+        bool  debugNormalMapped = false;
         if (mat.transmission <= 0.0f && mat.normalTex != 0 && scene.d_tangents) {
             float4 t0 = scene.d_tangents[i0];
             float4 t1 = scene.d_tangents[i1];
             float4 t2 = scene.d_tangents[i2];
             float4 tangent = t0 * baryW + t1 * baryU + t2 * baryV;
+            debugHandedness = tangent.w;
+            debugNormalMapped = true;
             N = applyNormalMap(N, tangent, mat.normalTex, texUV);
         }
+        // Capture pre-flip N for the back-face debug viz — we want to see
+        // whether perturbation pushed N to the wrong side of the surface.
+        const float3 debugNPreFlip = N;
+        const float3 debugRayDir = ray.direction;
         // For glass, preserve the original normal orientation (frontFace is the ground truth).
         // For opaque surfaces, flip to face the ray as before.
         if (mat.transmission <= 0.0f) {
             if (dot(N, ray.direction) > 0) N = -N;
+        }
+
+        // Primary-hit debug visualization. Runs only on the first bounce of
+        // the first sample — any more would just average noise onto a
+        // deterministic value. Writes a false-colour radiance and breaks the
+        // path; the outer spp loop also bails because we set
+        // `samplesPerPixel = 1` effectively by zeroing the remaining iters.
+        if (firstBounce && scene.debugNormalViz != 0) {
+            float3 debugColor = make_float3(0.0f, 0.0f, 0.0f);
+            if (scene.debugNormalViz == 1) {
+                // Perturbed world-space normal as RGB in [0,1].
+                debugColor = N * 0.5f + make_float3(0.5f, 0.5f, 0.5f);
+            } else if (scene.debugNormalViz == 2) {
+                // Handedness visualization. Pixels without a normal map are
+                // black (so you can tell them apart from the lit ones). With a
+                // normal map: interpolated w ≈ +1 → green, ≈ -1 → blue,
+                // anything in between → red intensity proportional to drift.
+                if (!debugNormalMapped) {
+                    debugColor = make_float3(0.0f, 0.0f, 0.0f);
+                } else {
+                    float w = debugHandedness;
+                    float drift = fminf(fabsf(fabsf(w) - 1.0f), 1.0f);
+                    if (drift < 0.05f) {
+                        debugColor = (w >= 0.0f)
+                            ? make_float3(0.0f, 1.0f, 0.0f)
+                            : make_float3(0.0f, 0.0f, 1.0f);
+                    } else {
+                        // Red channel scales with drift; preserves sign hint
+                        // as dim green/blue so seams remain readable.
+                        float base = 0.15f;
+                        debugColor = make_float3(
+                            drift,
+                            (w >= 0.0f) ? base : 0.0f,
+                            (w <  0.0f) ? base : 0.0f);
+                    }
+                }
+            } else if (scene.debugNormalViz == 3) {
+                // Back-face-after-perturbation flag. Red = perturbed N points
+                // away from the camera (dot(N_pre_flip, rayDir) > 0), i.e.
+                // the flip will mirror the shading normal — a sign the TBN
+                // perturbation pushed past the horizon. Green = front-facing.
+                if (!debugNormalMapped) {
+                    debugColor = make_float3(0.1f, 0.1f, 0.1f);
+                } else {
+                    float d = dot(debugNPreFlip, debugRayDir);
+                    debugColor = (d > 0.0f)
+                        ? make_float3(1.0f, 0.0f, 0.0f)
+                        : make_float3(0.0f, 0.6f, 0.0f);
+                }
+            }
+            radiance = debugColor;
+            // Short-circuit: skip all remaining bounces for this path; the
+            // spp-loop guard below skips further samples too (they would all
+            // produce the exact same debug colour).
+            if (!gbufferWritten) {
+                if (gbuffer.viewZ) surf2Dwrite<float>(1.0e6f, gbuffer.viewZ, x * 4, y);
+                gbufferWritten = true;
+            }
+            break;
         }
 
         // Write aux buffers from the first sample that produces a primary hit.
