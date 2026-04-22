@@ -6,6 +6,7 @@
 #include "scene/SceneLoader.h"
 #include "scene/Texture.h"
 #include "render/Renderer.h"
+#include "render/DebugHeatmap.h"
 #include "backend/RayTracingBackend.h"
 #include "backend/CUDABackend.h"
 #include <cstdint>
@@ -82,6 +83,7 @@ private:
     // Debug: visualise point lights as on-screen boxes and allow click-toggle.
     bool m_debugShowPointLights = false;
     bool m_skipEmissiveInNEE = false;
+    DebugHeatmapMode m_heatmapMode = DebugHeatmapMode::Off;
     // Mirror of each point light's enabled flag (CPU side). Size matches
     // m_scene.getLights() after loadScene. Toggles here trigger a tiny
     // re-upload to the device via RayTracingBackend::updatePointLightsEnabled.

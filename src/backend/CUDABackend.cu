@@ -125,7 +125,8 @@ void CUDABackend::launchPathTrace(
     uint32_t maxBounces,
     uint32_t samplesPerPixel,
     PrimaryHitSurfaces gbufferSurfaces,
-    bool skipEmissiveInNEE)
+    bool skipEmissiveInNEE,
+    DebugHeatmapPtrs heatmap)
 {
     // Patch in BVH data (since DeviceScene may not have it directly)
     DeviceSceneData patchedScene = scene;
@@ -138,7 +139,8 @@ void CUDABackend::launchPathTrace(
         width, height, sampleIndex, enableEnvironment, maxBounces,
         samplesPerPixel,
         gbufferSurfaces,
-        skipEmissiveInNEE
+        skipEmissiveInNEE,
+        heatmap
     );
 }
 

@@ -24,10 +24,30 @@ void Renderer::init(uint32_t width, uint32_t height) {
     m_height = height;
     m_accumBuffer.init(width, height);
     m_auxBuffers.init(width, height);
+    // Heatmap buffers are allocated lazily on first use — skip them when the
+    // debug mode is Off so users who never toggle it don't pay the memory cost.
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
     m_renderWidth  = width;
     m_renderHeight = height;
 #endif
+}
+
+void Renderer::setHeatmapMode(DebugHeatmapMode m) {
+    if (m == m_heatmapMode) return;
+    m_heatmapMode = m;
+    if (m_heatmapMode == DebugHeatmapMode::Off) {
+        // Keep the allocation around — user may toggle it back on next frame.
+        // Reset the accum so the main image gets a clean start.
+        resetAccumulation();
+        return;
+    }
+    if (!m_heatmap.valid()) {
+        m_heatmap.init(m_width, m_height);
+    }
+    // Fresh heatmap: clear previous-mode data and restart accumulation so the
+    // visualised sums match the buckets being populated from now on.
+    m_heatmap.reset();
+    resetAccumulation();
 }
 
 void Renderer::resize(uint32_t width, uint32_t height) {
@@ -36,6 +56,7 @@ void Renderer::resize(uint32_t width, uint32_t height) {
     m_height = height;
     m_accumBuffer.resize(width, height);
     m_auxBuffers.resize(width, height);
+    if (m_heatmap.valid()) m_heatmap.resize(width, height);
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
     // Non-Native modes rely on shared VkImages sized to the render resolution;
@@ -57,6 +78,7 @@ void Renderer::resize(uint32_t width, uint32_t height) {
 
 void Renderer::resetAccumulation() {
     m_accumBuffer.reset();
+    if (m_heatmap.valid()) m_heatmap.reset();
 }
 
 void Renderer::renderFrame(
@@ -69,15 +91,26 @@ void Renderer::renderFrame(
     uint32_t samplesPerFrame,
     VulkanDisplay* display,
     uint32_t frameIndex,
-    bool skipEmissiveInNEE)
+    bool skipEmissiveInNEE,
+    DebugHeatmapMode heatmapMode)
 {
     uint32_t sampleIndex = m_accumBuffer.getSampleCount();
     if (samplesPerFrame < 1) samplesPerFrame = 1;
+
+    // The caller can pass a mode argument per-frame; reconcile it with the
+    // persistent Renderer state (which owns buffer allocation lifecycle).
+    if (heatmapMode != m_heatmapMode) {
+        setHeatmapMode(heatmapMode);
+        sampleIndex = m_accumBuffer.getSampleCount();  // reset by setHeatmapMode
+    }
 
     if (m_mode == Mode::Native) {
         // Native fallback: the kernel now accumulates `samplesPerFrame`
         // samples into the accum buffer internally, and divides by
         // (sampleIndex + samplesPerFrame). Advance our counter by the same.
+        DebugHeatmapPtrs heatmapPtrs = (m_heatmapMode != DebugHeatmapMode::Off && m_heatmap.valid())
+            ? m_heatmap.getPtrs()
+            : DebugHeatmapPtrs{};
         backend->launchPathTrace(
             scene, camera,
             m_accumBuffer.getAccumBuffer(),
@@ -88,15 +121,27 @@ void Renderer::renderFrame(
             maxBounces,
             samplesPerFrame,
             PrimaryHitSurfaces{},
-            skipEmissiveInNEE
+            skipEmissiveInNEE,
+            heatmapPtrs
         );
-        launchTonemapKernel(
-            m_accumBuffer.getOutputBuffer(),
-            d_ldrOutput,
-            m_width, m_height,
-            m_exposure,
-            m_toneMappingMode
-        );
+        if (m_heatmapMode != DebugHeatmapMode::Off && m_heatmap.valid()) {
+            // Replace tonemap with the category visualisation. Sample count
+            // is one behind (we haven't bumped it yet), so use the post-launch
+            // count for the divide.
+            launchDebugHeatmapKernel(
+                m_heatmap.getPtrs(), d_ldrOutput,
+                m_width, m_height,
+                sampleIndex + samplesPerFrame,
+                m_heatmapMode, m_exposure);
+        } else {
+            launchTonemapKernel(
+                m_accumBuffer.getOutputBuffer(),
+                d_ldrOutput,
+                m_width, m_height,
+                m_exposure,
+                m_toneMappingMode
+            );
+        }
         m_accumBuffer.addSamples(samplesPerFrame);
         return;
     }
@@ -397,6 +442,7 @@ void Renderer::shutdown() {
     shutdownDlssPath();
     shutdownNrdPath();
 #endif
+    m_heatmap.free();
     m_accumBuffer.free();
     m_auxBuffers.free();
 }

@@ -460,7 +460,8 @@ void Application::renderSceneSample(uchar4* d_pbo, bool timeHeadless) {
                                m_enableEnvironment, m_maxBounces,
                                m_samplesPerFrame,
                                &m_display, m_frameIndex,
-                               m_skipEmissiveInNEE);
+                               m_skipEmissiveInNEE,
+                               m_heatmapMode);
     } else {
         CUDA_CHECK(cudaMemset(d_pbo, 40, m_width * m_height * sizeof(uchar4)));
     }
@@ -602,6 +603,7 @@ void Application::runGui() {
 #endif
 
         bool envChanged = false;
+        int heatmapModeInt = (int)m_heatmapMode;
         if (m_showGui) {
             envChanged = m_gui.render(
                 m_fps,
@@ -619,8 +621,10 @@ void Application::runGui() {
                 envMapLoadRequested,
                 m_debugShowPointLights,
                 m_skipEmissiveInNEE,
+                heatmapModeInt,
                 modePtr, qualityPtr, rrW, rrH);
         }
+        m_heatmapMode = (DebugHeatmapMode)heatmapModeInt;
 
         // Point-light debug overlay: project each light to screen space, draw
         // a box + label, and handle left-click-to-toggle. Implemented entirely

@@ -18,7 +18,8 @@ public:
         uint32_t maxBounces,
         uint32_t samplesPerPixel = 1,
         PrimaryHitSurfaces gbufferSurfaces = {},
-        bool skipEmissiveInNEE = false
+        bool skipEmissiveInNEE = false,
+        DebugHeatmapPtrs heatmap = {}
     ) override;
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED

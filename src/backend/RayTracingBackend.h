@@ -2,6 +2,7 @@
 #include "gpu/DeviceScene.h"
 #include "core/Camera.h"
 #include "render/AuxBuffers.h"
+#include "render/DebugHeatmap.h"
 #include <cuda_runtime.h>
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
@@ -30,7 +31,8 @@ public:
         // written. When `gbufferSurfaces.hdrColor` is non-zero, the kernel
         // bypasses `d_outputBuffer` and writes the HDR result there instead.
         PrimaryHitSurfaces gbufferSurfaces = {},
-        bool skipEmissiveInNEE = false
+        bool skipEmissiveInNEE = false,
+        DebugHeatmapPtrs heatmap = {}
     ) = 0;
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED

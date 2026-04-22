@@ -2,6 +2,7 @@
 #include "gpu/DeviceScene.h"
 #include "core/Camera.h"
 #include "render/AuxBuffers.h"
+#include "render/DebugHeatmap.h"
 #include <cuda_runtime.h>
 
 void launchPathTraceKernel(
@@ -17,7 +18,8 @@ void launchPathTraceKernel(
     uint32_t maxBounces,
     uint32_t samplesPerPixel = 1,  // spp per kernel invocation
     PrimaryHitSurfaces gbufferSurfaces = {},  // optional Vulkan-shared writes for DLSSOnly
-    bool skipEmissiveInNEE = false  // skip area-light NEE entirely when true
+    bool skipEmissiveInNEE = false,  // skip area-light NEE entirely when true
+    DebugHeatmapPtrs heatmap = {}    // when non-null, kernel writes per-category radiance
 );
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED

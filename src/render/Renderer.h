@@ -1,6 +1,7 @@
 #pragma once
 #include "render/AccumulationBuffer.h"
 #include "render/AuxBuffers.h"
+#include "render/DebugHeatmap.h"
 #include "render/Tonemapping.h"
 #include "core/Camera.h"
 #include "gpu/DeviceScene.h"
@@ -50,8 +51,15 @@ public:
         uint32_t samplesPerFrame,
         VulkanDisplay* display,
         uint32_t frameIndex,
-        bool skipEmissiveInNEE = false
+        bool skipEmissiveInNEE = false,
+        DebugHeatmapMode heatmapMode = DebugHeatmapMode::Off
     );
+
+    // Debug heatmap accessors. When mode != Off, the path tracer writes
+    // per-category radiance into these buffers, and Native-mode renderFrame
+    // skips tonemap and instead visualises them.
+    DebugHeatmapMode getHeatmapMode() const { return m_heatmapMode; }
+    void setHeatmapMode(DebugHeatmapMode m);
 
     // Mode plumbing (safe to call after init()).
     Mode getMode() const { return m_mode; }
@@ -95,6 +103,8 @@ private:
 
     AccumulationBuffer m_accumBuffer;
     AuxBuffers         m_auxBuffers;
+    DebugHeatmapBuffers m_heatmap;
+    DebugHeatmapMode   m_heatmapMode = DebugHeatmapMode::Off;
     uint32_t m_width = 0, m_height = 0;
     float    m_exposure = 1.0f;
     ToneMappingMode m_toneMappingMode = ToneMappingMode::ACES;

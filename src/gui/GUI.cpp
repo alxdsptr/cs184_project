@@ -71,6 +71,7 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
                  char* envMapPathBuf, size_t envMapPathBufSize, bool& loadEnvMapRequested,
                  bool& debugShowPointLights,
                  bool& skipEmissiveInNEE,
+                 int& heatmapMode,
                  int* renderMode,
                  int* dlssQuality,
                  uint32_t renderResW,
@@ -132,6 +133,18 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
     ImGui::Text("Lighting Debug");
     ImGui::Checkbox("Show point lights (click box to toggle)", &debugShowPointLights);
     if (ImGui::Checkbox("Skip emissive in NEE", &skipEmissiveInNEE)) {
+        changed = true;
+    }
+    const char* heatmapItems[] = {
+        "Off",
+        "Categorized (R=point, G=area/emissive, B=env)",
+        "Point lights only",
+        "Area / emissive only",
+        "Environment only",
+        "Indirect-only bucket (empty)",
+    };
+    if (ImGui::Combo("Light contribution heatmap", &heatmapMode,
+                     heatmapItems, IM_ARRAYSIZE(heatmapItems))) {
         changed = true;
     }
 

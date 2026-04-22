@@ -316,7 +316,8 @@ __global__ void pathTraceKernel(
     uint32_t        maxBounces,
     uint32_t        samplesPerPixel,
     PrimaryHitSurfaces gbuffer,
-    bool            skipEmissiveInNEE)
+    bool            skipEmissiveInNEE,
+    DebugHeatmapPtrs heatmap)
 {
     uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -330,6 +331,15 @@ __global__ void pathTraceKernel(
     // buffer as one batch; caller advances the sample counter by `spp`.
     float3 radianceSum = make_float3(0, 0, 0);
     bool gbufferWritten = false;
+
+    // Per-category radiance sums for the optional heatmap, accumulated across
+    // all spp for this frame. Per-sample buckets live inside the spp loop so
+    // the firefly clamp / NaN reject applies to them consistently with the
+    // main `radiance`.
+    const bool heatmapActive = (heatmap.d_pointLight != nullptr);
+    float3 hmPointSum = make_float3(0, 0, 0);
+    float3 hmAreaSum  = make_float3(0, 0, 0);
+    float3 hmEnvSum   = make_float3(0, 0, 0);
 
     // DLSSOnly publishes to `gbuffer.hdrColor`; in that path the sub-pixel
     // offset must exactly match `camera.jitterOffset` (Halton) — DLSS does
@@ -358,6 +368,11 @@ __global__ void pathTraceKernel(
 
     float3 throughput = make_float3(1, 1, 1);
     float3 radiance   = make_float3(0, 0, 0);
+    // Per-sample heatmap buckets (reset each spp; rolled into the per-frame
+    // sums below after clamp/NaN check).
+    float3 hmPoint = make_float3(0, 0, 0);
+    float3 hmArea  = make_float3(0, 0, 0);
+    float3 hmEnv   = make_float3(0, 0, 0);
     bool firstBounce  = true;
     // True only when the previous bounce used a *delta* BSDF (perfect mirror /
     // glass refraction) whose sampling pdf is a Dirac. In that case we cannot
@@ -399,7 +414,9 @@ __global__ void pathTraceKernel(
                 if (envLum > envClamp) {
                     envColor = envColor * (envClamp / envLum);
                 }
-                radiance += throughput * envColor;
+                float3 envContrib = throughput * envColor;
+                radiance += envContrib;
+                if (heatmapActive) hmEnv = hmEnv + envContrib;
             }
             // Sky pixel: write a sentinel viewZ so DLSS / NRD treat it as far.
             if (firstBounce && !gbufferWritten) {
@@ -743,7 +760,9 @@ __global__ void pathTraceKernel(
                 }
             }
 
-            radiance += throughput * Le * weight;
+            float3 emContrib = throughput * Le * weight;
+            radiance += emContrib;
+            if (heatmapActive) hmArea = hmArea + emContrib;
 
             // For textured emissives (e.g. light bulbs): continue the path so the
             // surface also reflects light and shows specular highlights / depth.
@@ -840,7 +859,9 @@ __global__ void pathTraceKernel(
                     float weight = powerHeuristic(pdfOmega, pdfBsdf);
 
                     float3 Le = sampleAreaLightLe(light, b0, b1, b2);
-                    radiance += throughput * shadowTransmittance * brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
+                    float3 neeContrib = throughput * shadowTransmittance * brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
+                    radiance += neeContrib;
+                    if (heatmapActive) hmArea = hmArea + neeContrib;
                 }
             }
         }
@@ -917,7 +938,9 @@ __global__ void pathTraceKernel(
                 direct += brdf * shadowTransmittancePL * Li * NdotL;
             }
 
-            radiance += throughput * direct;
+            float3 ptContrib = throughput * direct;
+            radiance += ptContrib;
+            if (heatmapActive) hmPoint = hmPoint + ptContrib;
         }
 
         // BRDF sampling: Fresnel-weighted blend between diffuse and specular
@@ -991,21 +1014,52 @@ __global__ void pathTraceKernel(
     if (isnan(radiance.x) || isnan(radiance.y) || isnan(radiance.z) ||
         isinf(radiance.x) || isinf(radiance.y) || isinf(radiance.z)) {
         radiance = make_float3(0.0f, 0.0f, 0.0f);
+        // Per-sample heatmap buckets are also discarded — summing NaN into
+        // the per-frame sums would poison the image permanently.
+        hmPoint = make_float3(0,0,0);
+        hmArea  = make_float3(0,0,0);
+        hmEnv   = make_float3(0,0,0);
     }
     float luminance = 0.2126f * radiance.x + 0.7152f * radiance.y + 0.0722f * radiance.z;
     float clampMax = 200.0f;
     if (luminance > clampMax) {
         float scale = clampMax / luminance;
         radiance = radiance * scale;
+        // Scale heatmap buckets by the same factor so their sum still roughly
+        // matches `radiance` (they were built from the same contributions).
+        if (heatmapActive) {
+            hmPoint = hmPoint * scale;
+            hmArea  = hmArea  * scale;
+            hmEnv   = hmEnv   * scale;
+        }
     }
 
         radianceSum = radianceSum + radiance;
+        if (heatmapActive) {
+            hmPointSum = hmPointSum + hmPoint;
+            hmAreaSum  = hmAreaSum  + hmArea;
+            hmEnvSum   = hmEnvSum   + hmEnv;
+            // reset per-sample buckets for the next spp iteration
+            hmPoint = make_float3(0,0,0);
+            hmArea  = make_float3(0,0,0);
+            hmEnv   = make_float3(0,0,0);
+        }
     } // end spp loop
 
     // Accumulate: add all spp samples at once. The caller advances the sample
     // counter by `samplesPerPixel`, so the divisor below stays correct.
     float4 sumTexel = make_float4(radianceSum.x, radianceSum.y, radianceSum.z, (float)samplesPerPixel);
     d_accumBuffer[pixelIdx] = d_accumBuffer[pixelIdx] + sumTexel;
+    if (heatmapActive) {
+        heatmap.d_pointLight[pixelIdx]  = heatmap.d_pointLight[pixelIdx]
+            + make_float4(hmPointSum.x, hmPointSum.y, hmPointSum.z, 0.0f);
+        heatmap.d_areaLight[pixelIdx]   = heatmap.d_areaLight[pixelIdx]
+            + make_float4(hmAreaSum.x,  hmAreaSum.y,  hmAreaSum.z,  0.0f);
+        heatmap.d_environment[pixelIdx] = heatmap.d_environment[pixelIdx]
+            + make_float4(hmEnvSum.x,   hmEnvSum.y,   hmEnvSum.z,   0.0f);
+        // `d_indirect` intentionally left unwritten — every contribution site
+        // is already categorised; an empty bucket reads as "no catch-all".
+    }
     float invN = 1.0f / (float)(sampleIndex + samplesPerPixel);
     float4 hdr = d_accumBuffer[pixelIdx] * invN;
     if (d_outputBuffer) d_outputBuffer[pixelIdx] = hdr;
@@ -1038,7 +1092,8 @@ void launchPathTraceKernel(
     uint32_t maxBounces,
     uint32_t samplesPerPixel,
     PrimaryHitSurfaces gbufferSurfaces,
-    bool skipEmissiveInNEE)
+    bool skipEmissiveInNEE,
+    DebugHeatmapPtrs heatmap)
 {
     if (samplesPerPixel < 1) samplesPerPixel = 1;
     dim3 block(8, 8);
@@ -1046,6 +1101,6 @@ void launchPathTraceKernel(
     pathTraceKernel<<<grid, block>>>(
         scene, camera, d_accumBuffer, d_outputBuffer, auxBuffers,
         width, height, sampleIndex, enableEnvironment, maxBounces, samplesPerPixel,
-        gbufferSurfaces, skipEmissiveInNEE);
+        gbufferSurfaces, skipEmissiveInNEE, heatmap);
     CUDA_CHECK(cudaGetLastError());
 }

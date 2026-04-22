@@ -429,8 +429,10 @@ void OptiXBackend::launchPathTrace(
     uint32_t maxBounces,
     uint32_t samplesPerPixel,
     PrimaryHitSurfaces gbufferSurfaces,
-    bool skipEmissiveInNEE)
+    bool skipEmissiveInNEE,
+    DebugHeatmapPtrs heatmap)
 {
+    (void)heatmap;  // OptiX path does not populate heatmap yet
     if (!m_initialized || !m_gasHandle) return;
 
     LaunchParams lp;

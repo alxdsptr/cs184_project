@@ -25,6 +25,7 @@ public:
                 char* envMapPathBuf, size_t envMapPathBufSize, bool& loadEnvMapRequested,
                 bool& debugShowPointLights,
                 bool& skipEmissiveInNEE,
+                int& heatmapMode,
                 int* renderMode = nullptr,
                 int* dlssQuality = nullptr,
                 uint32_t renderResW = 0,
