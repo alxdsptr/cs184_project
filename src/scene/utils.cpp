@@ -103,6 +103,61 @@ void decompressBC3Block(const uint8_t* block, uint8_t out[4][4][4]) {
     }
 }
 
+// ── BC4 single-channel block decompression ────────────────────
+// 8 bytes per block. Used directly for BC4 textures, and twice (once per
+// channel) by the BC5 decoder below. Matches the BC3 alpha-block layout.
+static void decompressBC4Block(const uint8_t* block, uint8_t out[4][4]) {
+    uint8_t v0 = block[0];
+    uint8_t v1 = block[1];
+    uint8_t vals[8];
+    vals[0] = v0;
+    vals[1] = v1;
+    if (v0 > v1) {
+        for (int i = 1; i <= 6; i++)
+            vals[i + 1] = (uint8_t)(((7 - i) * v0 + i * v1 + 3) / 7);
+    } else {
+        for (int i = 1; i <= 4; i++)
+            vals[i + 1] = (uint8_t)(((5 - i) * v0 + i * v1 + 2) / 5);
+        vals[6] = 0;
+        vals[7] = 255;
+    }
+    uint64_t bits = 0;
+    for (int i = 2; i < 8; i++)
+        bits |= (uint64_t)block[i] << (8 * (i - 2));
+    for (int row = 0; row < 4; row++) {
+        for (int col = 0; col < 4; col++) {
+            int pixel = row * 4 + col;
+            int idx = (int)((bits >> (3 * pixel)) & 0x7);
+            out[row][col] = vals[idx];
+        }
+    }
+}
+
+// ── BC5 / 3Dc (ATI2) software decompression ───────────────────
+// 16 bytes per block: two stacked BC4 blocks. First → R, second → G.
+// Blue is reconstructed as z = sqrt(1 - nx² - ny²) so shader code doesn't
+// need a per-sample rebuild; A = 255.
+static void decompressBC5Block(const uint8_t* block, uint8_t out[4][4][4]) {
+    uint8_t r[4][4];
+    uint8_t g[4][4];
+    decompressBC4Block(block,     r);
+    decompressBC4Block(block + 8, g);
+    for (int row = 0; row < 4; row++) {
+        for (int col = 0; col < 4; col++) {
+            float nx = r[row][col] / 255.0f * 2.0f - 1.0f;
+            float ny = g[row][col] / 255.0f * 2.0f - 1.0f;
+            float nz = std::sqrt(std::fmax(0.0f, 1.0f - nx * nx - ny * ny));
+            int bInt = (int)std::lround((nz * 0.5f + 0.5f) * 255.0f);
+            if (bInt < 0) bInt = 0;
+            if (bInt > 255) bInt = 255;
+            out[row][col][0] = r[row][col];
+            out[row][col][1] = g[row][col];
+            out[row][col][2] = (uint8_t)bInt;
+            out[row][col][3] = 255;
+        }
+    }
+}
+
 bool decompressDDS(const std::string& path,
                    std::vector<unsigned char>& outPixels,
                    int& outWidth, int& outHeight) {
@@ -124,8 +179,13 @@ bool decompressDDS(const std::string& path,
                   fmt == gli::FORMAT_RGBA_DXT1_SRGB_BLOCK8);
     bool isBC3 = (fmt == gli::FORMAT_RGBA_DXT5_UNORM_BLOCK16 ||
                   fmt == gli::FORMAT_RGBA_DXT5_SRGB_BLOCK16);
+    // BC5 / 3Dc / ATI2: two-channel format used for tangent-space normals.
+    // gli::convert swizzles this to (R, 0, 0, 1), destroying the Y channel —
+    // we MUST decompress it ourselves.
+    bool isBC5 = (fmt == gli::FORMAT_RG_ATI2N_UNORM_BLOCK16 ||
+                  fmt == gli::FORMAT_RG_ATI2N_SNORM_BLOCK16);
 
-    if (!isBC1 && !isBC3) return false; // unsupported, let gli try
+    if (!isBC1 && !isBC3 && !isBC5) return false; // unsupported, let gli try
 
     size_t blockSize = isBC1 ? 8 : 16;
     int bw = (outWidth + 3) / 4;
@@ -138,8 +198,9 @@ bool decompressDDS(const std::string& path,
         for (int bx = 0; bx < bw; bx++) {
             const uint8_t* block = src + ((size_t)by * bw + bx) * blockSize;
             uint8_t decoded[4][4][4];
-            if (isBC1) decompressBC1Block(block, decoded);
-            else       decompressBC3Block(block, decoded);
+            if (isBC1)      decompressBC1Block(block, decoded);
+            else if (isBC3) decompressBC3Block(block, decoded);
+            else            decompressBC5Block(block, decoded);
 
             for (int row = 0; row < 4; row++) {
                 int py = by * 4 + row;
