@@ -48,9 +48,21 @@ inline D float3 applyNormalMap(
     float3 B = cross(N, T) * tangent4.w;
 
     float4 nm = tex2D<float4>(normalTex, uv.x, uv.y);
-    float3 ts = make_float3(nm.x * 2.0f - 1.0f,
-                            nm.y * 2.0f - 1.0f,
-                            nm.z * 2.0f - 1.0f);
+    float tsx = nm.x * 2.0f - 1.0f;
+    float tsy = nm.y * 2.0f - 1.0f;
+    float tsz = nm.z * 2.0f - 1.0f;
+    // BC5 / 3Dc / two-channel normal maps store only X and Y — the blue
+    // channel ends up as 0 (→ tsz ≈ -1) or 128 (→ tsz ≈ 0) after conversion
+    // to RGBA8. A valid tangent-space normal has tsz > 0 (pointing out of
+    // the surface); anything below a small epsilon means we need to
+    // reconstruct z = sqrt(1 - x² - y²). This also catches BC1 artefacts
+    // where blue collapses to 0. Without this, the normal is rotated to
+    // point INTO the surface, producing the "floor lit from below" effect.
+    if (tsz < 0.25f) {
+        float xy2 = tsx * tsx + tsy * tsy;
+        tsz = sqrtf(fmaxf(0.0f, 1.0f - xy2));
+    }
+    float3 ts = make_float3(tsx, tsy, tsz);
     float tsLen2 = dot(ts, ts);
     if (tsLen2 < 1e-8f) return N;
     ts = ts * rsqrtf(tsLen2);
