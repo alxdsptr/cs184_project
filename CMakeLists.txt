@@ -236,6 +236,23 @@ if(PATHTRACER_ENABLE_OPTIX)
     # Compile OptiX device programs to OptiX-IR.
     set(OPTIX_PROGRAMS_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/OptiXPrograms.cu)
     set(OPTIX_PROGRAMS_IR  ${CMAKE_CURRENT_BINARY_DIR}/optix_programs.optixir)
+    # Headers that change LaunchParams / DeviceSceneData layout MUST trigger a
+    # rebuild — otherwise the shipped .optixir bakes in a stale
+    # pipelineLaunchParamsSize and runtime barfs with OPTIX_ERROR_INVALID_VALUE
+    # (7001) "launch param size configured by pipeline link options ... is
+    # smaller than pipelineParamsSize". nvcc --optix-ir doesn't emit a depfile,
+    # so we list the big ones by hand.
+    set(OPTIX_PROGRAMS_DEPS
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/OptiXLaunchParams.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/OptiXSBTRecords.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/DeviceScene.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/MaterialGPU.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/LightGPU.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/AreaLightGPU.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/Sampling.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/core/Camera.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/render/AuxBuffers.h
+    )
     add_custom_command(
         OUTPUT  ${OPTIX_PROGRAMS_IR}
         COMMAND ${CMAKE_CUDA_COMPILER}
@@ -250,7 +267,7 @@ if(PATHTRACER_ENABLE_OPTIX)
                 "-I$<JOIN:${CUDAToolkit_INCLUDE_DIRS},;-I>"
                 -o ${OPTIX_PROGRAMS_IR}
                 ${OPTIX_PROGRAMS_SRC}
-        DEPENDS ${OPTIX_PROGRAMS_SRC}
+        DEPENDS ${OPTIX_PROGRAMS_SRC} ${OPTIX_PROGRAMS_DEPS}
         COMMENT "Compiling OptiX device programs to OptiX-IR"
         VERBATIM)
     add_custom_target(optix_programs_ir DEPENDS ${OPTIX_PROGRAMS_IR})
