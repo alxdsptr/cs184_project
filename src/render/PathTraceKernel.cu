@@ -952,7 +952,7 @@ __global__ void pathTraceKernel(
         // exclusivity). Bistro puts its main illumination on 4 point lights
         // in addition to emissive mesh geometry — gating this branch behind
         // "no area lights" would drop those entirely.
-        if (scene.d_pointLights && scene.pointLightCount > 0) {
+        else if (scene.d_pointLights && scene.pointLightCount > 0) {
             float3 direct = make_float3(0.0f, 0.0f, 0.0f);
             float3 V = -ray.direction;
 

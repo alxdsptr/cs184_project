@@ -682,7 +682,7 @@ extern "C" __global__ void __raygen__path_trace()
 
             // Point lights are delta emitters — always sampled, regardless of
             // whether area lights also exist. See PathTraceKernel.cu comment.
-            if (scene.d_pointLights && scene.pointLightCount > 0) {
+            else if (scene.d_pointLights && scene.pointLightCount > 0) {
                 float3 direct = make_float3(0.0f, 0.0f, 0.0f);
                 float3 V = -ray.direction;
                 for (uint32_t li = 0; li < scene.pointLightCount; li++) {
