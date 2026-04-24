@@ -1,5 +1,6 @@
 #include "core/Camera.h"
 #include "core/Halton.h"
+#include "core/SceneCollider.h"
 #include "util/Log.h"
 #include <cmath>
 #include <fstream>
@@ -67,13 +68,37 @@ void Camera::setAspect(float a) {
 
 void Camera::update(float dt, const InputState& input) {
     m_moved = false;
+    m_lifetimeT += dt;
+
+    // Mouse look — same in both modes; gated by mouseHeld so the caller can
+    // disable look while the cursor is released for ImGui interaction.
+    if (input.mouseHeld && (fabsf(input.mouseDx) > 0.01f || fabsf(input.mouseDy) > 0.01f)) {
+        m_yaw   += input.mouseDx * m_mouseSens;
+        m_pitch -= input.mouseDy * m_mouseSens;
+        m_pitch  = clampf(m_pitch, -89.0f, 89.0f);
+        m_moved  = true;
+        rebuildMatrices(); // refresh basis so movement uses current heading
+    }
+
+    if (m_collider && m_collider->ready()) {
+        updateCollider(dt, input);
+    } else {
+        updateFreeFly(dt, input);
+    }
+
+    if (m_moved) {
+        rebuildMatrices();
+    }
+}
+
+void Camera::updateFreeFly(float dt, const InputState& input) {
     float speed = m_moveSpeed * dt;
 
     // WASD movement — use locked basis if the user has frozen the movement
     // frame, otherwise follow the current camera orientation.
-    const float3 fwd   = m_frameLocked ? m_lockedForward : m_forward;
-    const float3 right = m_frameLocked ? m_lockedRight   : m_right;
-    const float3 upAxis = m_frameLocked ? m_lockedUp     : make_float3(0, 1, 0);
+    const float3 fwd    = m_frameLocked ? m_lockedForward : m_forward;
+    const float3 right  = m_frameLocked ? m_lockedRight   : m_right;
+    const float3 upAxis = m_frameLocked ? m_lockedUp      : make_float3(0, 1, 0);
 
     float3 moveDir = make_float3(0, 0, 0);
     if (input.forward)  moveDir += fwd;
@@ -88,17 +113,193 @@ void Camera::update(float dt, const InputState& input) {
         m_position += moveDir * (speed / len);
         m_moved = true;
     }
+}
 
-    // Mouse look
-    if (input.mouseHeld && (fabsf(input.mouseDx) > 0.01f || fabsf(input.mouseDy) > 0.01f)) {
-        m_yaw   += input.mouseDx * m_mouseSens;
-        m_pitch -= input.mouseDy * m_mouseSens;
-        m_pitch  = clampf(m_pitch, -89.0f, 89.0f);
-        m_moved  = true;
+bool Camera::probeGround(float3 from, float maxDist, float& groundY) const {
+    if (!m_collider || !m_collider->ready()) return false;
+    float t;
+    float3 n;
+    // Start the probe just above `from` so we don't miss a face we're already
+    // resting on (eps offset survives floating-point jitter).
+    float3 origin = make_float3(from.x, from.y + 0.05f, from.z);
+    if (m_collider->raycast(origin, make_float3(0, -1, 0), maxDist + 0.05f, t, n)) {
+        groundY = origin.y - t;
+        return true;
+    }
+    return false;
+}
+
+float3 Camera::sweepHorizontal(float3 from, float3 delta) const {
+    // `delta` should be horizontal; we sweep along X then Z so the camera
+    // slides along walls instead of binding on inner corners. For each axis
+    // we cast a ray of length |delta| + radius and clamp to the hit.
+    float3 result = make_float3(0, 0, 0);
+    float3 cur = from;
+
+    auto sweepAxis = [&](int axis) {
+        float d = (axis == 0) ? delta.x : delta.z;
+        if (fabsf(d) < 1e-6f) return;
+        float3 dir = make_float3(0, 0, 0);
+        if (axis == 0) dir.x = (d > 0) ? 1.0f : -1.0f;
+        else           dir.z = (d > 0) ? 1.0f : -1.0f;
+
+        float reach = fabsf(d) + m_collisionRadius;
+        float tHit;
+        float3 n;
+        if (m_collider->raycast(cur, dir, reach, tHit, n)) {
+            // Stop `m_collisionRadius` before the hit so the capsule's edge
+            // sits on the wall. Negative results clamp to zero (already
+            // touching).
+            float allowed = fmaxf(0.0f, tHit - m_collisionRadius);
+            float step = (d > 0) ? fminf(allowed, d) : fmaxf(-allowed, d);
+            if (axis == 0) { cur.x += step; result.x = step; }
+            else           { cur.z += step; result.z = step; }
+        } else {
+            if (axis == 0) { cur.x += d; result.x = d; }
+            else           { cur.z += d; result.z = d; }
+        }
+    };
+
+    sweepAxis(0);
+    sweepAxis(2);
+    return result;
+}
+
+void Camera::updateCollider(float dt, const InputState& input) {
+    // Cap dt so a hitch doesn't tunnel us through the floor / a wall.
+    if (dt > 0.05f) dt = 0.05f;
+
+    // ── Double-tap jump → toggle fly mode ──
+    if (input.jumpPressed) {
+        float since = m_lifetimeT - m_lastJumpPressTime;
+        if (since < 0.30f) {
+            m_flyMode   = !m_flyMode;
+            m_velocityY = 0.0f;
+            LOG_INFO("Camera: fly mode %s", m_flyMode ? "ON" : "OFF");
+            // Consume both presses so a triple-tap doesn't toggle twice.
+            m_lastJumpPressTime = -1e9f;
+        } else {
+            m_lastJumpPressTime = m_lifetimeT;
+        }
     }
 
-    if (m_moved) {
+    // ── Build horizontal move from WASD ──
+    // Project camera basis onto the XZ plane so pitch doesn't drag us into
+    // the floor or sky when walking.
+    float3 fwdH = make_float3(m_forward.x, 0.0f, m_forward.z);
+    float3 rgtH = make_float3(m_right.x,   0.0f, m_right.z);
+    float fl = length(fwdH);
+    float rl = length(rgtH);
+    if (fl > 1e-6f) fwdH = fwdH / fl;
+    else            fwdH = make_float3(0, 0, -1);
+    if (rl > 1e-6f) rgtH = rgtH / rl;
+    else            rgtH = make_float3(1, 0, 0);
+
+    float3 moveDir = make_float3(0, 0, 0);
+    if (input.forward)  moveDir += fwdH;
+    if (input.backward) moveDir += fwdH * (-1.0f);
+    if (input.left)     moveDir += rgtH * (-1.0f);
+    if (input.right)    moveDir += rgtH;
+    float ml = length(moveDir);
+    if (ml > 1e-6f) moveDir = moveDir / ml;
+
+    float speedScale = m_flyMode ? 2.0f : 1.0f;
+    float3 horizDelta = moveDir * (m_moveSpeed * speedScale * dt);
+
+    if (length(horizDelta) > 1e-6f) {
+        float3 applied = sweepHorizontal(m_position, horizDelta);
+        if (length(applied) > 1e-6f) {
+            m_position += applied;
+            m_moved = true;
+        }
+    }
+
+    // ── Vertical motion ──
+    if (m_flyMode) {
+        // Creative-mode: free vertical translation, no gravity, no ground
+        // snap. Hold space to ascend, shift to descend.
+        float v = 0.0f;
+        if (input.up)   v += 1.0f;
+        if (input.down) v -= 1.0f;
+        if (fabsf(v) > 1e-6f) {
+            m_position.y += v * m_moveSpeed * speedScale * dt;
+            m_moved = true;
+        }
+        m_velocityY = 0.0f;
+        m_onGround = false;
+    } else {
+        // Walking: gravity, jump on rising-edge of space, ground snap.
+        float groundY = 0.0f;
+        bool onGround = probeGround(m_position - make_float3(0, m_eyeHeight, 0),
+                                    0.20f, groundY);
+        // probeGround took feet-level origin; convert ground hit back to eye Y.
+        float groundEyeY = groundY + m_eyeHeight;
+
+        if (onGround && m_velocityY <= 0.0f) {
+            m_position.y = groundEyeY;
+            m_velocityY = 0.0f;
+            m_onGround = true;
+        } else {
+            m_onGround = false;
+        }
+
+        if (input.jumpPressed && m_onGround) {
+            m_velocityY = m_jumpSpeed;
+            m_onGround = false;
+        }
+
+        // Integrate gravity.
+        m_velocityY -= m_gravity * dt;
+        // Clamp terminal velocity to keep tunneling under control on cheap
+        // raycasts.
+        if (m_velocityY < -50.0f) m_velocityY = -50.0f;
+
+        float dy = m_velocityY * dt;
+        if (fabsf(dy) > 1e-6f) {
+            // Cast against ceiling/floor before applying so we don't poke
+            // through low ceilings or fall through thin floors.
+            float3 dirV = make_float3(0, dy > 0 ? 1.0f : -1.0f, 0);
+            float reach = fabsf(dy) + m_collisionRadius;
+            float tHit;
+            float3 n;
+            float3 origin = m_position;
+            if (m_collider->raycast(origin, dirV, reach, tHit, n)) {
+                float allowed = fmaxf(0.0f, tHit - m_collisionRadius);
+                float step = (dy > 0) ? fminf(allowed, dy) : fmaxf(-allowed, dy);
+                m_position.y += step;
+                if (fabsf(step) < fabsf(dy) - 1e-5f) {
+                    // Hit something — kill vertical velocity.
+                    m_velocityY = 0.0f;
+                    if (dy < 0.0f) m_onGround = true;
+                }
+            } else {
+                m_position.y += dy;
+            }
+            m_moved = true;
+        }
+    }
+}
+
+void Camera::snapToGround(float maxDrop) {
+    if (!m_collider || !m_collider->ready()) return;
+    float groundY;
+    // Probe from well above current position to find the floor underneath.
+    float3 origin = make_float3(m_position.x,
+                                m_position.y + 0.5f,
+                                m_position.z);
+    if (probeGround(origin, maxDrop, groundY)) {
+        m_position = make_float3(m_position.x,
+                                 groundY + m_eyeHeight,
+                                 m_position.z);
+        m_velocityY = 0.0f;
+        m_onGround = true;
+        m_groundedOnce = true;
+        m_flyMode = false;
         rebuildMatrices();
+        m_moved = true;
+    } else {
+        LOG_WARN("Camera::snapToGround: no ground found beneath (%g, %g, %g)",
+                 m_position.x, m_position.y, m_position.z);
     }
 }
 

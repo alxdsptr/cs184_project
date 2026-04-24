@@ -3,6 +3,8 @@
 #include "core/Math.h"
 #include <string>
 
+class SceneCollider;
+
 struct CameraParams {
     float3   position;
     float    fovYRadians;
@@ -31,10 +33,19 @@ struct InputState {
     bool backward = false;
     bool left     = false;
     bool right    = false;
+    // `up`/`down` keep the legacy free-fly meaning (translate along world up).
+    // In collider mode `up` is the held jump key (ground jump or fly-mode
+    // ascend), `down` is the descend key (fly mode only / sneak).
     bool up       = false;
     bool down     = false;
+    // Rising edge of the jump key. Used for jump impulse + double-tap fly
+    // toggle in collider mode.
+    bool jumpPressed = false;
     float mouseDx = 0.0f;
     float mouseDy = 0.0f;
+    // Apply `mouseDx/Dy` to look around. In free-fly mode this is the legacy
+    // "right-mouse held" gate; in collider/cursor-captured mode it's true
+    // every frame (cursor is hidden + locked).
     bool mouseHeld = false;
 };
 
@@ -58,6 +69,19 @@ public:
     void lockMovementFrame();
     void unlockMovementFrame() { m_frameLocked = false; }
     bool isMovementFrameLocked() const { return m_frameLocked; }
+
+    // Attach a collider for FPS-style movement (gravity, jump, wall sweeps).
+    // When null, `update()` falls back to the original free-fly behavior.
+    void setCollider(const SceneCollider* c) { m_collider = c; }
+    bool hasCollider() const { return m_collider != nullptr; }
+
+    // Snap the camera to the ground directly below `m_position`. Resets fly
+    // mode and vertical velocity. No-op if no collider is attached or if no
+    // ground is found within `maxDrop`.
+    void snapToGround(float maxDrop = 1000.0f);
+
+    bool isFlying() const { return m_flyMode; }
+    void setFlying(bool fly) { m_flyMode = fly; m_velocityY = 0.0f; }
 
     bool saveToFile(const std::string& path) const;
     bool loadFromFile(const std::string& path);
@@ -92,4 +116,31 @@ private:
     float3 m_lockedForward = make_float3(0, 0, -1);
     float3 m_lockedRight   = make_float3(1, 0, 0);
     float3 m_lockedUp      = make_float3(0, 1, 0);
+
+    // ── Collider-mode physics (Minecraft-creative-style movement) ──
+    // Active only when m_collider != nullptr. The camera is treated as a
+    // capsule of half-width `m_collisionRadius` with eyes `m_eyeHeight`
+    // above its feet; horizontal motion sweeps against scene geometry,
+    // vertical motion is gravity-driven on the ground and free in fly mode.
+    void updateFreeFly(float dt, const InputState& input);
+    void updateCollider(float dt, const InputState& input);
+    // Sweep a horizontal step `delta` (Y component is ignored), returning a
+    // collision-clamped delta. Performs per-axis raycasts so we slide along
+    // walls instead of stopping dead.
+    float3 sweepHorizontal(float3 from, float3 delta) const;
+    // Returns true if a downward ray from `from` hits ground within `maxDist`.
+    // On hit, writes the ground Y-coordinate into `groundY`.
+    bool   probeGround(float3 from, float maxDist, float& groundY) const;
+
+    const SceneCollider* m_collider = nullptr;
+    float  m_collisionRadius = 0.3f;   // half-width of the camera "capsule"
+    float  m_eyeHeight       = 1.7f;   // distance from feet to eyes
+    float  m_gravity         = 28.0f;  // m/s^2 — snappier than real gravity
+    float  m_jumpSpeed       = 8.5f;   // m/s, gives ~1.3 m jump height
+    float  m_velocityY       = 0.0f;
+    bool   m_onGround        = false;
+    bool   m_flyMode         = false;
+    float  m_lastJumpPressTime = -1e9f;
+    float  m_lifetimeT       = 0.0f;   // seconds since camera created
+    bool   m_groundedOnce    = false;  // becomes true after first ground snap
 };

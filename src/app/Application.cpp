@@ -162,6 +162,17 @@ bool Application::init(uint32_t width, uint32_t height, const std::string& title
     if (!m_window) { LOG_ERROR("glfwCreateWindow failed"); return false; }
     glfwSetWindowUserPointer(m_window, this);
 
+    // Capture the cursor by default in interactive mode so the camera tracks
+    // raw mouse motion (FPS-style). ESC toggles back to a normal cursor for
+    // ImGui interaction; in that mode the legacy right-drag look still works.
+    if (m_guiEnabled) {
+        glfwSetInputMode(m_window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+        if (glfwRawMouseMotionSupported()) {
+            glfwSetInputMode(m_window, GLFW_RAW_MOUSE_MOTION, GLFW_TRUE);
+        }
+        m_cursorCaptured = true;
+    }
+
     // CUDA device
     int deviceCount = 0;
     CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
@@ -300,6 +311,18 @@ bool Application::loadScene(const std::string& path) {
     m_sceneLoaded = true;
     m_renderer.resetAccumulation();
 
+    // CPU-side collider for camera physics (gravity, jump, wall sweeps).
+    // Uses its own BVH over the same triangle soup the GPU uses; only
+    // attached in interactive (GUI) mode so headless rendering keeps the
+    // legacy free-fly camera that respects --camera files exactly.
+    if (m_guiEnabled) {
+        m_collider.build(m_scene);
+        m_camera.setCollider(&m_collider);
+    } else {
+        m_collider.clear();
+        m_camera.setCollider(nullptr);
+    }
+
     std::string ext = lowerString(std::filesystem::path(path).extension().string());
     const SceneCamera& sceneCamera = m_scene.getCamera();
     float aspect = m_height > 0 ? (float)m_width / (float)m_height : 1.0f;
@@ -317,6 +340,12 @@ bool Application::loadScene(const std::string& path) {
         if (m_camera.loadFromFile(m_cameraFilePath)) {
             LOG_INFO("Loaded camera from: %s", m_cameraFilePath.c_str());
         }
+    } else if (m_guiEnabled && m_camera.hasCollider()) {
+        // Drop the camera onto the ground at its current XZ. Skipped when
+        // the user passed --camera so explicit viewpoints aren't clobbered.
+        // If no ground is found we leave the position alone and the player
+        // will simply fall once the loop starts (gravity + wall sweeps).
+        m_camera.snapToGround();
     }
 
     m_renderer.resetAccumulation();
@@ -352,6 +381,25 @@ void Application::processInput() {
         return;
     }
 
+    // ── ESC toggles cursor capture ──
+    // Captured (default): cursor hidden + locked, mouse motion always drives
+    //   camera look ("晃鼠标"-style FPS controls).
+    // Released: normal cursor for ImGui; camera look only fires while the
+    //   right mouse button is held (legacy drag fallback).
+    bool escDown = glfwGetKey(m_window, GLFW_KEY_ESCAPE) == GLFW_PRESS;
+    if (escDown && !m_prevEscDown) {
+        m_cursorCaptured = !m_cursorCaptured;
+        if (m_cursorCaptured) {
+            glfwSetInputMode(m_window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+        } else {
+            glfwSetInputMode(m_window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+        }
+        // Force the next mouse delta to start fresh — switching modes warps
+        // the cursor and we don't want that jump fed into yaw/pitch.
+        m_firstMouse = true;
+    }
+    m_prevEscDown = escDown;
+
     bool speedDownKey = glfwGetKey(m_window, GLFW_KEY_LEFT_BRACKET) == GLFW_PRESS;
     bool speedUpKey = glfwGetKey(m_window, GLFW_KEY_RIGHT_BRACKET) == GLFW_PRESS;
 
@@ -360,7 +408,10 @@ void Application::processInput() {
         m_input.backward = glfwGetKey(m_window, GLFW_KEY_S) == GLFW_PRESS;
         m_input.left     = glfwGetKey(m_window, GLFW_KEY_A) == GLFW_PRESS;
         m_input.right    = glfwGetKey(m_window, GLFW_KEY_D) == GLFW_PRESS;
-        m_input.up       = glfwGetKey(m_window, GLFW_KEY_SPACE) == GLFW_PRESS;
+        bool spaceDown   = glfwGetKey(m_window, GLFW_KEY_SPACE) == GLFW_PRESS;
+        m_input.up           = spaceDown;
+        m_input.jumpPressed  = spaceDown && !m_prevSpaceDown;
+        m_prevSpaceDown      = spaceDown;
         m_input.down     = glfwGetKey(m_window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS;
 
         if (speedDownKey && !m_prevSpeedDownKey) {
@@ -369,13 +420,20 @@ void Application::processInput() {
         if (speedUpKey && !m_prevSpeedUpKey) {
             m_camera.setMoveSpeed(m_camera.getMoveSpeed() * 1.1f);
         }
+    } else {
+        // Don't latch a stale "space was down" state while ImGui owns the
+        // keyboard, otherwise releasing focus would synthesize a jump.
+        m_prevSpaceDown = false;
     }
 
     m_prevSpeedDownKey = speedDownKey;
     m_prevSpeedUpKey = speedUpKey;
 
+    // ── Mouse look ──
     if (!m_gui.wantCaptureMouse()) {
-        m_input.mouseHeld = glfwGetMouseButton(m_window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+        bool rightHeld = glfwGetMouseButton(m_window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+        // Captured: look every frame. Released: only while RMB is held.
+        m_input.mouseHeld = m_cursorCaptured ? true : rightHeld;
         double mx, my;
         glfwGetCursorPos(m_window, &mx, &my);
         if (m_firstMouse) {
@@ -388,6 +446,11 @@ void Application::processInput() {
         m_input.mouseDy = m_invertMouseY ? -rawDy : rawDy;
         m_lastMouseX = mx;
         m_lastMouseY = my;
+    } else {
+        // ImGui is grabbing the mouse — don't apply look this frame, and
+        // resync next frame so the jump back into the viewport doesn't fire
+        // a spurious delta.
+        m_firstMouse = true;
     }
 }
 
@@ -533,7 +596,10 @@ void Application::runGui() {
             m_renderer.resetAccumulation();
         }
 
-        if (glfwGetKey(m_window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+        // ESC is owned by processInput() (toggles cursor capture). Use the
+        // window close button (or Q) to quit.
+        if (glfwGetKey(m_window, GLFW_KEY_Q) == GLFW_PRESS &&
+            !m_gui.wantCaptureKeyboard()) {
             glfwSetWindowShouldClose(m_window, true);
         }
 

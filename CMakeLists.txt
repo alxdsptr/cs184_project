@@ -167,6 +167,7 @@ add_executable(pathtracer
     # Core
     src/core/Math.cpp
     src/core/Camera.cpp
+    src/core/SceneCollider.cpp
     # Scene
     src/scene/Scene.cpp
     src/scene/SceneLoader.cpp

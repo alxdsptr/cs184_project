@@ -1,5 +1,6 @@
 #pragma once
 #include "core/Camera.h"
+#include "core/SceneCollider.h"
 #include "display/VulkanDisplay.h"
 #include "gui/GUI.h"
 #include "scene/Scene.h"
@@ -51,6 +52,7 @@ private:
     uint32_t    m_height = 720;
 
     Camera        m_camera;
+    SceneCollider m_collider;
     VulkanDisplay m_display;
     GUI        m_gui;
     Scene      m_scene;
@@ -75,6 +77,14 @@ private:
     double m_lastMouseX = 0.0;
     double m_lastMouseY = 0.0;
     bool   m_firstMouse = true;
+    // Cursor capture toggle. When captured (default), mouse motion drives
+    // camera look every frame and the cursor is hidden + locked to the
+    // window. ESC releases the cursor for ImGui interaction; in that mode
+    // mouse-look only fires while the right mouse button is held (the legacy
+    // workflow). Re-press ESC (or click into the viewport) to recapture.
+    bool   m_cursorCaptured = true;
+    bool   m_prevEscDown    = false;
+    bool   m_prevSpaceDown  = false;
 
     bool m_enableEnvironment = false;
     bool m_invertMouseY = false;
