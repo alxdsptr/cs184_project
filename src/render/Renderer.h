@@ -2,6 +2,7 @@
 #include "render/AccumulationBuffer.h"
 #include "render/AuxBuffers.h"
 #include "render/Tonemapping.h"
+#include "render/ReSTIR.h"
 #include "core/Camera.h"
 #include "gpu/DeviceScene.h"
 #include <cstdint>
@@ -62,6 +63,12 @@ public:
     ToneMappingMode getToneMappingMode() const { return m_toneMappingMode; }
     void setToneMappingMode(ToneMappingMode mode) { m_toneMappingMode = mode; }
 
+    // ReSTIR DI controls (applied to primary-hit direct lighting in Native mode).
+    bool  isReSTIREnabled() const { return m_restir.enabled(); }
+    void  setReSTIREnabled(bool on) { m_restir.setEnabled(on); m_restir.invalidateHistory(); }
+    ReSTIRContext&       restir()       { return m_restir; }
+    const ReSTIRContext& restir() const { return m_restir; }
+
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
     enum class DLSSQuality { Performance, Balanced, Quality, DLAA };
     void setDLSSQuality(DLSSQuality q);
@@ -94,6 +101,7 @@ private:
 
     AccumulationBuffer m_accumBuffer;
     AuxBuffers         m_auxBuffers;
+    ReSTIRContext      m_restir;
     uint32_t m_width = 0, m_height = 0;
     float    m_exposure = 1.0f;
     ToneMappingMode m_toneMappingMode = ToneMappingMode::ACES;

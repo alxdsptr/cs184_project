@@ -44,6 +44,11 @@ public:
         return data;
     }
 
+    void patchScene(DeviceSceneData& scene) const override {
+        scene.d_bvhNodes   = m_bvhNodes;
+        scene.bvhRootIndex = m_bvhRoot;
+    }
+
 private:
     DeviceScene m_deviceScene;
     BVHNode*    m_bvhNodes = nullptr;

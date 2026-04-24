@@ -41,6 +41,13 @@ struct DeviceSceneData {
     // PDF lookup when a BSDF-sampled ray hits a known emissive triangle).
     uint32_t*     d_lightIndexToSlot    = nullptr;
 
+    // ReSTIR DI — when non-null, the main kernel reads the precomputed
+    // reservoir at bounce-0 NEE instead of running fresh RIS. Struct type is
+    // forward-declared opaque (void*) to avoid pulling render/ReSTIR.h into
+    // every translation unit that sees DeviceSceneData.
+    void*         d_restirReservoirs    = nullptr;
+    int           restirEnabled         = 0;
+
     // HDR environment map (equirectangular, float4 texture)
     cudaTextureObject_t envMapTex   = 0;
 

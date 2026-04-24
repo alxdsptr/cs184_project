@@ -58,4 +58,12 @@ public:
     ) = 0;
 
     virtual DeviceSceneData getSceneData() const = 0;
+
+    // Fill in backend-private pointers (triangle BVH nodes, etc.) on `scene`
+    // so a caller can launch their own kernels against the same acceleration
+    // structure the backend's launchPathTrace uses. The default impl leaves
+    // `scene` untouched; CUDABackend overrides it to patch d_bvhNodes /
+    // bvhRootIndex. Used by the renderer's ReSTIR prepass, which needs a
+    // primary-ray BVH before the main kernel gets a chance to patch one in.
+    virtual void patchScene(DeviceSceneData& scene) const { (void)scene; }
 };

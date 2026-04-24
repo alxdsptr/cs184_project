@@ -10,6 +10,7 @@
 #include "gpu/SHEnv.cuh"
 #include "accel/BVH.h"
 #include "accel/LightBVHSample.h"
+#include "render/ReSTIR.h"
 #include "util/CudaCheck.h"
 
 #include <cuda_fp16.h>
@@ -875,38 +876,64 @@ __global__ void pathTraceKernel(
         if (scene.d_areaLights && scene.areaLightCount > 0 &&
             scene.d_areaLightCDF && scene.areaLightTotalWeight > 0.0f) {
             uint32_t lightIndex = 0;
-            // P(select this light) — will be filled either by the BVH
-            // descent or by the flat-CDF fallback (weight/totalWeight).
-            float    pSelect = 0.0f;
-            bool     haveLight = false;
-            if (scene.d_lightBVHNodes && scene.d_lightOrderedIndices) {
-                uint32_t slot = 0;
-                float    pdf  = 0.0f;
-                if (lightBVH_sample(scene.d_lightBVHNodes,
-                                    scene.lightBVHRootIndex,
-                                    hit.position, pcg32_float(rng),
-                                    slot, pdf) && pdf > 0.0f) {
-                    lightIndex = scene.d_lightOrderedIndices[slot];
-                    pSelect    = pdf;
-                    haveLight  = true;
+            float    pSelect  = 0.0f;       // unused when restirActive
+            float    b0 = 0.0f, b1 = 0.0f, b2 = 0.0f;
+            float    restirW = 0.0f;
+            // ReSTIR is applied at the primary hit (bounce 0) only; bounces
+            // ≥1 keep the existing light-BVH / CDF sampling pipeline because
+            // the reservoir buffer is only populated for camera rays.
+            bool restirActive = (scene.restirEnabled != 0) &&
+                                (scene.d_restirReservoirs != nullptr) &&
+                                (bounce == 0) && (s == 0);
+            bool restirSkip = false;
+            if (restirActive) {
+                const ReSTIRReservoir* res =
+                    reinterpret_cast<const ReSTIRReservoir*>(scene.d_restirReservoirs);
+                ReSTIRReservoir r = res[pixelIdx];
+                if (r.lightIndex == 0xFFFFFFFFu || r.W <= 0.0f || r.pHat <= 0.0f) {
+                    // Empty reservoir (e.g. surface-culled) → skip NEE at this
+                    // bounce entirely. Indirect light via BSDF sampling still
+                    // works, so the image is unbiased on average.
+                    restirSkip = true;
+                } else {
+                    lightIndex = r.lightIndex;
+                    b1 = r.baryB1;
+                    b2 = r.baryB2;
+                    b0 = 1.0f - b1 - b2;
+                    restirW = r.W;
                 }
-            }
-            if (!haveLight) {
-                lightIndex = sampleAreaLightIndex(
-                    scene.d_areaLightCDF, scene.areaLightCount,
-                    pcg32_float(rng));
-                pSelect = scene.d_areaLights[lightIndex].weight /
-                          fmaxf(scene.areaLightTotalWeight, 1e-7f);
+            } else {
+                bool haveLight = false;
+                if (scene.d_lightBVHNodes && scene.d_lightOrderedIndices) {
+                    uint32_t slot = 0;
+                    float    pdf  = 0.0f;
+                    if (lightBVH_sample(scene.d_lightBVHNodes,
+                                        scene.lightBVHRootIndex,
+                                        hit.position, pcg32_float(rng),
+                                        slot, pdf) && pdf > 0.0f) {
+                        lightIndex = scene.d_lightOrderedIndices[slot];
+                        pSelect    = pdf;
+                        haveLight  = true;
+                    }
+                }
+                if (!haveLight) {
+                    lightIndex = sampleAreaLightIndex(
+                        scene.d_areaLightCDF, scene.areaLightCount,
+                        pcg32_float(rng));
+                    pSelect = scene.d_areaLights[lightIndex].weight /
+                              fmaxf(scene.areaLightTotalWeight, 1e-7f);
+                }
+
+                float r1 = pcg32_float(rng);
+                float r2 = pcg32_float(rng);
+                float su = sqrtf(r1);
+                b0 = 1.0f - su;
+                b1 = su * (1.0f - r2);
+                b2 = su * r2;
             }
 
+            if (!restirSkip) {
             GPUAreaLight light = scene.d_areaLights[lightIndex];
-
-            float r1 = pcg32_float(rng);
-            float r2 = pcg32_float(rng);
-            float su = sqrtf(r1);
-            float b0 = 1.0f - su;
-            float b1 = su * (1.0f - r2);
-            float b2 = su * r2;
 
             float3 lightV0 = light.v0;
             float3 lightV1 = light.v0 + light.e1;
@@ -965,20 +992,34 @@ __global__ void pathTraceKernel(
 
                 float shadowLum = 0.2126f * shadowTransmittance.x + 0.7152f * shadowTransmittance.y + 0.0722f * shadowTransmittance.z;
                 if (!occluded && shadowLum > 1e-6f) {
-                    float pTri = pSelect;
-                    float pArea = pTri / fmaxf(light.area, 1e-7f);
-                    float pdfOmega = pArea * dist2 / fmaxf(lightNdot, 1e-7f);
-
                     float3 V = -ray.direction;
                     float3 brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
-                    float neeSpecProb = materialSpecProb(mat, N, V, albedo);
-                    float pdfBsdf = materialMixturePdf(mat, N, V, Ld, neeSpecProb);
-                    float weight = powerHeuristic(pdfOmega, pdfBsdf);
-
                     float3 Le = sampleAreaLightLe(light, b0, b1, b2);
-                    radiance += throughput * shadowTransmittance * brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
+
+                    if (restirActive) {
+                        // ReSTIR estimator: f(x) * W where f is the unshadowed
+                        // integrand (BRDF * Le * G * NdotL) and W is the
+                        // reservoir's contribution weight. No MIS against BSDF
+                        // sampling here — ReSTIR *is* our light-side strategy
+                        // at the primary hit, and mixing it with BSDF MIS
+                        // requires a bounded-weight variant beyond the scope
+                        // of this implementation.
+                        float geom = lightNdot / dist2;
+                        radiance += throughput * shadowTransmittance *
+                                    brdf * Le * (NdotL * geom) * restirW;
+                    } else {
+                        float pTri = pSelect;
+                        float pArea = pTri / fmaxf(light.area, 1e-7f);
+                        float pdfOmega = pArea * dist2 / fmaxf(lightNdot, 1e-7f);
+                        float neeSpecProb = materialSpecProb(mat, N, V, albedo);
+                        float pdfBsdf = materialMixturePdf(mat, N, V, Ld, neeSpecProb);
+                        float weight = powerHeuristic(pdfOmega, pdfBsdf);
+                        radiance += throughput * shadowTransmittance * brdf * Le *
+                                    (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
+                    }
                 }
             }
+            } // end !restirSkip
         }
 
         // Point lights are delta emitters: BSDF-sampling can never hit them,

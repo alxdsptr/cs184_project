@@ -24,6 +24,7 @@ void Renderer::init(uint32_t width, uint32_t height) {
     m_height = height;
     m_accumBuffer.init(width, height);
     m_auxBuffers.init(width, height);
+    m_restir.init(width, height);
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
     m_renderWidth  = width;
     m_renderHeight = height;
@@ -36,6 +37,8 @@ void Renderer::resize(uint32_t width, uint32_t height) {
     m_height = height;
     m_accumBuffer.resize(width, height);
     m_auxBuffers.resize(width, height);
+    m_restir.resize(width, height);
+    m_restir.invalidateHistory();
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
     // Non-Native modes rely on shared VkImages sized to the render resolution;
@@ -57,6 +60,9 @@ void Renderer::resize(uint32_t width, uint32_t height) {
 
 void Renderer::resetAccumulation() {
     m_accumBuffer.reset();
+    // The reservoir history samples light transport that is now stale —
+    // keeping it would smear the previous camera's shading into the new one.
+    m_restir.invalidateHistory();
 }
 
 void Renderer::renderFrame(
@@ -74,11 +80,30 @@ void Renderer::renderFrame(
     if (samplesPerFrame < 1) samplesPerFrame = 1;
 
     if (m_mode == Mode::Native) {
-        // Native fallback: the kernel now accumulates `samplesPerFrame`
-        // samples into the accum buffer internally, and divides by
-        // (sampleIndex + samplesPerFrame). Advance our counter by the same.
+        // ── ReSTIR DI prepass (Bitterli et al. 2020) ─────────────
+        // Runs before the main path tracer when enabled and the scene has
+        // an area-light BVH; writes a per-pixel reservoir that the main
+        // kernel consumes at bounce-0 NEE.
+        DeviceSceneData sceneWithBVH = scene;
+        backend->patchScene(sceneWithBVH);
+        const bool restirRan = m_restir.enabled() &&
+            sceneWithBVH.d_lightBVHNodes &&
+            sceneWithBVH.d_areaLights &&
+            sceneWithBVH.areaLightCount > 0 &&
+            sceneWithBVH.d_bvhNodes;
+        if (restirRan) {
+            m_restir.runFrame(sceneWithBVH, camera,
+                              m_width, m_height, sampleIndex);
+        }
+
+        DeviceSceneData scenePatched = scene;
+        if (restirRan) {
+            scenePatched.d_restirReservoirs = m_restir.getBuffers().d_reservoirsCurr;
+            scenePatched.restirEnabled      = 1;
+        }
+
         backend->launchPathTrace(
-            scene, camera,
+            scenePatched, camera,
             m_accumBuffer.getAccumBuffer(),
             m_accumBuffer.getOutputBuffer(),
             m_auxBuffers.getPtrs(),
@@ -95,6 +120,7 @@ void Renderer::renderFrame(
             m_toneMappingMode
         );
         m_accumBuffer.addSamples(samplesPerFrame);
+        if (restirRan) m_restir.swapHistory();
         return;
     }
 
@@ -394,6 +420,7 @@ void Renderer::shutdown() {
 #endif
     m_accumBuffer.free();
     m_auxBuffers.free();
+    m_restir.free();
 }
 
 // ────────────────────────────────────────────────────────────────
