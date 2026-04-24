@@ -5,6 +5,8 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+class RayTracingBackend;
+
 // Per-pixel reservoir produced by ReSTIR DI.
 //
 // Notation follows Bitterli et al. 2020 (Spatiotemporal Reservoir Resampling
@@ -119,8 +121,21 @@ public:
     // Drive the full per-frame ReSTIR pipeline (init → temporal → spatial)
     // and leave the final reservoir in m_buffers.d_reservoirsCurr so the
     // caller can hand that pointer to the main path tracer.
-    void runFrame(const DeviceSceneData& scene, const CameraParams& camera,
-                  uint32_t width, uint32_t height, uint32_t sampleIndex);
+    //
+    // If `backend` provides a native ReSTIR init implementation (OptiX
+    // backend: raygen against the GAS), it's used for the initial-
+    // candidates pass. Otherwise the CUDA kernel runs, which requires
+    // scene.d_bvhNodes to be populated by the caller (via patchScene).
+    // The temporal + spatial passes always run on CUDA — they read buffers
+    // only, no ray tracing.
+    //
+    // Returns true if the reservoir buffer was freshly populated this
+    // frame (main kernel may consume it); false if the pass was skipped
+    // (caller must disable ReSTIR consumption this frame to avoid reading
+    // last frame's reservoirs as if they were current).
+    bool runFrame(const DeviceSceneData& scene, const CameraParams& camera,
+                  uint32_t width, uint32_t height, uint32_t sampleIndex,
+                  RayTracingBackend* backend = nullptr);
 
     // Runtime tuning knobs.
     void setNumCandidates(uint32_t n) { m_numCandidates = n; }

@@ -66,4 +66,25 @@ public:
     // bvhRootIndex. Used by the renderer's ReSTIR prepass, which needs a
     // primary-ray BVH before the main kernel gets a chance to patch one in.
     virtual void patchScene(DeviceSceneData& scene) const { (void)scene; }
+
+    // Run the ReSTIR DI initial-candidates pass for one frame: cast primary
+    // rays against this backend's acceleration structure, resolve material
+    // at the hit, and stream M light candidates into `d_reservoirsCurr`.
+    // `d_surfacesCurr` receives the cached surface record the temporal /
+    // spatial CUDA passes will read from.
+    //
+    // Returns true if the pass ran. Returns false when the backend has no
+    // override (and the renderer should fall back to the CUDA-kernel path)
+    // or when required scene data (light BVH etc.) is missing.
+    virtual bool runReSTIRInitCandidates(
+        const DeviceSceneData& /*scene*/,
+        const CameraParams&    /*camera*/,
+        void*                  /*d_reservoirsCurr*/,
+        void*                  /*d_surfacesCurr*/,
+        uint32_t               /*width*/,
+        uint32_t               /*height*/,
+        uint32_t               /*sampleIndex*/,
+        uint32_t               /*numCandidates*/) {
+        return false;  // backend has no native ReSTIR — caller falls back.
+    }
 };

@@ -1,4 +1,6 @@
 #include "render/ReSTIR.h"
+#include "render/ReSTIRDevice.cuh"  // shared target-pdf + reservoir primitives
+#include "backend/RayTracingBackend.h"
 #include "core/Math.h"
 #include "gpu/AreaLightGPU.h"
 #include "gpu/MaterialGPU.h"
@@ -9,10 +11,6 @@
 
 #include <cuda_runtime.h>
 
-#ifndef M_PI_F
-#define M_PI_F 3.14159265358979323846f
-#endif
-
 // ─────────────────────────────────────────────────────────────────────────
 // ReSTIR DI — primary-hit only, biased spatial reuse.
 //
@@ -22,95 +20,12 @@
 //
 //   E[ f / target * W ]  =  integral( f )                       [RIS]
 //
-// where target(x) = luminance(Le) * |f_r(wi)| * G(x,y) is evaluated without
+// where target(x) = restirLuminance(Le) * |f_r(wi)| * G(x,y) is evaluated without
 // visibility — shadow ray is cast once at final shading.
 // ─────────────────────────────────────────────────────────────────────────
 
-// ── Minimal BRDF helpers used only for the target-pdf evaluation ──
-// We intentionally mirror the main kernel's behavior (materialSpecProb,
-// bsdfEvaluate, bsdfDiffusePdf) rather than reuse its file — PathTraceKernel.cu
-// is a megakernel translation unit and its symbols are static. The target pdf
-// only needs a scalar luminance so small approximations are fine: we use the
-// same mixture as the main kernel but read the cached specProb off the
-// surface record, avoiding recomputation.
-
-__device__ inline float luminance(float3 c) {
-    return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
-}
-
-__device__ inline float ggx_D(float NdotH, float roughness) {
-    float a  = roughness * roughness;
-    float a2 = a * a;
-    float denom = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
-    return a2 / (M_PI_F * denom * denom + 1e-14f);
-}
-__device__ inline float smith_G1(float NdotX, float alpha) {
-    float a2 = alpha * alpha;
-    float cos2 = NdotX * NdotX;
-    return 2.0f * NdotX / (NdotX + sqrtf(a2 + (1.0f - a2) * cos2) + 1e-7f);
-}
-__device__ inline float3 fresnelSchlick(float cosTheta, float3 F0) {
-    float t = 1.0f - fminf(fmaxf(cosTheta, 0.0f), 1.0f);
-    float t5 = t*t*t*t*t;
-    return F0 + (make_float3(1,1,1) - F0) * t5;
-}
-
-__device__ inline float3 evalBrdf_local(
-    const ReSTIRSurface& s, const float3& L)
-{
-    float NdotL = fmaxf(dot(s.normal, L), 0.0f);
-    float NdotV = fmaxf(dot(s.normal, s.viewDir), 0.0f);
-    if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0,0,0);
-    if (s.pureDiffuse) return s.albedo * (1.0f / M_PI_F);
-
-    float3 H = normalize(s.viewDir + L);
-    float NdotH = fmaxf(dot(s.normal, H), 0.0f);
-    float LdotH = fmaxf(dot(L, H), 0.0f);
-    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), s.albedo, s.metallic);
-    float3 F = fresnelSchlick(LdotH, F0);
-    float Dt = ggx_D(NdotH, s.roughness);
-    float alpha = s.roughness * s.roughness;
-    float Gt = smith_G1(NdotL, alpha) * smith_G1(NdotV, alpha);
-
-    float3 spec = F * (Dt * Gt / (4.0f * NdotL * NdotV + 1e-7f));
-    float3 kd = (make_float3(1,1,1) - F) * (1.0f - s.metallic);
-    float3 diff = kd * s.albedo * (1.0f / M_PI_F);
-    return diff + spec;
-}
-
-// Target pdf = luminance(Le) * |BRDF * NdotL| * geometry, NO visibility.
-// Returns 0 if the sample is back-facing on either surface.
-__device__ inline float evalTargetPdf(
-    const ReSTIRSurface& s,
-    const GPUAreaLight&  light,
-    float b1, float b2)
-{
-    float b0 = 1.0f - b1 - b2;
-    if (b0 < 0.0f || b1 < 0.0f || b2 < 0.0f) return 0.0f;
-    float3 pOnLight = light.v0 + light.e1 * b1 + light.e2 * b2;
-    float3 toL = pOnLight - s.position;
-    float  dist2 = fmaxf(dot(toL, toL), 1e-6f);
-    float  dist  = sqrtf(dist2);
-    float3 L = toL * (1.0f / dist);
-
-    float NdotL = fmaxf(dot(s.normal, L), 0.0f);
-    float lightNdot = fmaxf(dot(light.normal, -L), 0.0f);
-    if (NdotL <= 0.0f || lightNdot <= 0.0f) return 0.0f;
-
-    // Use the on-triangle emission as a proxy. Textured emitters still work —
-    // we slightly under-weight bright texels, but the final shadow-ray pass
-    // re-fetches the texel so no energy is lost.
-    float Lum = luminance(light.emission);
-    if (Lum <= 0.0f) return 0.0f;
-
-    float3 brdf = evalBrdf_local(s, L);
-    float  fLum = luminance(brdf) * NdotL;
-    if (fLum <= 0.0f) return 0.0f;
-
-    // Geometric factor = lightNdot / dist^2  (NdotL already in fLum)
-    float geom = lightNdot / dist2;
-    return Lum * fLum * geom;
-}
+// (BRDF + target-pdf helpers live in ReSTIRDevice.cuh so OptiX raygen can
+// share them verbatim.)
 
 // Duplicate of generateRay from PathTraceKernel.cu — that file's static
 // definitions aren't visible here. Keeping it identical in math so reservoirs
@@ -135,81 +50,7 @@ __device__ inline Ray generateRayReSTIR(
     return ray;
 }
 
-// ── Reservoir primitives (Alg. 2 in Bitterli 2020) ──────────────
-// updateReservoir:      stream one candidate with weight w_i (= p_hat / pdf).
-// combineReservoir:     stream an entire other reservoir (used for reuse).
-// Both share the same code modulo how they aggregate M.
-
-__device__ inline void reservoir_reset(ReSTIRReservoir& r) {
-    r.lightIndex = 0xFFFFFFFFu;
-    r.baryB1 = 0.0f;
-    r.baryB2 = 0.0f;
-    r.pHat   = 0.0f;
-    r.W      = 0.0f;
-    r.M      = 0.0f;
-}
-
-// Returns true if the incoming candidate was accepted as the held sample.
-// wSum is the running sum of candidate weights; pass &wSum across updates.
-__device__ inline bool reservoir_update(
-    ReSTIRReservoir& r, float& wSum,
-    uint32_t lightIdx, float b1, float b2, float pHat,
-    float wCandidate, float u01)
-{
-    if (!(wCandidate > 0.0f)) return false;
-    wSum += wCandidate;
-    r.M  += 1.0f;
-    if (u01 * wSum < wCandidate) {
-        r.lightIndex = lightIdx;
-        r.baryB1     = b1;
-        r.baryB2     = b2;
-        r.pHat       = pHat;
-        return true;
-    }
-    return false;
-}
-
-// After all streaming, convert (pHat, wSum, M) into the unbiased contribution
-// weight W.  W = wSum / (M * pHat)  (Bitterli eq. 9).
-__device__ inline void reservoir_finalize(ReSTIRReservoir& r, float wSum) {
-    if (r.lightIndex == 0xFFFFFFFFu || r.pHat <= 0.0f || r.M <= 0.0f) {
-        r.W = 0.0f;
-        return;
-    }
-    r.W = wSum / (r.M * r.pHat);
-}
-
-// Stream an entire neighbor reservoir into `dst`. This is the spatial/temporal
-// combine operator: pretend we drew `src.M` candidates with effective weight
-// `src.pHat * src.W * src.M` (so that the RIS invariant holds), re-evaluated
-// at `dst`'s surface.
-__device__ inline bool reservoir_combine(
-    ReSTIRReservoir& dst, float& wSum,
-    const ReSTIRReservoir& src, float pHatAtDst, float u01)
-{
-    if (src.lightIndex == 0xFFFFFFFFu || src.M <= 0.0f) {
-        // Still count M so temporal cap logic sees the history length.
-        dst.M += src.M;
-        return false;
-    }
-    // Candidate weight contributed by this reservoir: pHatAtDst * W * M.
-    // When pHatAtDst = 0 (sample is behind the dst surface, or self-shadowed
-    // by geometry at dst's orientation) we still add to M but do not replace.
-    float w = pHatAtDst * src.W * src.M;
-    bool accepted = false;
-    if (w > 0.0f) {
-        wSum += w;
-        if (u01 * wSum < w) {
-            dst.lightIndex = src.lightIndex;
-            dst.baryB1     = src.baryB1;
-            dst.baryB2     = src.baryB2;
-            dst.pHat       = pHatAtDst;
-            accepted = true;
-        }
-    }
-    dst.M += src.M;
-    return accepted;
-}
+// (Reservoir primitives live in ReSTIRDevice.cuh.)
 
 // ── Kernel 1: initial candidate generation ──────────────────────
 // For each pixel: cast the primary ray, resolve the material (a cut-down
@@ -250,7 +91,7 @@ __global__ void kReSTIR_InitCandidates(
                                 scene.d_materialIndices, hit);
     }
 
-    ReSTIRReservoir r; reservoir_reset(r);
+    ReSTIRReservoir r; restir_reservoirReset(r);
     ReSTIRSurface surf{};
     surf.valid = 0.0f;
 
@@ -298,9 +139,9 @@ __global__ void kReSTIR_InitCandidates(
             float t = 1.0f - fminf(fmaxf(NdotV, 0.0f), 1.0f);
             float t5 = t*t*t*t*t;
             float3 F = F0 + (make_float3(1,1,1) - F0) * t5;
-            float specW = luminance(F);
+            float specW = restirLuminance(F);
             float3 kd = (make_float3(1,1,1) - F) * (1.0f - surf.metallic);
-            float diffW = luminance(kd * surf.albedo);
+            float diffW = restirLuminance(kd * surf.albedo);
             float p = specW / fmaxf(specW + diffW, 1e-7f);
             surf.specProb = fminf(fmaxf(p, 0.1f), 0.9f);
         }
@@ -333,13 +174,13 @@ __global__ void kReSTIR_InitCandidates(
 
             // Source pdf (area-sampling): pSelect / area_tri.
             float areaPdf = pSelect / fmaxf(light.area, 1e-7f);
-            float pHat = evalTargetPdf(surf, light, cb1, cb2);
+            float pHat = restirEvalTargetPdf(surf, light, cb1, cb2);
             float wCand = (areaPdf > 0.0f) ? (pHat / areaPdf) : 0.0f;
 
-            reservoir_update(r, wSum, lightIdx, cb1, cb2, pHat,
+            restir_reservoirUpdate(r, wSum, lightIdx, cb1, cb2, pHat,
                              wCand, pcg32_float(rng));
         }
-        reservoir_finalize(r, wSum);
+        restir_reservoirFinalize(r, wSum);
     }
 
     outReservoirs[pixelIdx] = r;
@@ -399,13 +240,13 @@ __global__ void kReSTIR_Temporal(
 
     // Re-evaluate pHat of pr's sample at the current surface.
     GPUAreaLight light = scene.d_areaLights[pr.lightIndex];
-    float pHatAtCurr = evalTargetPdf(s, light, pr.baryB1, pr.baryB2);
+    float pHatAtCurr = restirEvalTargetPdf(s, light, pr.baryB1, pr.baryB2);
 
     // Rebuild wSum for the current reservoir so we can continue streaming.
     // Before combine: wSum = r.pHat * r.M * r.W  (inverse of finalize).
     float wSum = r.pHat * r.M * r.W;
-    reservoir_combine(r, wSum, pr, pHatAtCurr, pcg32_float(rng));
-    reservoir_finalize(r, wSum);
+    restir_reservoirCombine(r, wSum, pr, pHatAtCurr, pcg32_float(rng));
+    restir_reservoirFinalize(r, wSum);
 
     curr[pixelIdx] = r;
 }
@@ -460,10 +301,10 @@ __global__ void kReSTIR_Spatial(
         if (nr.lightIndex == 0xFFFFFFFFu) continue;
 
         GPUAreaLight light = scene.d_areaLights[nr.lightIndex];
-        float pHatAtCurr = evalTargetPdf(s, light, nr.baryB1, nr.baryB2);
-        reservoir_combine(r, wSum, nr, pHatAtCurr, pcg32_float(rng));
+        float pHatAtCurr = restirEvalTargetPdf(s, light, nr.baryB1, nr.baryB2);
+        restir_reservoirCombine(r, wSum, nr, pHatAtCurr, pcg32_float(rng));
     }
-    reservoir_finalize(r, wSum);
+    restir_reservoirFinalize(r, wSum);
     outRes[pixelIdx] = r;
 }
 
@@ -590,17 +431,33 @@ void ReSTIRContext::invalidateHistory() {
     m_buffers.historyValid = false;
 }
 
-void ReSTIRContext::runFrame(
+bool ReSTIRContext::runFrame(
     const DeviceSceneData& scene, const CameraParams& camera,
-    uint32_t width, uint32_t height, uint32_t sampleIndex)
+    uint32_t width, uint32_t height, uint32_t sampleIndex,
+    RayTracingBackend* backend)
 {
-    if (!m_enabled) return;
+    if (!m_enabled) return false;
     if (!scene.d_lightBVHNodes || !scene.d_areaLights ||
-        scene.areaLightCount == 0 || !scene.d_bvhNodes) return;
+        scene.areaLightCount == 0) return false;
 
-    launchReSTIRInitialCandidates(
-        scene, camera, m_buffers,
-        width, height, sampleIndex, m_numCandidates);
+    // Initial-candidates pass: prefer the backend's native implementation
+    // (OptiX raygen → GAS) when available; otherwise fall back to the CUDA
+    // kernel, which needs scene.d_bvhNodes populated by backend->patchScene.
+    bool initRan = false;
+    if (backend) {
+        initRan = backend->runReSTIRInitCandidates(
+            scene, camera,
+            (void*)m_buffers.d_reservoirsCurr,
+            (void*)m_buffers.d_surfaceCurr,
+            width, height, sampleIndex, m_numCandidates);
+    }
+    if (!initRan) {
+        if (!scene.d_bvhNodes) return false;
+        launchReSTIRInitialCandidates(
+            scene, camera, m_buffers,
+            width, height, sampleIndex, m_numCandidates);
+    }
+
     launchReSTIRTemporalReuse(
         scene, m_buffers,
         width, height, sampleIndex, m_temporalMCap);
@@ -612,4 +469,5 @@ void ReSTIRContext::runFrame(
     ReSTIRReservoir* t = m_buffers.d_reservoirsCurr;
     m_buffers.d_reservoirsCurr    = m_buffers.d_reservoirsSpatial;
     m_buffers.d_reservoirsSpatial = t;
+    return true;
 }

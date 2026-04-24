@@ -59,6 +59,7 @@ void OptiXBackend::destroyAll() {
     if (m_pipeline)       { optixPipelineDestroy(m_pipeline); m_pipeline = nullptr; }
     if (m_pgRaygen)       { optixProgramGroupDestroy(m_pgRaygen); m_pgRaygen = nullptr; }
     if (m_pgRaygenSplit)  { optixProgramGroupDestroy(m_pgRaygenSplit); m_pgRaygenSplit = nullptr; }
+    if (m_pgRaygenReSTIR) { optixProgramGroupDestroy(m_pgRaygenReSTIR); m_pgRaygenReSTIR = nullptr; }
     if (m_pgMissRadiance) { optixProgramGroupDestroy(m_pgMissRadiance); m_pgMissRadiance = nullptr; }
     if (m_pgMissShadow)   { optixProgramGroupDestroy(m_pgMissShadow); m_pgMissShadow = nullptr; }
     if (m_pgHitRadiance)  { optixProgramGroupDestroy(m_pgHitRadiance); m_pgHitRadiance = nullptr; }
@@ -196,6 +197,18 @@ bool OptiXBackend::loadModule(const std::string& optixirPath) {
     OPTIX_CHECK(optixProgramGroupCreate(m_ctx, &pgdRaygenSplit, 1, &pgOptions, logBuf, &logSize, &m_pgRaygenSplit));
 #endif
 
+    // Third raygen: ReSTIR DI initial-candidates pass. Shares the same
+    // closest-hit / miss programs as __raygen__path_trace (they just record
+    // the hit primitive + barycentrics into the 5-slot payload), so no new
+    // hitgroup needed. Always built — enabling/disabling ReSTIR is a
+    // runtime knob on Renderer, not a compile-time one.
+    OptixProgramGroupDesc pgdRaygenReSTIR{};
+    pgdRaygenReSTIR.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+    pgdRaygenReSTIR.raygen.module = m_module;
+    pgdRaygenReSTIR.raygen.entryFunctionName = "__raygen__restir_init_candidates";
+    logSize = sizeof(logBuf);
+    OPTIX_CHECK(optixProgramGroupCreate(m_ctx, &pgdRaygenReSTIR, 1, &pgOptions, logBuf, &logSize, &m_pgRaygenReSTIR));
+
     OptixProgramGroupDesc pgdMissR{};
     pgdMissR.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
     pgdMissR.miss.module = m_module;
@@ -237,6 +250,7 @@ bool OptiXBackend::buildPipeline() {
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
     if (m_pgRaygenSplit) groups.push_back(m_pgRaygenSplit);
 #endif
+    if (m_pgRaygenReSTIR) groups.push_back(m_pgRaygenReSTIR);
 
     OptixPipelineLinkOptions linkOptions{};
     linkOptions.maxTraceDepth = 2;  // primary trace can fire shadow trace
@@ -274,21 +288,25 @@ bool OptiXBackend::buildPipeline() {
 }
 
 bool OptiXBackend::buildSBT() {
-    // Layout: [raygen][raygenSplit?][missR][missS][hitR][hitS]
-    // raygenSplit is included only when NRD/DLSS is compiled in.
+    // Layout: [raygen][raygenSplit?][raygenReSTIR?][missR][missS][hitR][hitS]
+    // raygenSplit is included only when NRD/DLSS is compiled in; raygenReSTIR
+    // is always included (it's a runtime-toggled feature). Launches pick a
+    // raygen by rewriting m_sbt.raygenRecord to the appropriate slot.
     const size_t recSize = sizeof(RaygenRecord);  // all records same size (empty data)
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
     const bool   haveSplit = (m_pgRaygenSplit != nullptr);
 #else
     const bool   haveSplit = false;
 #endif
-    const uint32_t numRaygens = haveSplit ? 2u : 1u;
+    const bool   haveReSTIR = (m_pgRaygenReSTIR != nullptr);
+    const uint32_t numRaygens = 1u + (haveSplit ? 1u : 0u) + (haveReSTIR ? 1u : 0u);
     const size_t total = recSize * (numRaygens + 4u);
 
     CUDA_CHECK(cudaMalloc((void**)&m_sbtRecordsBuf, total));
 
     RaygenRecord raygenRec;
     RaygenRecord raygenSplitRec;
+    RaygenRecord raygenReSTIRRec;
     MissRecord   missR;
     MissRecord   missS;
     HitRecord_   hitR;
@@ -296,6 +314,9 @@ bool OptiXBackend::buildSBT() {
     OPTIX_CHECK(optixSbtRecordPackHeader(m_pgRaygen,       &raygenRec));
     if (haveSplit) {
         OPTIX_CHECK(optixSbtRecordPackHeader(m_pgRaygenSplit, &raygenSplitRec));
+    }
+    if (haveReSTIR) {
+        OPTIX_CHECK(optixSbtRecordPackHeader(m_pgRaygenReSTIR, &raygenReSTIRRec));
     }
     OPTIX_CHECK(optixSbtRecordPackHeader(m_pgMissRadiance, &missR));
     OPTIX_CHECK(optixSbtRecordPackHeader(m_pgMissShadow,   &missS));
@@ -313,6 +334,13 @@ bool OptiXBackend::buildSBT() {
         off += recSize;
     } else {
         m_dRaygenSplitRecord = 0;
+    }
+    if (haveReSTIR) {
+        CUDA_CHECK(cudaMemcpy(base + off, &raygenReSTIRRec, recSize, cudaMemcpyHostToDevice));
+        m_dRaygenReSTIRRecord = (CUdeviceptr)(base + off);
+        off += recSize;
+    } else {
+        m_dRaygenReSTIRRecord = 0;
     }
     CUDA_CHECK(cudaMemcpy(base + off, &missR, recSize, cudaMemcpyHostToDevice)); off += recSize;
     CUDA_CHECK(cudaMemcpy(base + off, &missS, recSize, cudaMemcpyHostToDevice)); off += recSize;
@@ -512,6 +540,57 @@ void OptiXBackend::launchPathTraceSplit(
     CUDA_CHECK(cudaStreamSynchronize(m_stream));
 }
 #endif
+
+bool OptiXBackend::launchReSTIRInitCandidatesOptiX(
+    const DeviceSceneData& scene,
+    const CameraParams&    camera,
+    void*                  d_reservoirsCurr,
+    void*                  d_surfacesCurr,
+    uint32_t               width,
+    uint32_t               height,
+    uint32_t               sampleIndex,
+    uint32_t               numCandidates)
+{
+    if (!m_initialized || !m_gasHandle || !m_dRaygenReSTIRRecord) return false;
+    if (!d_reservoirsCurr || !d_surfacesCurr) return false;
+    if (!scene.d_lightBVHNodes || scene.areaLightCount == 0) return false;
+
+    LaunchParams lp;
+    std::memset(&lp, 0, sizeof(lp));
+    lp.scene  = scene;
+    lp.camera = camera;
+    // accum/output/aux/gbuffer and all split-output surfaces are unused by
+    // the ReSTIR raygen — the memset above zeroes them. Only the scene +
+    // camera + ReSTIR-specific fields need to be valid.
+    lp.width       = width;
+    lp.height      = height;
+    lp.sampleIndex = sampleIndex;
+    lp.maxBounces  = 1;   // unused here; set to 1 for defensiveness.
+    lp.spp         = 1;
+    lp.enableEnvironment = 0;
+    lp.handle      = m_gasHandle;
+    lp.restirReservoirsCurr = static_cast<ReSTIRReservoir*>(d_reservoirsCurr);
+    lp.restirSurfacesCurr   = static_cast<ReSTIRSurface*>(d_surfacesCurr);
+    lp.restirNumCandidates  = numCandidates;
+
+    m_sbt.raygenRecord = m_dRaygenReSTIRRecord;
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        (void*)m_dLaunchParams, &lp, sizeof(lp),
+        cudaMemcpyHostToDevice, m_stream));
+
+    OPTIX_CHECK_VOID(optixLaunch(
+        m_pipeline, m_stream,
+        m_dLaunchParams, sizeof(LaunchParams),
+        &m_sbt,
+        width, height, 1));
+    CUDA_CHECK(cudaStreamSynchronize(m_stream));
+
+    // Restore regular raygen so a subsequent launchPathTrace doesn't
+    // accidentally fire the ReSTIR raygen.
+    m_sbt.raygenRecord = m_dRaygenRecord;
+    return true;
+}
 
 void OptiXBackend::traceOcclusionRays(
     const float3* /*d_origins*/,

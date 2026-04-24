@@ -57,6 +57,50 @@ public:
         return m_deviceScene.getData();
     }
 
+    // Used by the Renderer's ReSTIR prepass — exposes the OptiX GAS handle
+    // via the scene struct so ReSTIR kernels / raygens can trace primary
+    // rays against the same acceleration structure launchPathTrace uses.
+    // The CUDA backend fills d_bvhNodes; we leave those null (the OptiX
+    // raygen uses `handle` instead) and stash the handle in the scene's
+    // reserved slot.
+    void patchScene(DeviceSceneData& scene) const override {
+        // Nothing to patch on scene itself — OptiX uses params.handle, not
+        // scene.d_bvhNodes. Keeping the default no-op would also work; this
+        // override exists to document the contract and give a hook point
+        // when we eventually teach the CUDA spatial/temporal passes to use
+        // an OptiX-traced occlusion query.
+        (void)scene;
+    }
+
+    // Launch the ReSTIR DI initial-candidates raygen. Returns false if the
+    // backend isn't initialized. The temporal / spatial passes still run on
+    // CUDA (they don't trace rays — they read the reservoir + surface
+    // buffers written here).
+    bool launchReSTIRInitCandidatesOptiX(
+        const DeviceSceneData& scene,
+        const CameraParams&    camera,
+        void*                  d_reservoirsCurr,  // ReSTIRReservoir*
+        void*                  d_surfacesCurr,    // ReSTIRSurface*
+        uint32_t               width,
+        uint32_t               height,
+        uint32_t               sampleIndex,
+        uint32_t               numCandidates);
+
+    bool runReSTIRInitCandidates(
+        const DeviceSceneData& scene,
+        const CameraParams&    camera,
+        void*                  d_reservoirsCurr,
+        void*                  d_surfacesCurr,
+        uint32_t               width,
+        uint32_t               height,
+        uint32_t               sampleIndex,
+        uint32_t               numCandidates) override
+    {
+        return launchReSTIRInitCandidatesOptiX(
+            scene, camera, d_reservoirsCurr, d_surfacesCurr,
+            width, height, sampleIndex, numCandidates);
+    }
+
 private:
     bool loadModule(const std::string& optixirPath);
     bool buildPipeline();
@@ -69,6 +113,7 @@ private:
     OptixModule             m_module         = nullptr;
     OptixProgramGroup       m_pgRaygen       = nullptr;
     OptixProgramGroup       m_pgRaygenSplit  = nullptr;  // NRD split-output raygen
+    OptixProgramGroup       m_pgRaygenReSTIR = nullptr;  // ReSTIR DI init-candidates raygen
     OptixProgramGroup       m_pgMissRadiance = nullptr;
     OptixProgramGroup       m_pgMissShadow   = nullptr;
     OptixProgramGroup       m_pgHitRadiance  = nullptr;
@@ -82,6 +127,7 @@ private:
     // between them depending on which raygen they want to launch.
     CUdeviceptr             m_dRaygenRecord       = 0;
     CUdeviceptr             m_dRaygenSplitRecord  = 0;
+    CUdeviceptr             m_dRaygenReSTIRRecord = 0;
 
     CUdeviceptr             m_gasOutput      = 0;
     OptixTraversableHandle  m_gasHandle      = 0;

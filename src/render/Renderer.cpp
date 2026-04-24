@@ -86,14 +86,15 @@ void Renderer::renderFrame(
         // kernel consumes at bounce-0 NEE.
         DeviceSceneData sceneWithBVH = scene;
         backend->patchScene(sceneWithBVH);
-        const bool restirRan = m_restir.enabled() &&
-            sceneWithBVH.d_lightBVHNodes &&
-            sceneWithBVH.d_areaLights &&
-            sceneWithBVH.areaLightCount > 0 &&
-            sceneWithBVH.d_bvhNodes;
-        if (restirRan) {
-            m_restir.runFrame(sceneWithBVH, camera,
-                              m_width, m_height, sampleIndex);
+        // Backend-native ReSTIR (OptiX raygen) doesn't need d_bvhNodes — it
+        // traces against the GAS via params.handle. The CUDA fallback does,
+        // but ReSTIRContext::runFrame checks that itself and returns false
+        // if it can't actually run.
+        bool restirRan = false;
+        if (m_restir.enabled()) {
+            restirRan = m_restir.runFrame(sceneWithBVH, camera,
+                                          m_width, m_height, sampleIndex,
+                                          backend);
         }
 
         DeviceSceneData scenePatched = scene;

@@ -20,6 +20,8 @@
 #include "gpu/BRDF.h"
 #include "gpu/RayTypes.h"
 #include "gpu/SHEnv.cuh"
+#include "accel/LightBVHSample.h"
+#include "render/ReSTIRDevice.cuh"
 
 #ifndef M_PI_F
 #define M_PI_F 3.14159265358979323846f
@@ -1520,4 +1522,164 @@ extern "C" __global__ void __raygen__path_trace_split()
         ushort4 p = packHalf4_split(emTexel);
         surf2Dwrite<ushort4>(p, params.splitEmissive, x * 8, y);
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ReSTIR DI initial-candidates raygen (OptiX path).
+//
+// Mirrors `kReSTIR_InitCandidates` from render/ReSTIR.cu but traces the
+// primary ray against the OptiX GAS via `traceRadianceRay()` instead of the
+// CUDA SAH BVH. Output layout matches exactly — the CUDA temporal / spatial
+// passes consume `params.restirReservoirsCurr` unchanged.
+//
+// All RIS helpers (target pdf, reservoir streaming) come from
+// render/ReSTIRDevice.cuh so this program is a thin harness around the
+// closest-hit + material-resolve logic already proven in the megakernel.
+// ─────────────────────────────────────────────────────────────────────────
+extern "C" __global__ void __raygen__restir_init_candidates()
+{
+    uint3 idx = optixGetLaunchIndex();
+    uint32_t x = idx.x;
+    uint32_t y = idx.y;
+    if (x >= params.width || y >= params.height) return;
+    uint32_t pixelIdx = y * params.width + x;
+
+    const DeviceSceneData& scene  = params.scene;
+    const CameraParams&    camera = params.camera;
+    OptixTraversableHandle handle = params.handle;
+
+    ReSTIRReservoir r; restir_reservoirReset(r);
+    ReSTIRSurface   surf{};
+    surf.valid = 0.0f;
+
+    // Dedicated RNG stream (matches the CUDA kernel's seeding salt).
+    uint32_t rng = pcg32_seed(pixelIdx * 0xA1B2C3D4u + params.sampleIndex,
+                              params.sampleIndex * 0xDEADBEEFu + 1u);
+
+    // Primary ray — same jitter as the main kernel so the reservoir lines up
+    // with the shading point that will consume it.
+    float jx = camera.jitterOffset.x;
+    float jy = camera.jitterOffset.y;
+    Ray ray = generateRay(x, y, params.width, params.height, camera, jx, jy);
+
+    RadiancePayload rp = traceRadianceRay(
+        handle, ray.origin, ray.direction, ray.tmin, ray.tmax);
+
+    bool eligible = (rp.hit != 0) && scene.d_areaLights &&
+                    scene.areaLightCount > 0 && scene.d_lightBVHNodes;
+
+    if (eligible) {
+        uint32_t triIdx = rp.primIdx;
+        uint32_t i0 = scene.d_indices[triIdx * 3 + 0];
+        uint32_t i1 = scene.d_indices[triIdx * 3 + 1];
+        uint32_t i2 = scene.d_indices[triIdx * 3 + 2];
+        float baryU = rp.baryU;
+        float baryV = rp.baryV;
+        float baryW = 1.0f - baryU - baryV;
+        float3 v0 = scene.d_positions[i0];
+        float3 v1 = scene.d_positions[i1];
+        float3 v2 = scene.d_positions[i2];
+        float3 hitPos = v0 * baryW + v1 * baryU + v2 * baryV;
+
+        int matIdx = scene.d_materialIndices ? scene.d_materialIndices[triIdx] : -1;
+        if (matIdx < 0 || (uint32_t)matIdx >= scene.materialCount) {
+            eligible = false;
+        }
+        if (eligible) {
+            GPUMaterial mat = scene.d_materials[matIdx];
+
+            // Shading normal — interpolate vertex normals, flip to face the ray.
+            float3 N;
+            if (scene.d_normals) {
+                N = normalize(scene.d_normals[i0] * baryW +
+                              scene.d_normals[i1] * baryU +
+                              scene.d_normals[i2] * baryV);
+            } else {
+                N = normalize(cross(v1 - v0, v2 - v0));
+            }
+            if (dot(N, ray.direction) > 0.0f) N = -N;
+
+            // Texture UV + albedo / metallic / roughness resolve.
+            float2 uv = make_float2(0.0f, 0.0f);
+            if (scene.d_uvs) {
+                uv = scene.d_uvs[i0] * baryW +
+                     scene.d_uvs[i1] * baryU +
+                     scene.d_uvs[i2] * baryV;
+            }
+            float3 albedo = mat.albedo;
+            if (mat.albedoTex != 0) {
+                float4 t = tex2D<float4>(mat.albedoTex, uv.x, uv.y);
+                albedo = albedo * make_float3(t.x, t.y, t.z);
+            }
+            if (mat.metallicRoughTex != 0) {
+                float4 mrT = tex2D<float4>(mat.metallicRoughTex, uv.x, uv.y);
+                mat.roughness *= mrT.y;
+                mat.metallic  *= mrT.z;
+            }
+
+            surf.position    = hitPos;
+            surf.normal      = N;
+            surf.albedo      = albedo;
+            // Floor roughness so pHat's GGX term doesn't spike near zero —
+            // keeps RIS well-conditioned on near-mirror surfaces. Matches
+            // the CUDA kernel.
+            surf.roughness   = fmaxf(mat.roughness, 0.04f);
+            surf.metallic    = mat.metallic;
+            surf.pureDiffuse = mat.pureDiffuse ? 1u : 0u;
+            surf.viewDir     = -ray.direction;
+            surf.valid       = 1.0f;
+
+            // Cached specProb for downstream passes.
+            {
+                float NdotV = fmaxf(dot(surf.normal, surf.viewDir), 0.0f);
+                float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), surf.albedo, surf.metallic);
+                float t = 1.0f - fminf(fmaxf(NdotV, 0.0f), 1.0f);
+                float t5 = t*t*t*t*t;
+                float3 F = F0 + (make_float3(1,1,1) - F0) * t5;
+                float specW = restirLuminance(F);
+                float3 kd = (make_float3(1,1,1) - F) * (1.0f - surf.metallic);
+                float diffW = restirLuminance(kd * surf.albedo);
+                float p = specW / fmaxf(specW + diffW, 1e-7f);
+                surf.specProb = fminf(fmaxf(p, 0.1f), 0.9f);
+            }
+
+            float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hitPos);
+            surf.prevPixel = make_float2(
+                (clipPrev.x + 1.0f) * 0.5f * (float)params.width,
+                (1.0f - clipPrev.y) * 0.5f * (float)params.height);
+
+            // ── RIS: draw M candidates from the light BVH, stream them ──
+            uint32_t M = params.restirNumCandidates;
+            float wSum = 0.0f;
+            for (uint32_t i = 0; i < M; i++) {
+                float u = pcg32_float(rng);
+                uint32_t slot = 0;
+                float pSelect = 0.0f;
+                if (!lightBVH_sample(scene.d_lightBVHNodes,
+                                     scene.lightBVHRootIndex,
+                                     surf.position, u, slot, pSelect) ||
+                    !(pSelect > 0.0f))
+                    continue;
+                uint32_t lightIdx = scene.d_lightOrderedIndices[slot];
+                GPUAreaLight light = scene.d_areaLights[lightIdx];
+
+                float r1 = pcg32_float(rng);
+                float r2 = pcg32_float(rng);
+                float su = sqrtf(r1);
+                float cb1 = su * (1.0f - r2);
+                float cb2 = su * r2;
+
+                float areaPdf = pSelect / fmaxf(light.area, 1e-7f);
+                float pHat = restirEvalTargetPdf(surf, light, cb1, cb2);
+                float wCand = (areaPdf > 0.0f) ? (pHat / areaPdf) : 0.0f;
+
+                restir_reservoirUpdate(r, wSum, lightIdx, cb1, cb2, pHat,
+                                       wCand, pcg32_float(rng));
+            }
+            restir_reservoirFinalize(r, wSum);
+        }
+    }
+
+    if (params.restirReservoirsCurr) params.restirReservoirsCurr[pixelIdx] = r;
+    if (params.restirSurfacesCurr)   params.restirSurfacesCurr[pixelIdx]   = surf;
 }

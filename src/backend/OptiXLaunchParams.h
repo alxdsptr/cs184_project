@@ -2,6 +2,7 @@
 #include "gpu/DeviceScene.h"
 #include "core/Camera.h"
 #include "render/AuxBuffers.h"
+#include "render/ReSTIR.h"
 #include <cuda_runtime.h>
 
 #ifdef __CUDACC__
@@ -44,6 +45,14 @@ struct LaunchParams {
     unsigned int    maxBounces;
     unsigned int    spp;
     unsigned int    enableEnvironment;
+
+    // Used only by `__raygen__restir_init_candidates`; all-zero in the other
+    // raygens. The reservoir + surface buffers mirror the CUDA path's layout
+    // (render/ReSTIR.h), so the CUDA temporal / spatial kernels can consume
+    // the OptiX raygen's output directly.
+    ReSTIRReservoir* restirReservoirsCurr;
+    ReSTIRSurface*   restirSurfacesCurr;
+    unsigned int     restirNumCandidates;
 
     OptixTraversableHandle handle;
 };
