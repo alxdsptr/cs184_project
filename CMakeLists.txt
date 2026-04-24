@@ -181,6 +181,7 @@ add_executable(pathtracer
     src/render/Renderer.cpp
     # Accel (CPU-only BVH construction)
     src/accel/SAH_BVH.cpp
+    src/accel/LightBVH.cpp
 )
 
 # CUDA sources

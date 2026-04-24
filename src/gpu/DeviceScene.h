@@ -3,6 +3,7 @@
 #include "gpu/MaterialGPU.h"
 #include "gpu/LightGPU.h"
 #include "accel/BVHNode.h"
+#include "accel/LightBVHNode.h"
 #include <cuda_runtime.h>
 
 struct DeviceSceneData {
@@ -25,6 +26,20 @@ struct DeviceSceneData {
     int*         d_triangleAreaLightIndex = nullptr;
     BVHNode*     d_bvhNodes        = nullptr;
     uint32_t     bvhRootIndex      = 0;
+
+    // Spatial acceleration structure over area lights used for importance
+    // sampling many lights from a shading point. When d_lightBVHNodes is
+    // non-null the path tracer descends the tree (stochastic, shading-point
+    // dependent) instead of binary-searching d_areaLightCDF.
+    LightBVHNode* d_lightBVHNodes   = nullptr;
+    uint32_t      lightBVHRootIndex = 0;
+    // orderedLightIndices[i] = original area-light index at ordered slot i
+    // (a leaf stores [primOffset, primOffset+primCount) slots, and each slot
+    // indexes this array to get the real GPUAreaLight ID).
+    uint32_t*     d_lightOrderedIndices = nullptr;
+    // Inverse map: lightIndexToSlot[origLightIdx] = ordered slot (for MIS
+    // PDF lookup when a BSDF-sampled ray hits a known emissive triangle).
+    uint32_t*     d_lightIndexToSlot    = nullptr;
 
     // HDR environment map (equirectangular, float4 texture)
     cudaTextureObject_t envMapTex   = 0;

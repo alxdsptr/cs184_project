@@ -9,6 +9,7 @@
 #include "gpu/BRDF.h"
 #include "gpu/SHEnv.cuh"
 #include "accel/BVH.h"
+#include "accel/LightBVHSample.h"
 #include "util/CudaCheck.h"
 
 #include <cuda_fp16.h>
@@ -837,7 +838,19 @@ __global__ void pathTraceKernel(
                     float3 wi = normalize(toLight);
                     float lightNdot = fmaxf(dot(light.normal, -wi), 0.0f);
                     if (lightNdot > 0.0f) {
-                        float pTri = light.weight / fmaxf(scene.areaLightTotalWeight, 1e-7f);
+                        // pTri must match the light-selection strategy used in
+                        // NEE: if we sampled this light via the BVH at
+                        // prevSurfacePos, the MIS inverse probability is the
+                        // BVH PDF of reaching `areaLightIndex` from there.
+                        float pTri;
+                        if (scene.d_lightBVHNodes && scene.d_lightIndexToSlot) {
+                            uint32_t slot = scene.d_lightIndexToSlot[(uint32_t)areaLightIndex];
+                            pTri = lightBVH_pdf(scene.d_lightBVHNodes,
+                                                scene.lightBVHRootIndex,
+                                                prevSurfacePos, slot);
+                        } else {
+                            pTri = light.weight / fmaxf(scene.areaLightTotalWeight, 1e-7f);
+                        }
                         float pArea = pTri / fmaxf(light.area, 1e-7f);
                         float pLight = pArea * dist2 / fmaxf(lightNdot, 1e-7f);
                         float pBsdf = prevBsdfPdf;
@@ -861,9 +874,30 @@ __global__ void pathTraceKernel(
         // Direct lighting from emissive triangle lights (next-event estimation).
         if (scene.d_areaLights && scene.areaLightCount > 0 &&
             scene.d_areaLightCDF && scene.areaLightTotalWeight > 0.0f) {
-            uint32_t lightIndex = sampleAreaLightIndex(
-                scene.d_areaLightCDF, scene.areaLightCount,
-                pcg32_float(rng));
+            uint32_t lightIndex = 0;
+            // P(select this light) — will be filled either by the BVH
+            // descent or by the flat-CDF fallback (weight/totalWeight).
+            float    pSelect = 0.0f;
+            bool     haveLight = false;
+            if (scene.d_lightBVHNodes && scene.d_lightOrderedIndices) {
+                uint32_t slot = 0;
+                float    pdf  = 0.0f;
+                if (lightBVH_sample(scene.d_lightBVHNodes,
+                                    scene.lightBVHRootIndex,
+                                    hit.position, pcg32_float(rng),
+                                    slot, pdf) && pdf > 0.0f) {
+                    lightIndex = scene.d_lightOrderedIndices[slot];
+                    pSelect    = pdf;
+                    haveLight  = true;
+                }
+            }
+            if (!haveLight) {
+                lightIndex = sampleAreaLightIndex(
+                    scene.d_areaLightCDF, scene.areaLightCount,
+                    pcg32_float(rng));
+                pSelect = scene.d_areaLights[lightIndex].weight /
+                          fmaxf(scene.areaLightTotalWeight, 1e-7f);
+            }
 
             GPUAreaLight light = scene.d_areaLights[lightIndex];
 
@@ -931,7 +965,7 @@ __global__ void pathTraceKernel(
 
                 float shadowLum = 0.2126f * shadowTransmittance.x + 0.7152f * shadowTransmittance.y + 0.0722f * shadowTransmittance.z;
                 if (!occluded && shadowLum > 1e-6f) {
-                    float pTri = light.weight / scene.areaLightTotalWeight;
+                    float pTri = pSelect;
                     float pArea = pTri / fmaxf(light.area, 1e-7f);
                     float pdfOmega = pArea * dist2 / fmaxf(lightNdot, 1e-7f);
 

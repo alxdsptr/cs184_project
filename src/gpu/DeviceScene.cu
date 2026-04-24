@@ -2,6 +2,7 @@
 #include "scene/Scene.h"
 #include "util/CudaCheck.h"
 #include "util/Log.h"
+#include "accel/LightBVH.h"
 
 void DeviceScene::upload(const Scene& scene) {
     free(); // release any prior data
@@ -219,6 +220,56 @@ void DeviceScene::upload(const Scene& scene) {
             CUDA_CHECK(cudaMalloc(&m_data.d_areaLightCDF, areaLights.size() * sizeof(float)));
             CUDA_CHECK(cudaMemcpy(m_data.d_areaLightCDF, cdf.data(),
                                    areaLights.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+            // Build the Light BVH over the GPU area lights. Each light's AABB
+            // is the bbox of its triangle; weights match the CDF weights so
+            // the BVH's summed weights are identical to what the NEE path
+            // expects (sum == areaLightTotalWeight at the root).
+            std::vector<AABB>  lightBounds(areaLights.size());
+            std::vector<float> lightWeights(areaLights.size());
+            for (size_t i = 0; i < areaLights.size(); i++) {
+                const auto& src = areaLights[i];
+                float3 v0 = src.v0;
+                float3 v1 = src.v0 + src.e1;
+                float3 v2 = src.v0 + src.e2;
+                AABB b;
+                b.expand(v0); b.expand(v1); b.expand(v2);
+                lightBounds[i]  = b;
+                lightWeights[i] = src.weight;
+            }
+
+            LightBVH builder;
+            LightBVHData lbvh = builder.build(lightBounds.data(),
+                                              lightWeights.data(),
+                                              (uint32_t)areaLights.size());
+
+            // Inverse map: original light index -> ordered slot (needed for
+            // BSDF-hit MIS PDF lookup against a specific emissive triangle).
+            std::vector<uint32_t> lightIndexToSlot(areaLights.size(), 0);
+            for (uint32_t slot = 0; slot < lbvh.orderedLightIndices.size(); slot++) {
+                lightIndexToSlot[lbvh.orderedLightIndices[slot]] = slot;
+            }
+
+            CUDA_CHECK(cudaMalloc(&m_data.d_lightBVHNodes,
+                                  lbvh.nodes.size() * sizeof(LightBVHNode)));
+            CUDA_CHECK(cudaMemcpy(m_data.d_lightBVHNodes, lbvh.nodes.data(),
+                                  lbvh.nodes.size() * sizeof(LightBVHNode),
+                                  cudaMemcpyHostToDevice));
+            m_data.lightBVHRootIndex = lbvh.rootIndex;
+
+            CUDA_CHECK(cudaMalloc(&m_data.d_lightOrderedIndices,
+                                  lbvh.orderedLightIndices.size() * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMemcpy(m_data.d_lightOrderedIndices,
+                                  lbvh.orderedLightIndices.data(),
+                                  lbvh.orderedLightIndices.size() * sizeof(uint32_t),
+                                  cudaMemcpyHostToDevice));
+
+            CUDA_CHECK(cudaMalloc(&m_data.d_lightIndexToSlot,
+                                  lightIndexToSlot.size() * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMemcpy(m_data.d_lightIndexToSlot,
+                                  lightIndexToSlot.data(),
+                                  lightIndexToSlot.size() * sizeof(uint32_t),
+                                  cudaMemcpyHostToDevice));
         }
     }
 
@@ -239,5 +290,8 @@ void DeviceScene::free() {
     if (m_data.d_areaLightCDF)    { cudaFree(m_data.d_areaLightCDF); }
     if (m_data.d_triangleAreaLightIndex) { cudaFree(m_data.d_triangleAreaLightIndex); }
     if (m_data.d_bvhNodes)        { cudaFree(m_data.d_bvhNodes); }
+    if (m_data.d_lightBVHNodes)     { cudaFree(m_data.d_lightBVHNodes); }
+    if (m_data.d_lightOrderedIndices){ cudaFree(m_data.d_lightOrderedIndices); }
+    if (m_data.d_lightIndexToSlot)   { cudaFree(m_data.d_lightIndexToSlot); }
     m_data = DeviceSceneData{};
 }
