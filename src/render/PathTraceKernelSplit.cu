@@ -671,6 +671,50 @@ __global__ void pathTraceKernelSplit(
             pathRadiance += throughput * direct;
         }
 
+        if (scene.d_directionalLights && scene.directionalLightCount > 0) {
+            float3 V = -ray.direction;
+            float3 direct = make_float3(0,0,0);
+            for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
+                GPUDirectionalLight light = scene.d_directionalLights[li];
+                float3 Ld = light.direction;
+                float NdotL = fmaxf(dot(N, Ld), 0.0f);
+                if (NdotL <= 0.0f) continue;
+                bool occ = false;
+                float3 st = make_float3(1,1,1);
+                if (scene.d_bvhNodes && scene.totalTriangles > 0) {
+                    Ray sr; sr.origin = hit.position + N * 0.001f; sr.direction = Ld;
+                    sr.tmin = 0.001f; sr.tmax = 1e30f;
+                    for (int s = 0; s < 8; s++) {
+                        HitRecord sh; sh.t = sr.tmax;
+                        if (!bvh_closestHit(sr, scene.d_bvhNodes, scene.bvhRootIndex,
+                                            scene.d_positions, scene.d_indices, scene.d_materialIndices, sh)) break;
+                        GPUMaterial sm;
+                        if (sh.materialIndex >= 0 && (uint32_t)sh.materialIndex < scene.materialCount)
+                            sm = scene.d_materials[sh.materialIndex];
+                        else { occ = true; break; }
+                        if (sm.transmission > 0.0f) {
+                            float sl = 0.2126f*sm.albedo.x + 0.7152f*sm.albedo.y + 0.0722f*sm.albedo.z;
+                            if (sl < 0.9f) st = st * sm.albedo;
+                            sr.origin = sh.position + Ld * 0.002f;
+                            sr.tmax = 1e30f;
+                        } else { occ = true; break; }
+                    }
+                }
+                float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
+                if (occ || slum < 1e-6f) continue;
+                float3 brdf;
+                if (primaryLobeOverride) {
+                    brdf = (pickedBucket == 0)
+                        ? materialDiffuseLobe(mat, N, V, Ld, albedo)
+                        : materialSpecularLobe(mat, N, V, Ld, albedo);
+                } else {
+                    brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
+                }
+                direct += clampFirefly(brdf * st * light.color * NdotL, 10.0f);
+            }
+            pathRadiance += throughput * direct;
+        }
+
         // ReSTIR PT / GI consumption at the primary hit on sample s==0.
         // PT takes precedence over GI (PT subsumes GI's 1-bounce NEE plus k
         // more bounces of light transport). Either branch adds the

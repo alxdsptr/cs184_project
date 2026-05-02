@@ -14,6 +14,7 @@
 #include "core/Math.h"
 #include "core/Halton.h"
 #include "gpu/AreaLightGPU.h"
+#include "gpu/LightGPU.h"
 #include "gpu/MaterialGPU.h"
 #include "gpu/Random.h"
 #include "gpu/Sampling.h"
@@ -785,6 +786,28 @@ extern "C" __global__ void __raygen__path_trace()
                 radiance += throughput * direct;
             }
 
+            if (scene.d_directionalLights && scene.directionalLightCount > 0) {
+                float3 direct = make_float3(0.0f, 0.0f, 0.0f);
+                float3 V = -ray.direction;
+                for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
+                    GPUDirectionalLight light = scene.d_directionalLights[li];
+                    float3 Ld = light.direction;
+                    float NdotL = fmaxf(dot(N, Ld), 0.0f);
+                    if (NdotL <= 0.0f) continue;
+
+                    float3 shadowTransmittanceDL = traceShadowRay(
+                        handle, hit.position + N * 0.001f, Ld, 0.001f, 1e30f);
+                    float shadowLumDL = 0.2126f * shadowTransmittanceDL.x +
+                                        0.7152f * shadowTransmittanceDL.y +
+                                        0.0722f * shadowTransmittanceDL.z;
+                    if (shadowLumDL < 1e-6f) continue;
+
+                    float3 brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
+                    direct += brdf * shadowTransmittanceDL * light.color * NdotL;
+                }
+                radiance += throughput * direct;
+            }
+
             // ReSTIR PT / GI consumption at the primary hit on sample s==0.
             // PT takes precedence (its postfix already contains GI's 1-bounce
             // NEE plus k more bounces' worth of light transport). Either branch
@@ -1550,6 +1573,32 @@ extern "C" __global__ void __raygen__path_trace_split()
                         brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
                     }
                     direct += clampFirefly_split(brdf * st * Li * NdotL, 10.0f);
+                }
+                pathRadiance += throughput * direct;
+            }
+
+            if (scene.d_directionalLights && scene.directionalLightCount > 0) {
+                float3 V = -ray.direction;
+                float3 direct = make_float3(0,0,0);
+                for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
+                    GPUDirectionalLight light = scene.d_directionalLights[li];
+                    float3 Ld = light.direction;
+                    float NdotL = fmaxf(dot(N, Ld), 0.0f);
+                    if (NdotL <= 0.0f) continue;
+
+                    float3 st = traceShadowRay(handle, hit.position + N * 0.001f, Ld, 0.001f, 1e30f);
+                    float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
+                    if (slum < 1e-6f) continue;
+
+                    float3 brdf;
+                    if (primaryLobeOverride) {
+                        brdf = (pickedBucket == 0)
+                            ? materialDiffuseLobe_split(mat, N, V, Ld, albedo)
+                            : materialSpecularLobe_split(mat, N, V, Ld, albedo);
+                    } else {
+                        brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
+                    }
+                    direct += clampFirefly_split(brdf * st * light.color * NdotL, 10.0f);
                 }
                 pathRadiance += throughput * direct;
             }
