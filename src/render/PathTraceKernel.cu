@@ -1021,6 +1021,64 @@ __global__ void pathTraceKernel(
             radiance += throughput * direct;
         }
 
+        if (scene.d_directionalLights && scene.directionalLightCount > 0) {
+            float3 direct = make_float3(0.0f, 0.0f, 0.0f);
+            float3 V = -ray.direction;
+
+            for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
+                GPUDirectionalLight light = scene.d_directionalLights[li];
+                float3 Ld = light.direction;
+
+                float NdotL = fmaxf(dot(N, Ld), 0.0f);
+                if (NdotL <= 0.0f) continue;
+
+                float3 shadowTransmittanceDL = make_float3(1.0f, 1.0f, 1.0f);
+                bool occluded = false;
+                if (scene.d_bvhNodes && scene.totalTriangles > 0) {
+                    Ray shadowRay;
+                    shadowRay.origin = hit.position + N * 0.001f;
+                    shadowRay.direction = Ld;
+                    shadowRay.tmin = 0.001f;
+                    shadowRay.tmax = 1e30f;
+
+                    for (int shadowStep = 0; shadowStep < 8; shadowStep++) {
+                        HitRecord shadowHit;
+                        shadowHit.t = shadowRay.tmax;
+                        bool didHitShadow = bvh_closestHit(
+                            shadowRay, scene.d_bvhNodes, scene.bvhRootIndex,
+                            scene.d_positions, scene.d_indices, scene.d_materialIndices,
+                            shadowHit);
+                        if (!didHitShadow) break;
+
+                        GPUMaterial shadowMat;
+                        if (shadowHit.materialIndex >= 0 && (uint32_t)shadowHit.materialIndex < scene.materialCount)
+                            shadowMat = scene.d_materials[shadowHit.materialIndex];
+                        else { occluded = true; break; }
+
+                        if (shadowMat.transmission > 0.0f) {
+                            float sAlbLumDL = 0.2126f * shadowMat.albedo.x + 0.7152f * shadowMat.albedo.y + 0.0722f * shadowMat.albedo.z;
+                            if (sAlbLumDL < 0.9f) {
+                                shadowTransmittanceDL = shadowTransmittanceDL * shadowMat.albedo;
+                            }
+                            shadowRay.origin = shadowHit.position + Ld * 0.002f;
+                            shadowRay.tmax = 1e30f;
+                        } else {
+                            occluded = true;
+                            break;
+                        }
+                    }
+                }
+
+                float shadowLumDL = 0.2126f * shadowTransmittanceDL.x + 0.7152f * shadowTransmittanceDL.y + 0.0722f * shadowTransmittanceDL.z;
+                if (occluded || shadowLumDL < 1e-6f) continue;
+
+                float3 brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
+                direct += brdf * shadowTransmittanceDL * light.color * NdotL;
+            }
+
+            radiance += throughput * direct;
+        }
+
         // BRDF sampling: Fresnel-weighted blend between diffuse and specular
         float3 V = -ray.direction;
         float specProb = materialSpecProb(mat, N, V, albedo);

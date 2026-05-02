@@ -22,10 +22,12 @@ public:
     std::vector<TriangleMesh>& getMeshes() { return m_meshes; }
     std::vector<PBRMaterial>&  getMaterials() { return m_materials; }
     std::vector<PointLight>&   getLights() { return m_lights; }
+    std::vector<DirectionalLight>& getDirectionalLights() { return m_directionalLights; }
     std::vector<TriangleAreaLight>& getAreaLights() { return m_areaLights; }
     const std::vector<TriangleMesh>& getMeshes() const { return m_meshes; }
     const std::vector<PBRMaterial>&  getMaterials() const { return m_materials; }
     const std::vector<PointLight>&   getLights() const { return m_lights; }
+    const std::vector<DirectionalLight>& getDirectionalLights() const { return m_directionalLights; }
     const std::vector<TriangleAreaLight>& getAreaLights() const { return m_areaLights; }
 
     AABB& getBounds() { return m_bounds; }
@@ -41,6 +43,7 @@ private:
     std::vector<TriangleMesh> m_meshes;
     std::vector<PBRMaterial>  m_materials;
     std::vector<PointLight>   m_lights;
+    std::vector<DirectionalLight> m_directionalLights;
     std::vector<TriangleAreaLight> m_areaLights;
     AABB m_bounds;
     SceneCamera m_camera;

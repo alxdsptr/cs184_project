@@ -9,3 +9,8 @@ struct GPUPointLight {
     float  linearAttenuation;
     float  quadraticAttenuation;
 };
+
+struct GPUDirectionalLight {
+    float3 direction;
+    float3 color;
+};
