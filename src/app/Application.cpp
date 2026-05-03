@@ -180,6 +180,9 @@ bool Application::init(uint32_t width, uint32_t height, const std::string& title
     }
     glfwSetScrollCallback(m_window, glfwScrollCallback);
     m_renderer.init(width, height);
+    // Apply ReSTIR toggles set via main.cpp before init()
+    m_renderer.setReSTIREnabled(m_pendingReSTIRDI);
+    m_renderer.setReSTIRGIEnabled(m_pendingReSTIRGI);
 
     bool backendReady = false;
 #ifdef PATHTRACER_OPTIX_ENABLED
@@ -626,6 +629,10 @@ void Application::runGui() {
 #endif
 
         bool envChanged = false;
+        // Snapshot ReSTIR state into local bools so the GUI can mutate them;
+        // we apply the result via the renderer's setters after render().
+        bool guiReSTIRDI = m_renderer.isReSTIREnabled();
+        bool guiReSTIRGI = m_renderer.isReSTIRGIEnabled();
         if (m_showGui) {
             envChanged = m_gui.render(
                 m_fps,
@@ -646,7 +653,15 @@ void Application::runGui() {
                 &m_enableNormalMap,
                 &m_showNormalArrows,
                 &m_normalArrowStride,
-                &m_normalArrowLength);
+                &m_normalArrowLength,
+                &guiReSTIRDI,
+                &guiReSTIRGI);
+            if (guiReSTIRDI != m_renderer.isReSTIREnabled()) {
+                m_renderer.setReSTIREnabled(guiReSTIRDI);
+            }
+            if (guiReSTIRGI != m_renderer.isReSTIRGIEnabled()) {
+                m_renderer.setReSTIRGIEnabled(guiReSTIRGI);
+            }
 
             // Arrow overlay renders under/over the same ImGui frame.
             if (m_showNormalArrows && !m_h_debugArrows.empty() &&

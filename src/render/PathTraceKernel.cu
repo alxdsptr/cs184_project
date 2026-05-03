@@ -343,12 +343,25 @@ __global__ void pathTraceKernel(
     uint32_t rng = pcg32_seed(pixelIdx * 0x9E3779B9u + s,
                               sampleIndex * 0x85EBCA6Bu + s);
 
+    // ReSTIR (DI / GI) reservoirs are evaluated against the surface that
+    // ReSTIRInitCandidates traced — that pass uses ONLY camera.jitterOffset
+    // (halton, no per-sample random sub-pixel jitter). When ReSTIR is active
+    // for this bounce/sample, we must hit the same surface here, otherwise
+    // the reservoir's stored pHat/W is for a different (x,y) on the
+    // primary-hit surface than the integrand evaluated below — the resulting
+    // f * W mismatch produces a strong overexposure on glossy/reflective
+    // surfaces where small sub-pixel jitters land on different geometry.
+    bool restirActiveBounce0 =
+        (s == 0) && (
+            (scene.restirEnabled != 0 && scene.d_restirReservoirs != nullptr) ||
+            (scene.restirGIEnabled != 0 && scene.d_restirGIIndirect != nullptr));
+
     float jx, jy;
-    if (dlssPublish) {
+    if (dlssPublish || restirActiveBounce0) {
         jx = camera.jitterOffset.x;
         jy = camera.jitterOffset.y;
     } else {
-        // Native (no DLSS): per-sample random sub-pixel jitter for AA.
+        // Native (no DLSS, no ReSTIR): per-sample random sub-pixel jitter for AA.
         jx = pcg32_float(rng) - 0.5f;
         jy = pcg32_float(rng) - 0.5f;
         jx += camera.jitterOffset.x;

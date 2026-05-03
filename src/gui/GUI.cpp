@@ -81,7 +81,9 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
                  bool* enableNormalMap,
                  bool* showNormalArrows,
                  int*  normalArrowStride,
-                 float* normalArrowLength) {
+                 float* normalArrowLength,
+                 bool* restirDIEnabled,
+                 bool* restirGIEnabled) {
     bool changed = false;
     loadEnvMapRequested = false;
 
@@ -176,6 +178,25 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
             }
             if (normalArrowLength) {
                 ImGui::SliderFloat("Arrow length", normalArrowLength, 0.02f, 5.0f, "%.2f");
+            }
+        }
+    }
+
+    if (restirDIEnabled || restirGIEnabled) {
+        ImGui::Separator();
+        ImGui::Text("ReSTIR");
+        if (restirDIEnabled) {
+            // Toggle the direct-lighting reservoir prepass. Disabling it
+            // falls back to plain NEE at the primary hit.
+            if (ImGui::Checkbox("ReSTIR DI", restirDIEnabled)) {
+                changed = true;
+            }
+        }
+        if (restirGIEnabled) {
+            // Toggle the indirect-lighting reservoir prepass. Disabling it
+            // restores the path tracer's own continuation bounces.
+            if (ImGui::Checkbox("ReSTIR GI", restirGIEnabled)) {
+                changed = true;
             }
         }
     }

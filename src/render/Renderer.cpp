@@ -110,7 +110,8 @@ void Renderer::renderFrame(
         if (m_restirGI.enabled()) {
             restirGIRan = m_restirGI.runFrame(sceneWithBVH, camera,
                                               m_width, m_height, sampleIndex,
-                                              enableEnvironment);
+                                              enableEnvironment,
+                                              backend);
         }
 
         DeviceSceneData scenePatched = scene;

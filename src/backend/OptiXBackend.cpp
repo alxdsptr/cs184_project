@@ -61,6 +61,7 @@ void OptiXBackend::destroyAll() {
     if (m_pgRaygenSplit)  { optixProgramGroupDestroy(m_pgRaygenSplit); m_pgRaygenSplit = nullptr; }
     if (m_pgRaygenReSTIR) { optixProgramGroupDestroy(m_pgRaygenReSTIR); m_pgRaygenReSTIR = nullptr; }
     if (m_pgRaygenReSTIRVis) { optixProgramGroupDestroy(m_pgRaygenReSTIRVis); m_pgRaygenReSTIRVis = nullptr; }
+    if (m_pgRaygenReSTIRGI) { optixProgramGroupDestroy(m_pgRaygenReSTIRGI); m_pgRaygenReSTIRGI = nullptr; }
     if (m_pgMissRadiance) { optixProgramGroupDestroy(m_pgMissRadiance); m_pgMissRadiance = nullptr; }
     if (m_pgMissShadow)   { optixProgramGroupDestroy(m_pgMissShadow); m_pgMissShadow = nullptr; }
     if (m_pgHitRadiance)  { optixProgramGroupDestroy(m_pgHitRadiance); m_pgHitRadiance = nullptr; }
@@ -221,6 +222,16 @@ bool OptiXBackend::loadModule(const std::string& optixirPath) {
     logSize = sizeof(logBuf);
     OPTIX_CHECK(optixProgramGroupCreate(m_ctx, &pgdRaygenReSTIRVis, 1, &pgOptions, logBuf, &logSize, &m_pgRaygenReSTIRVis));
 
+    // Fifth raygen: ReSTIR GI initial-candidates pass. Casts primary +
+    // indirect rays via the radiance hitgroup, plus one NEE shadow ray at
+    // the indirect bounce. No new SBT slots needed.
+    OptixProgramGroupDesc pgdRaygenReSTIRGI{};
+    pgdRaygenReSTIRGI.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+    pgdRaygenReSTIRGI.raygen.module = m_module;
+    pgdRaygenReSTIRGI.raygen.entryFunctionName = "__raygen__restir_gi_init_candidates";
+    logSize = sizeof(logBuf);
+    OPTIX_CHECK(optixProgramGroupCreate(m_ctx, &pgdRaygenReSTIRGI, 1, &pgOptions, logBuf, &logSize, &m_pgRaygenReSTIRGI));
+
     OptixProgramGroupDesc pgdMissR{};
     pgdMissR.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
     pgdMissR.miss.module = m_module;
@@ -264,6 +275,7 @@ bool OptiXBackend::buildPipeline() {
 #endif
     if (m_pgRaygenReSTIR) groups.push_back(m_pgRaygenReSTIR);
     if (m_pgRaygenReSTIRVis) groups.push_back(m_pgRaygenReSTIRVis);
+    if (m_pgRaygenReSTIRGI) groups.push_back(m_pgRaygenReSTIRGI);
 
     OptixPipelineLinkOptions linkOptions{};
     linkOptions.maxTraceDepth = 2;  // primary trace can fire shadow trace
@@ -313,9 +325,11 @@ bool OptiXBackend::buildSBT() {
 #endif
     const bool   haveReSTIR    = (m_pgRaygenReSTIR    != nullptr);
     const bool   haveReSTIRVis = (m_pgRaygenReSTIRVis != nullptr);
+    const bool   haveReSTIRGI  = (m_pgRaygenReSTIRGI  != nullptr);
     const uint32_t numRaygens = 1u + (haveSplit ? 1u : 0u)
                                    + (haveReSTIR ? 1u : 0u)
-                                   + (haveReSTIRVis ? 1u : 0u);
+                                   + (haveReSTIRVis ? 1u : 0u)
+                                   + (haveReSTIRGI ? 1u : 0u);
     const size_t total = recSize * (numRaygens + 4u);
 
     CUDA_CHECK(cudaMalloc((void**)&m_sbtRecordsBuf, total));
@@ -324,6 +338,7 @@ bool OptiXBackend::buildSBT() {
     RaygenRecord raygenSplitRec;
     RaygenRecord raygenReSTIRRec;
     RaygenRecord raygenReSTIRVisRec;
+    RaygenRecord raygenReSTIRGIRec;
     MissRecord   missR;
     MissRecord   missS;
     HitRecord_   hitR;
@@ -337,6 +352,9 @@ bool OptiXBackend::buildSBT() {
     }
     if (haveReSTIRVis) {
         OPTIX_CHECK(optixSbtRecordPackHeader(m_pgRaygenReSTIRVis, &raygenReSTIRVisRec));
+    }
+    if (haveReSTIRGI) {
+        OPTIX_CHECK(optixSbtRecordPackHeader(m_pgRaygenReSTIRGI, &raygenReSTIRGIRec));
     }
     OPTIX_CHECK(optixSbtRecordPackHeader(m_pgMissRadiance, &missR));
     OPTIX_CHECK(optixSbtRecordPackHeader(m_pgMissShadow,   &missS));
@@ -368,6 +386,13 @@ bool OptiXBackend::buildSBT() {
         off += recSize;
     } else {
         m_dRaygenReSTIRVisRecord = 0;
+    }
+    if (haveReSTIRGI) {
+        CUDA_CHECK(cudaMemcpy(base + off, &raygenReSTIRGIRec, recSize, cudaMemcpyHostToDevice));
+        m_dRaygenReSTIRGIRecord = (CUdeviceptr)(base + off);
+        off += recSize;
+    } else {
+        m_dRaygenReSTIRGIRecord = 0;
     }
     CUDA_CHECK(cudaMemcpy(base + off, &missR, recSize, cudaMemcpyHostToDevice)); off += recSize;
     CUDA_CHECK(cudaMemcpy(base + off, &missS, recSize, cudaMemcpyHostToDevice)); off += recSize;
@@ -647,6 +672,57 @@ bool OptiXBackend::launchReSTIRVisibilityReuseOptiX(
     lp.restirNumCandidates  = 0;  // unused
 
     m_sbt.raygenRecord = m_dRaygenReSTIRVisRecord;
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        (void*)m_dLaunchParams, &lp, sizeof(lp),
+        cudaMemcpyHostToDevice, m_stream));
+
+    OPTIX_CHECK_VOID(optixLaunch(
+        m_pipeline, m_stream,
+        m_dLaunchParams, sizeof(LaunchParams),
+        &m_sbt,
+        width, height, 1));
+    CUDA_CHECK(cudaStreamSynchronize(m_stream));
+
+    // Restore regular raygen.
+    m_sbt.raygenRecord = m_dRaygenRecord;
+    return true;
+}
+
+bool OptiXBackend::launchReSTIRGIInitCandidatesOptiX(
+    const DeviceSceneData& scene,
+    const CameraParams&    camera,
+    void*                  d_giReservoirsCurr,
+    void*                  d_giSurfacesCurr,
+    uint32_t               width,
+    uint32_t               height,
+    uint32_t               sampleIndex,
+    bool                   enableEnvironment)
+{
+    if (!m_initialized || !m_gasHandle || !m_dRaygenReSTIRGIRecord) return false;
+    if (!d_giReservoirsCurr || !d_giSurfacesCurr) return false;
+    // GI doesn't strictly need an area-light list (env hits are valid), but
+    // if there are none AND no env, the indirect Lo will always be zero and
+    // running the pass is wasted work. Skip in that case.
+    if ((!scene.d_areaLights || scene.areaLightCount == 0) && !enableEnvironment)
+        return false;
+
+    LaunchParams lp;
+    std::memset(&lp, 0, sizeof(lp));
+    lp.scene  = scene;
+    lp.camera = camera;
+    lp.width       = width;
+    lp.height      = height;
+    lp.sampleIndex = sampleIndex;
+    lp.maxBounces  = 1;   // unused; GI raygen does its own bounce
+    lp.spp         = 1;
+    lp.enableEnvironment = enableEnvironment ? 1u : 0u;
+    lp.handle      = m_gasHandle;
+    lp.giReservoirsCurr   = static_cast<GIReservoir*>(d_giReservoirsCurr);
+    lp.giSurfacesCurr     = static_cast<ReSTIRSurface*>(d_giSurfacesCurr);
+    lp.giEnableEnvironment = enableEnvironment ? 1u : 0u;
+
+    m_sbt.raygenRecord = m_dRaygenReSTIRGIRecord;
 
     CUDA_CHECK(cudaMemcpyAsync(
         (void*)m_dLaunchParams, &lp, sizeof(lp),

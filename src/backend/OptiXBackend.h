@@ -1,5 +1,6 @@
 #pragma once
 #include "backend/RayTracingBackend.h"
+#include "render/ReSTIRGI.h"  // for GIReservoir
 #include "gpu/DeviceScene.h"
 
 #include <optix.h>
@@ -122,6 +123,35 @@ public:
             scene, d_reservoirsCurr, d_surfacesCurr, width, height);
     }
 
+    // ReSTIR GI initial-candidates raygen. Casts the primary ray, builds the
+    // visible-point surface, samples one BSDF direction, traces the indirect
+    // ray, samples one NEE at the indirect hit (via lightBVH+shadow ray),
+    // packs everything into a GIReservoir written to d_giReservoirsCurr.
+    bool launchReSTIRGIInitCandidatesOptiX(
+        const DeviceSceneData& scene,
+        const CameraParams&    camera,
+        void*                  d_giReservoirsCurr,
+        void*                  d_giSurfacesCurr,
+        uint32_t               width,
+        uint32_t               height,
+        uint32_t               sampleIndex,
+        bool                   enableEnvironment);
+
+    bool runReSTIRGIInitCandidates(
+        const DeviceSceneData& scene,
+        const CameraParams&    camera,
+        void*                  d_giReservoirsCurr,
+        void*                  d_giSurfacesCurr,
+        uint32_t               width,
+        uint32_t               height,
+        uint32_t               sampleIndex,
+        bool                   enableEnvironment) override
+    {
+        return launchReSTIRGIInitCandidatesOptiX(
+            scene, camera, d_giReservoirsCurr, d_giSurfacesCurr,
+            width, height, sampleIndex, enableEnvironment);
+    }
+
 private:
     bool loadModule(const std::string& optixirPath);
     bool buildPipeline();
@@ -136,6 +166,7 @@ private:
     OptixProgramGroup       m_pgRaygenSplit  = nullptr;  // NRD split-output raygen
     OptixProgramGroup       m_pgRaygenReSTIR = nullptr;  // ReSTIR DI init-candidates raygen
     OptixProgramGroup       m_pgRaygenReSTIRVis = nullptr; // ReSTIR DI visibility-reuse raygen
+    OptixProgramGroup       m_pgRaygenReSTIRGI = nullptr;  // ReSTIR GI init-candidates raygen
     OptixProgramGroup       m_pgMissRadiance = nullptr;
     OptixProgramGroup       m_pgMissShadow   = nullptr;
     OptixProgramGroup       m_pgHitRadiance  = nullptr;
@@ -151,6 +182,7 @@ private:
     CUdeviceptr             m_dRaygenSplitRecord  = 0;
     CUdeviceptr             m_dRaygenReSTIRRecord = 0;
     CUdeviceptr             m_dRaygenReSTIRVisRecord = 0;
+    CUdeviceptr             m_dRaygenReSTIRGIRecord = 0;
 
     CUdeviceptr             m_gasOutput      = 0;
     OptixTraversableHandle  m_gasHandle      = 0;

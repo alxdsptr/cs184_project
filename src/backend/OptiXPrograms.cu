@@ -22,6 +22,7 @@
 #include "gpu/SHEnv.cuh"
 #include "accel/LightBVHSample.h"
 #include "render/ReSTIRDevice.cuh"
+#include "render/ReSTIRGIDevice.cuh"
 
 #ifndef M_PI_F
 #define M_PI_F 3.14159265358979323846f
@@ -1736,3 +1737,8 @@ extern "C" __global__ void __raygen__restir_visibility()
         params.restirReservoirsCurr[pixelIdx] = r;
     }
 }
+
+// ── ReSTIR GI raygen (lives in OptiXProgramsGI.inl to keep this file
+// readable). Compiled into the same module as the rest of the OptiX
+// programs so it sees `params`, `traceRadianceRay`, etc.
+#include "backend/OptiXProgramsGI.inl"

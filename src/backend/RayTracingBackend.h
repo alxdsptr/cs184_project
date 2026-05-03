@@ -104,4 +104,24 @@ public:
         uint32_t               /*height*/) {
         return false;
     }
+
+    // ReSTIR GI initial-candidates pass. Casts one primary ray per pixel,
+    // builds the visible-point surface, samples one BSDF direction, traces
+    // the indirect ray to a sample point, captures Lo (emission + 1-bounce
+    // NEE), and writes a per-pixel reservoir + surface buffer in the layout
+    // CUDA temporal/spatial passes consume. OptiX backend does this with
+    // hardware-traced rays against the GAS; CUDA falls back to its SAH-BVH
+    // kernel when the backend has no native implementation. Returns true on
+    // success.
+    virtual bool runReSTIRGIInitCandidates(
+        const DeviceSceneData& /*scene*/,
+        const CameraParams&    /*camera*/,
+        void*                  /*d_giReservoirsCurr*/,
+        void*                  /*d_giSurfacesCurr*/,
+        uint32_t               /*width*/,
+        uint32_t               /*height*/,
+        uint32_t               /*sampleIndex*/,
+        bool                   /*enableEnvironment*/) {
+        return false;
+    }
 };

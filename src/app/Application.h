@@ -35,6 +35,10 @@ public:
     // loadScene().
     void setEmissiveTargetLum(float v) { m_emissiveTargetLum = v; }
     void setHeadlessOutput(const std::string& outputPath, uint32_t sampleCount);
+    // Toggle ReSTIR DI / GI passes. Pre-init these are stored and applied
+    // after Renderer::init in Application::init().
+    void setReSTIREnabled(bool on)    { m_pendingReSTIRDI = on; }
+    void setReSTIRGIEnabled(bool on)  { m_pendingReSTIRGI = on; }
     void setEnvMap(const std::string& path);
     void loadCameraFile(const std::string& path) { m_cameraFilePath = path; }
 
@@ -101,6 +105,9 @@ private:
     bool m_prevF4Down = false;
     uint32_t m_maxBounces = 8;
     uint32_t m_samplesPerFrame = 1;
+    // Pending ReSTIR toggles applied to m_renderer right after init().
+    bool m_pendingReSTIRDI = true;
+    bool m_pendingReSTIRGI = false;
     // Normal-map debug visualization. 0 = off; 1 = perturbed N; 2 = tangent
     // handedness; 3 = back-face-after-perturb flag. See DeviceSceneData.
     int m_debugNormalViz = 0;

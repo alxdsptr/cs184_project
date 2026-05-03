@@ -158,10 +158,19 @@ __global__ void kReSTIR_InitCandidates(
             float u = pcg32_float(rng);
             uint32_t slot = 0;
             float pSelect = 0.0f;
-            if (!lightBVH_sample(scene.d_lightBVHNodes,
-                                 scene.lightBVHRootIndex,
-                                 surf.position, u, slot, pSelect) || !(pSelect > 0.0f))
+            bool sampled = lightBVH_sample(scene.d_lightBVHNodes,
+                                           scene.lightBVHRootIndex,
+                                           surf.position, u, slot, pSelect)
+                           && (pSelect > 0.0f);
+            if (!sampled) {
+                // Still count this draw against M so finalize divides by the
+                // true number of candidates considered (not just the
+                // successful ones). Without this, W is over-estimated for
+                // shading points where the BVH frequently rejects samples
+                // (e.g. behind / above the light cluster).
+                r.M += 1.0f;
                 continue;
+            }
             uint32_t lightIdx = scene.d_lightOrderedIndices[slot];
             GPUAreaLight light = scene.d_areaLights[lightIdx];
 

@@ -37,7 +37,11 @@ public:
                 // Normal-arrow overlay toggle + its parameters.
                 bool* showNormalArrows = nullptr,
                 int*  normalArrowStride = nullptr,
-                float* normalArrowLength = nullptr);
+                float* normalArrowLength = nullptr,
+                // ReSTIR toggles (DI = direct lighting, GI = indirect).
+                // Pass nullptr to hide the section.
+                bool* restirDIEnabled = nullptr,
+                bool* restirGIEnabled = nullptr);
 
     // Draw a sparse normal-arrow overlay on top of the path-traced image.
     // Call this once per frame between beginFrame() and endFrame(), only

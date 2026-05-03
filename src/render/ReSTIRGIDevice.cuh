@@ -106,10 +106,12 @@ __device__ inline float giJacobian(
     float cosSSrc = fmaxf(dot(r.sampleNormal, -dSrc * invSrc), 0.0f);
     if (cosSSrc <= 0.0f) return 0.0f;
     float jac = (cosSDst * r2Src) / (cosSSrc * r2Dst);
-    // Cap the Jacobian to reject pathological geometry (grazing connections
-    // blow up the ratio and produce fireflies). 10x is the standard clamp.
-    if (jac > 10.0f) return 0.0f;
-    if (jac < 0.1f)  return 0.0f;
+    // Symmetric clamp instead of asymmetric reject: rejecting jac<0.1 but
+    // not jac>10 (or vice versa) creates a selection bias that systematically
+    // favours the brighter side. Clamp on both ends keeps the ratio finite
+    // without skewing the distribution.
+    if (jac > 10.0f) jac = 10.0f;
+    if (jac < 0.1f)  jac = 0.1f;
     (void)nqDst;
     return jac;
 }
@@ -124,9 +126,13 @@ __device__ inline bool giReservoirUpdate(
     const float3& sampleRadiance,
     float pHat, float wCandidate, float u01)
 {
+    // Match paper Algorithm 1: M counts every candidate considered, not just
+    // the ones with non-zero weight. Skipping the M increment on zero-weight
+    // candidates inflates W = wSum/(M·pHat) and produces overexposure under
+    // temporal+spatial reuse — same root cause as the DI bug.
+    r.M += 1.0f;
     if (!(wCandidate > 0.0f)) return false;
     wSum  += wCandidate;
-    r.M   += 1.0f;
     if (u01 * wSum < wCandidate) {
         r.visiblePos     = visiblePos;
         r.visibleNormal  = visibleNormal;

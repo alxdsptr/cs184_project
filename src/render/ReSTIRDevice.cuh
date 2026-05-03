@@ -65,6 +65,14 @@ __device__ inline float3 restirEvalBrdf(
 
 // Target pdf for RIS: luminance(Le) * |BRDF * NdotL| * geometry, NO visibility.
 // Returns 0 if the sample is back-facing on either surface.
+//
+// IMPORTANT: when the area light has an emissive texture, the *actual* Le
+// used by the path tracer's NEE comes from sampling that texture at the
+// barycentric position. We must mirror that here, otherwise pHat reflects
+// only the base `light.emission` (often a fraction of the textured value)
+// while the final estimator evaluates `f * Le * W` against the textured Le —
+// the resulting W is too large for textured emitters, producing the bright
+// overexposure observed on scenes with screen / strip / billboard emitters.
 __device__ inline float restirEvalTargetPdf(
     const ReSTIRSurface& s,
     const GPUAreaLight&  light,
@@ -82,7 +90,14 @@ __device__ inline float restirEvalTargetPdf(
     float lightNdot = fmaxf(dot(light.normal, -L), 0.0f);
     if (NdotL <= 0.0f || lightNdot <= 0.0f) return 0.0f;
 
-    float Lum = restirLuminance(light.emission);
+    float3 Le = light.emission;
+    if (light.emissiveTex != 0) {
+        float u = light.uv0.x * b0 + light.uv1.x * b1 + light.uv2.x * b2;
+        float v = light.uv0.y * b0 + light.uv1.y * b1 + light.uv2.y * b2;
+        float4 t = tex2D<float4>(light.emissiveTex, u, v);
+        Le = make_float3(t.x, t.y, t.z) * light.emission;
+    }
+    float Lum = restirLuminance(Le);
     if (Lum <= 0.0f) return 0.0f;
 
     float3 brdf = restirEvalBrdf(s, L);
@@ -108,9 +123,14 @@ __device__ inline bool restir_reservoirUpdate(
     uint32_t lightIdx, float b1, float b2, float pHat,
     float wCandidate, float u01)
 {
+    // Paper Algorithm 1 increments M unconditionally (counts every candidate
+    // considered, including those with wCandidate=0). Skipping the increment
+    // for zero-weight candidates inflates W = wSum/(M·pHat) by a factor of
+    // (true M / non-zero M) — a small bias on its own, but it stacks under
+    // temporal+spatial reuse since the inflated W gets blended forward.
+    r.M += 1.0f;
     if (!(wCandidate > 0.0f)) return false;
     wSum += wCandidate;
-    r.M  += 1.0f;
     if (u01 * wSum < wCandidate) {
         r.lightIndex = lightIdx;
         r.baryB1     = b1;

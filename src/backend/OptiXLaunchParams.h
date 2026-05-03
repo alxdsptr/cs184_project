@@ -3,6 +3,7 @@
 #include "core/Camera.h"
 #include "render/AuxBuffers.h"
 #include "render/ReSTIR.h"
+#include "render/ReSTIRGI.h"
 #include <cuda_runtime.h>
 
 #ifdef __CUDACC__
@@ -53,6 +54,13 @@ struct LaunchParams {
     ReSTIRReservoir* restirReservoirsCurr;
     ReSTIRSurface*   restirSurfacesCurr;
     unsigned int     restirNumCandidates;
+
+    // ReSTIR GI init-candidates raygen output. Layout matches the CUDA
+    // kernel's so the temporal/spatial passes (still CUDA) can consume
+    // either backend's output transparently.
+    GIReservoir*     giReservoirsCurr;
+    ReSTIRSurface*   giSurfacesCurr;
+    unsigned int     giEnableEnvironment;
 
     OptixTraversableHandle handle;
 };

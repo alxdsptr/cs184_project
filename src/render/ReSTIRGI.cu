@@ -1,5 +1,6 @@
 #include "render/ReSTIRGI.h"
 #include "render/ReSTIRGIDevice.cuh"
+#include "backend/RayTracingBackend.h"
 #include "core/Math.h"
 #include "gpu/AreaLightGPU.h"
 #include "gpu/MaterialGPU.h"
@@ -426,24 +427,33 @@ __global__ void kReSTIRGI_InitCandidates(
         hasSample = (restirLuminance(Lo) > 0.0f);
     }
 
-    if (hasSample) {
-        // Build a temporary reservoir to evaluate pHat through the shared
-        // helper (needs a populated GIReservoir to compute brdf+geom).
-        GIReservoir cand{};
-        cand.visiblePos     = surf.position;
-        cand.visibleNormal  = surf.normal;
-        cand.samplePos      = samplePos;
-        cand.sampleNormal   = sampleNormal;
-        cand.sampleRadiance = Lo;
-        cand.isEnv          = isEnvSample ? 1u : 0u;
-        cand.valid          = 1u;
-        float3 wiOut;
-        float pHat = giEvalTargetPdf(surf, cand, wiOut);
-        // Source pdf is the BSDF pdf in solid-angle measure at the visible
-        // point; pHat is also in solid-angle measure → ratio is dimensionally
-        // consistent.
-        float wCand = (pdfBsdf > 0.0f) ? (pHat / pdfBsdf) : 0.0f;
+    // Always treat this pixel as having drawn 1 RIS candidate, even if it
+    // produced no visible/non-zero sample (BSDF lobe missed everything,
+    // shadow ray got fully occluded, etc.). Counting only the successful
+    // candidates inflates M's denominator role under temporal+spatial reuse
+    // — same root cause as the DI M-counting bug. With this, an invalid
+    // sample contributes (M=1, valid=0, W=0) so temporal/spatial merges see
+    // a denominator that includes the failed draw.
+    {
+        float pHat = 0.0f;
+        float wCand = 0.0f;
+        if (hasSample) {
+            GIReservoir cand{};
+            cand.visiblePos     = surf.position;
+            cand.visibleNormal  = surf.normal;
+            cand.samplePos      = samplePos;
+            cand.sampleNormal   = sampleNormal;
+            cand.sampleRadiance = Lo;
+            cand.isEnv          = isEnvSample ? 1u : 0u;
+            cand.valid          = 1u;
+            float3 wiOut;
+            pHat  = giEvalTargetPdf(surf, cand, wiOut);
+            wCand = (pdfBsdf > 0.0f) ? (pHat / pdfBsdf) : 0.0f;
+        }
         float wSum = 0.0f;
+        // giReservoirUpdate already increments M unconditionally now (paper
+        // Algorithm 1) so this single call covers both the successful and
+        // failed cases.
         giReservoirUpdate(r, wSum,
                           surf.position, surf.normal,
                           isEnvSample, samplePos, sampleNormal, Lo,
@@ -743,15 +753,30 @@ void ReSTIRGIContext::invalidateHistory() {
 bool ReSTIRGIContext::runFrame(
     const DeviceSceneData& scene, const CameraParams& camera,
     uint32_t width, uint32_t height, uint32_t sampleIndex,
-    bool enableEnvironment)
+    bool enableEnvironment,
+    RayTracingBackend* backend)
 {
     if (!m_enabled) return false;
-    // Initial-candidates pass needs the CUDA BVH.
-    if (!scene.d_bvhNodes || scene.totalTriangles == 0) return false;
 
-    launchReSTIRGIInitialCandidates(
-        scene, camera, m_buffers,
-        width, height, sampleIndex, enableEnvironment, m_temporalMCap);
+    // Prefer backend's native init (OptiX raygen → GAS). Falls back to the
+    // CUDA BVH kernel when the backend has no implementation or returns
+    // false. The CUDA kernel needs scene.d_bvhNodes patched in by the
+    // backend; the OptiX raygen doesn't, so we don't gate on d_bvhNodes
+    // until the fall-back path.
+    bool initRan = false;
+    if (backend) {
+        initRan = backend->runReSTIRGIInitCandidates(
+            scene, camera,
+            (void*)m_buffers.d_reservoirsCurr,
+            (void*)m_buffers.d_surfaceCurr,
+            width, height, sampleIndex, enableEnvironment);
+    }
+    if (!initRan) {
+        if (!scene.d_bvhNodes || scene.totalTriangles == 0) return false;
+        launchReSTIRGIInitialCandidates(
+            scene, camera, m_buffers,
+            width, height, sampleIndex, enableEnvironment, m_temporalMCap);
+    }
     launchReSTIRGITemporalReuse(
         scene, m_buffers, width, height, sampleIndex, m_temporalMCap);
     launchReSTIRGISpatialReuse(

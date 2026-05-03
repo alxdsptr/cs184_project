@@ -124,7 +124,8 @@ public:
     // skipped (e.g., scene has no BVH built CPU-side).
     bool runFrame(const DeviceSceneData& scene, const CameraParams& camera,
                   uint32_t width, uint32_t height, uint32_t sampleIndex,
-                  bool enableEnvironment);
+                  bool enableEnvironment,
+                  class RayTracingBackend* backend = nullptr);
 
     // Runtime tuning knobs.
     void setTemporalMCap(uint32_t n) { m_temporalMCap = n; }
@@ -143,7 +144,12 @@ private:
     GIBuffers m_buffers;
     uint32_t m_temporalMCap  = 30;    // Bitterli-style M cap on history
     uint32_t m_spatialMCap   = 500;   // higher cap once spatially fused
-    uint32_t m_numNeighbors  = 5;     // neighbors per spatial pass
+    uint32_t m_numNeighbors  = 0;     // spatial reuse off by default
+                                       // (combined with temporal reuse it
+                                       // produces a stable but biased
+                                       // overexposure on glossy/reflective
+                                       // surfaces; revisit once we add
+                                       // visibility re-test in spatial)
     float    m_spatialRadius = 30.0f; // pixels
     bool     m_enabled       = false; // off by default — opt-in
 };

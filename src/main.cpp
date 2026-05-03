@@ -20,6 +20,8 @@ int main(int argc, char** argv) {
     int backendKind = 0;   // 0=CUDA, 1=OptiX
     SGWorkflowMode sgMode = SGWorkflowMode::Off;
     float emissiveTargetLum = 20.0f;
+    bool restirDI = true;
+    bool restirGI = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -57,6 +59,12 @@ int main(int argc, char** argv) {
             else if (s == "fbx-c4d")  sgMode = SGWorkflowMode::FbxC4D;
             else if (s == "fbx-ue")   sgMode = SGWorkflowMode::FbxUE;
             else LOG_WARN("Invalid --sg value: %s (use off|heuristic|fbx-c4d|fbx-ue)", s.c_str());
+        } else if (arg == "--no-restir") {
+            restirDI = false;
+        } else if (arg == "--restir-gi") {
+            restirGI = true;
+        } else if (arg == "--no-restir-gi") {
+            restirGI = false;
         } else if (arg == "--emissive-target" && i + 1 < argc) {
             float v = (float)std::atof(argv[++i]);
             if (v > 0.0f) {
@@ -107,6 +115,8 @@ int main(int argc, char** argv) {
     app.setBackendKind(backendKind);
     app.setSGWorkflowMode(sgMode);
     app.setEmissiveTargetLum(emissiveTargetLum);
+    app.setReSTIREnabled(restirDI);
+    app.setReSTIRGIEnabled(restirGI);
     if (!outputPath.empty()) {
         app.setHeadlessOutput(outputPath, samples);
     }
