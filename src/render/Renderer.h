@@ -3,6 +3,7 @@
 #include "render/AuxBuffers.h"
 #include "render/Tonemapping.h"
 #include "render/ReSTIR.h"
+#include "render/ReSTIRGI.h"
 #include "core/Camera.h"
 #include "gpu/DeviceScene.h"
 #include <cstdint>
@@ -69,6 +70,13 @@ public:
     ReSTIRContext&       restir()       { return m_restir; }
     const ReSTIRContext& restir() const { return m_restir; }
 
+    // ReSTIR GI controls (replaces continuation bounces at the primary hit
+    // with a resampled 1-bounce indirect estimate). Native mode only.
+    bool  isReSTIRGIEnabled() const { return m_restirGI.enabled(); }
+    void  setReSTIRGIEnabled(bool on) { m_restirGI.setEnabled(on); m_restirGI.invalidateHistory(); }
+    ReSTIRGIContext&       restirGI()       { return m_restirGI; }
+    const ReSTIRGIContext& restirGI() const { return m_restirGI; }
+
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
     enum class DLSSQuality { Performance, Balanced, Quality, DLAA };
     void setDLSSQuality(DLSSQuality q);
@@ -102,6 +110,7 @@ private:
     AccumulationBuffer m_accumBuffer;
     AuxBuffers         m_auxBuffers;
     ReSTIRContext      m_restir;
+    ReSTIRGIContext    m_restirGI;
     uint32_t m_width = 0, m_height = 0;
     float    m_exposure = 1.0f;
     ToneMappingMode m_toneMappingMode = ToneMappingMode::ACES;

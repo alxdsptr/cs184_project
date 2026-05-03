@@ -48,6 +48,16 @@ struct DeviceSceneData {
     void*         d_restirReservoirs    = nullptr;
     int           restirEnabled         = 0;
 
+    // ReSTIR GI — per-pixel resolved indirect-radiance buffer produced by
+    // the ReSTIR GI pipeline (init candidates → temporal → spatial → shade).
+    // When non-null AND restirGIEnabled != 0, the main kernel consumes this
+    // value as the "indirect contribution from the primary hit" and skips
+    // its own continuation bounces (sample 0 only — extra spp still path-
+    // traces normally so we don't double-count). Layout: float3 per pixel
+    // in row-major width × height.
+    float3*       d_restirGIIndirect    = nullptr;
+    int           restirGIEnabled       = 0;
+
     // HDR environment map (equirectangular, float4 texture)
     cudaTextureObject_t envMapTex   = 0;
 

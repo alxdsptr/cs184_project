@@ -193,6 +193,7 @@ target_sources(pathtracer PRIVATE
     src/render/AccumulationBuffer.cu
     src/render/AuxBuffers.cu
     src/render/ReSTIR.cu
+    src/render/ReSTIRGI.cu
 )
 
 add_dependencies(pathtracer shaders)
