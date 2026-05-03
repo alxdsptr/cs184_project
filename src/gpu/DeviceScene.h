@@ -2,6 +2,7 @@
 #include "gpu/AreaLightGPU.h"
 #include "gpu/MaterialGPU.h"
 #include "gpu/LightGPU.h"
+#include "core/VolumeMedium.h"
 #include "accel/BVHNode.h"
 #include <cuda_runtime.h>
 
@@ -27,6 +28,9 @@ struct DeviceSceneData {
     int*         d_triangleAreaLightIndex = nullptr;
     BVHNode*     d_bvhNodes        = nullptr;
     uint32_t     bvhRootIndex      = 0;
+
+    // Scene-global homogeneous medium parameters.
+    HomogeneousMedium medium;
 
     // HDR environment map (equirectangular, float4 texture)
     cudaTextureObject_t envMapTex   = 0;

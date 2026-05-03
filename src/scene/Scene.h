@@ -1,5 +1,6 @@
 #pragma once
 #include "accel/AABB.h"
+#include "core/VolumeMedium.h"
 #include "scene/AreaLight.h"
 #include "scene/Mesh.h"
 #include "scene/Material.h"
@@ -36,6 +37,9 @@ public:
     SceneCamera& getCamera() { return m_camera; }
     const SceneCamera& getCamera() const { return m_camera; }
 
+    HomogeneousMedium& getMedium() { return m_medium; }
+    const HomogeneousMedium& getMedium() const { return m_medium; }
+
     uint32_t totalTriangles() const;
     uint32_t totalVertices() const;
 
@@ -47,4 +51,5 @@ private:
     std::vector<TriangleAreaLight> m_areaLights;
     AABB m_bounds;
     SceneCamera m_camera;
+    HomogeneousMedium m_medium;
 };

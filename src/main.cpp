@@ -1,4 +1,5 @@
 #include "app/Application.h"
+#include "core/Types.h"
 #include "scene/SceneLoader.h"
 #include "util/Log.h"
 
@@ -20,6 +21,13 @@ int main(int argc, char** argv) {
     int backendKind = 0;   // 0=CUDA, 1=OptiX
     SGWorkflowMode sgMode = SGWorkflowMode::Off;
     float emissiveTargetLum = 20.0f;
+    bool mediumEnabled = false;
+    float3 mediumSigmaA = make_float3(0.0f, 0.0f, 0.0f);
+    float3 mediumSigmaS = make_float3(0.0f, 0.0f, 0.0f);
+    float mediumDensity = 1.0f;
+    float mediumAnisotropy = 0.0f;
+    float mediumMaxDistance = 1e6f;
+    bool mediumAnyOverride = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -64,6 +72,51 @@ int main(int argc, char** argv) {
             } else {
                 LOG_WARN("Invalid --emissive-target value: %s", argv[i]);
             }
+        } else if (arg == "--medium" && i + 1 < argc) {
+            std::string v = argv[++i];
+            if (v == "on" || v == "1" || v == "true") {
+                mediumEnabled = true;
+                mediumAnyOverride = true;
+            } else if (v == "off" || v == "0" || v == "false") {
+                mediumEnabled = false;
+                mediumAnyOverride = true;
+            } else {
+                LOG_WARN("Invalid --medium value: %s (use on|off)", v.c_str());
+            }
+        } else if (arg == "--sigma-a" && i + 3 < argc) {
+            mediumSigmaA = make_float3((float)std::atof(argv[++i]),
+                                       (float)std::atof(argv[++i]),
+                                       (float)std::atof(argv[++i]));
+            mediumAnyOverride = true;
+        } else if (arg == "--sigma-s" && i + 3 < argc) {
+            mediumSigmaS = make_float3((float)std::atof(argv[++i]),
+                                       (float)std::atof(argv[++i]),
+                                       (float)std::atof(argv[++i]));
+            mediumAnyOverride = true;
+        } else if (arg == "--medium-density" && i + 1 < argc) {
+            float v = (float)std::atof(argv[++i]);
+            if (v >= 0.0f) {
+                mediumDensity = v;
+                mediumAnyOverride = true;
+            } else {
+                LOG_WARN("Invalid --medium-density value: %s", argv[i]);
+            }
+        } else if (arg == "--medium-g" && i + 1 < argc) {
+            float v = (float)std::atof(argv[++i]);
+            if (v >= -0.99f && v <= 0.99f) {
+                mediumAnisotropy = v;
+                mediumAnyOverride = true;
+            } else {
+                LOG_WARN("Invalid --medium-g value: %s (range -0.99..0.99)", argv[i]);
+            }
+        } else if (arg == "--medium-max-distance" && i + 1 < argc) {
+            float v = (float)std::atof(argv[++i]);
+            if (v > 0.0f) {
+                mediumMaxDistance = v;
+                mediumAnyOverride = true;
+            } else {
+                LOG_WARN("Invalid --medium-max-distance value: %s", argv[i]);
+            }
         } else if ((arg == "--spp" || arg == "-p") && i + 1 < argc) {
             int value = std::atoi(argv[++i]);
             if (value > 0) {
@@ -107,6 +160,14 @@ int main(int argc, char** argv) {
     app.setBackendKind(backendKind);
     app.setSGWorkflowMode(sgMode);
     app.setEmissiveTargetLum(emissiveTargetLum);
+    if (mediumAnyOverride) {
+        app.setMediumEnabled(mediumEnabled);
+        app.setMediumSigmaA(mediumSigmaA);
+        app.setMediumSigmaS(mediumSigmaS);
+        app.setMediumDensity(mediumDensity);
+        app.setMediumAnisotropy(mediumAnisotropy);
+        app.setMediumMaxDistance(mediumMaxDistance);
+    }
     if (!outputPath.empty()) {
         app.setHeadlessOutput(outputPath, samples);
     }

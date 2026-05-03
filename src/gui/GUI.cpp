@@ -73,6 +73,12 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
                  float& exposure, int& toneMappingMode,
                  float& moveSpeed,
                  char* envMapPathBuf, size_t envMapPathBufSize, bool& loadEnvMapRequested,
+                 bool* mediumEnabled,
+                 float* mediumSigmaA,
+                 float* mediumSigmaS,
+                 float* mediumDensity,
+                 float* mediumAnisotropy,
+                 float* mediumMaxDistance,
                  int* renderMode,
                  int* dlssQuality,
                  uint32_t renderResW,
@@ -114,6 +120,24 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
     ImGui::SliderFloat("Exposure", &exposure, 0.05f, 8.0f, "%.2f");
     const char* toneMappingItems[] = {"None", "Reinhard", "ACES"};
     ImGui::Combo("Mode", &toneMappingMode, toneMappingItems, IM_ARRAYSIZE(toneMappingItems));
+
+    if (mediumEnabled) {
+        ImGui::Separator();
+        ImGui::Text("Volumetric Medium");
+
+        if (ImGui::Checkbox("Enable medium", mediumEnabled)) {
+            changed = true;
+        }
+
+        if (*mediumEnabled) {
+            bool changedSigmaA = mediumSigmaA && ImGui::SliderFloat3("sigma_a", mediumSigmaA, 0.0f, 1.0f, "%.3f");
+            bool changedSigmaS = mediumSigmaS && ImGui::SliderFloat3("sigma_s", mediumSigmaS, 0.0f, 1.0f, "%.3f");
+            bool changedDensity = mediumDensity && ImGui::SliderFloat("density", mediumDensity, 0.0f, 1.0f, "%.3f");
+            bool changedAnisotropy = mediumAnisotropy && ImGui::SliderFloat("anisotropy g", mediumAnisotropy, -0.99f, 0.99f, "%.2f");
+            bool changedMaxDistance = mediumMaxDistance && ImGui::SliderFloat("max distance", mediumMaxDistance, 1.0f, 100.0f, "%.1f");
+            changed = changed || changedSigmaA || changedSigmaS || changedDensity || changedAnisotropy || changedMaxDistance;
+        }
+    }
 
     if (renderMode) {
         ImGui::Separator();

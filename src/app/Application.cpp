@@ -242,6 +242,11 @@ bool Application::loadScene(const std::string& path) {
         LOG_ERROR("Failed to load scene: %s", path.c_str());
         return false;
     }
+    if (m_hasMediumOverride) {
+        m_scene.getMedium() = m_medium;
+    } else {
+        m_medium = m_scene.getMedium();
+    }
 
     // Load textures and bind CUDA texture objects per material.
     // Cache key = (path, sRGB) since the same file may appear as both a
@@ -432,6 +437,7 @@ void Application::renderSceneSample(uchar4* d_pbo, bool timeHeadless) {
         CameraParams camParams = m_camera.getParams(m_frameIndex);
         DeviceSceneData sceneData = m_backend->getSceneData();
         sceneData.envMapTex = m_envMapTex;
+        sceneData.medium = m_medium;
         sceneData.d_shEnvCoeffs = m_d_shEnvCoeffs;
         sceneData.envUseSH = (m_useSHEnvIrradiance && m_d_shEnvCoeffs) ? 1 : 0;
         sceneData.debugNormalViz = m_debugNormalViz;
@@ -641,6 +647,12 @@ void Application::runGui() {
                 m_envMapPathBuf,
                 sizeof(m_envMapPathBuf),
                 envMapLoadRequested,
+                &m_medium.enabled,
+                &m_medium.sigmaA.x,
+                &m_medium.sigmaS.x,
+                &m_medium.density,
+                &m_medium.anisotropy,
+                &m_medium.maxDistance,
                 modePtr, qualityPtr, rrW, rrH,
                 &m_debugNormalViz,
                 &m_enableNormalMap,
@@ -671,6 +683,10 @@ void Application::runGui() {
 #endif
 
         m_camera.setMoveSpeed(moveSpeed);
+        m_medium.density = fmaxf(m_medium.density, 0.0f);
+        m_medium.maxDistance = fmaxf(m_medium.maxDistance, 1.0f);
+        m_medium.anisotropy = fminf(fmaxf(m_medium.anisotropy, -0.99f), 0.99f);
+        m_scene.getMedium() = m_medium;
         m_renderer.setExposure(exposure);
         if (toneMappingMode < (int)ToneMappingMode::None) {
             toneMappingMode = (int)ToneMappingMode::None;

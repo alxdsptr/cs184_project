@@ -12,6 +12,9 @@ void DeviceScene::upload(const Scene& scene) {
     const auto& directionalLights = scene.getDirectionalLights();
     const auto& areaLights = scene.getAreaLights();
 
+    // Small POD copied by value into launch params each frame.
+    m_data.medium = scene.getMedium();
+
     // Count totals
     uint32_t totalVerts = 0, totalTris = 0;
     for (auto& m : meshes) {
