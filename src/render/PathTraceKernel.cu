@@ -354,7 +354,8 @@ __global__ void pathTraceKernel(
     bool restirActiveBounce0 =
         (s == 0) && (
             (scene.restirEnabled != 0 && scene.d_restirReservoirs != nullptr) ||
-            (scene.restirGIEnabled != 0 && scene.d_restirGIIndirect != nullptr));
+            (scene.restirGIEnabled != 0 && scene.d_restirGIIndirect != nullptr) ||
+            (scene.restirPTEnabled != 0 && scene.d_restirPTIndirect != nullptr));
 
     float jx, jy;
     if (dlssPublish || restirActiveBounce0) {
@@ -1109,18 +1110,26 @@ __global__ void pathTraceKernel(
             radiance += throughput * direct;
         }
 
-        // ReSTIR GI consumption: at the primary hit on sample s==0, add the
-        // pre-computed indirect-radiance estimate from the GI reservoir and
-        // skip continuation bounces. Higher spp samples still path-trace
-        // normally so we don't bake a single biased estimate into the
-        // accumulator. Restricted to bounce==0 because the GI buffer is
-        // populated only for camera rays.
+        // ReSTIR PT / GI consumption at the primary hit on sample s==0.
+        // PT takes precedence (its postfix already contains GI's 1-bounce NEE
+        // plus k more bounces' worth of light transport). Either branch adds
+        // the pre-computed indirect estimate and skips continuation bounces;
+        // the direct lighting at the primary hit was already added above.
+        // Restricted to bounce==0 because the PT/GI buffer is populated for
+        // camera rays only — higher bounces fall through to plain BSDF sampling.
+        if (scene.restirPTEnabled != 0 && scene.d_restirPTIndirect != nullptr &&
+            bounce == 0 && s == 0)
+        {
+            float3 indirect = scene.d_restirPTIndirect[pixelIdx];
+            radiance += throughput * indirect;
+            break;
+        }
         if (scene.restirGIEnabled != 0 && scene.d_restirGIIndirect != nullptr &&
             bounce == 0 && s == 0)
         {
             float3 indirect = scene.d_restirGIIndirect[pixelIdx];
             radiance += throughput * indirect;
-            break; // direct lighting at primary hit already added above
+            break;
         }
 
         // BRDF sampling: Fresnel-weighted blend between diffuse and specular

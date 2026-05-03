@@ -194,6 +194,7 @@ target_sources(pathtracer PRIVATE
     src/render/AuxBuffers.cu
     src/render/ReSTIR.cu
     src/render/ReSTIRGI.cu
+    src/render/ReSTIRPT.cu
 )
 
 add_dependencies(pathtracer shaders)
@@ -255,6 +256,13 @@ if(PATHTRACER_ENABLE_OPTIX)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/Sampling.h
         ${CMAKE_CURRENT_SOURCE_DIR}/src/core/Camera.h
         ${CMAKE_CURRENT_SOURCE_DIR}/src/render/AuxBuffers.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/render/ReSTIR.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/render/ReSTIRGI.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/render/ReSTIRPT.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/render/ReSTIRDevice.cuh
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/render/ReSTIRGIDevice.cuh
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/OptiXProgramsGI.inl
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/OptiXProgramsPT.inl
     )
     add_custom_command(
         OUTPUT  ${OPTIX_PROGRAMS_IR}

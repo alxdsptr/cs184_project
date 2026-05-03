@@ -4,6 +4,7 @@
 #include "render/Tonemapping.h"
 #include "render/ReSTIR.h"
 #include "render/ReSTIRGI.h"
+#include "render/ReSTIRPT.h"
 #include "core/Camera.h"
 #include "gpu/DeviceScene.h"
 #include <cstdint>
@@ -82,6 +83,15 @@ public:
     ReSTIRGIContext&       restirGI()       { return m_restirGI; }
     const ReSTIRGIContext& restirGI() const { return m_restirGI; }
 
+    // ReSTIR PT controls (Lin et al. 2022). Generalises GI to arbitrary path
+    // length: stored radiance is the result of a multi-bounce random walk
+    // past the reconnection vertex. Native mode only. Mutually exclusive
+    // with GI at the consumption site (PT wins when both are on).
+    bool  isReSTIRPTEnabled() const { return m_restirPT.enabled(); }
+    void  setReSTIRPTEnabled(bool on) { m_restirPT.setEnabled(on); m_restirPT.invalidateHistory(); }
+    ReSTIRPTContext&       restirPT()       { return m_restirPT; }
+    const ReSTIRPTContext& restirPT() const { return m_restirPT; }
+
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
     enum class DLSSQuality { Performance, Balanced, Quality, DLAA };
     void setDLSSQuality(DLSSQuality q);
@@ -116,6 +126,7 @@ private:
     AuxBuffers         m_auxBuffers;
     ReSTIRContext      m_restir;
     ReSTIRGIContext    m_restirGI;
+    ReSTIRPTContext    m_restirPT;
     uint32_t m_width = 0, m_height = 0;
     float    m_exposure = 1.0f;
     ToneMappingMode m_toneMappingMode = ToneMappingMode::ACES;

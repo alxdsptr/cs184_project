@@ -62,6 +62,7 @@ void OptiXBackend::destroyAll() {
     if (m_pgRaygenReSTIR) { optixProgramGroupDestroy(m_pgRaygenReSTIR); m_pgRaygenReSTIR = nullptr; }
     if (m_pgRaygenReSTIRVis) { optixProgramGroupDestroy(m_pgRaygenReSTIRVis); m_pgRaygenReSTIRVis = nullptr; }
     if (m_pgRaygenReSTIRGI) { optixProgramGroupDestroy(m_pgRaygenReSTIRGI); m_pgRaygenReSTIRGI = nullptr; }
+    if (m_pgRaygenReSTIRPT) { optixProgramGroupDestroy(m_pgRaygenReSTIRPT); m_pgRaygenReSTIRPT = nullptr; }
     if (m_pgMissRadiance) { optixProgramGroupDestroy(m_pgMissRadiance); m_pgMissRadiance = nullptr; }
     if (m_pgMissShadow)   { optixProgramGroupDestroy(m_pgMissShadow); m_pgMissShadow = nullptr; }
     if (m_pgHitRadiance)  { optixProgramGroupDestroy(m_pgHitRadiance); m_pgHitRadiance = nullptr; }
@@ -232,6 +233,16 @@ bool OptiXBackend::loadModule(const std::string& optixirPath) {
     logSize = sizeof(logBuf);
     OPTIX_CHECK(optixProgramGroupCreate(m_ctx, &pgdRaygenReSTIRGI, 1, &pgOptions, logBuf, &logSize, &m_pgRaygenReSTIRGI));
 
+    // Sixth raygen: ReSTIR PT initial-candidates pass. Same SBT geometry as
+    // ReSTIR GI (radiance + shadow program groups); the only difference is
+    // the multi-bounce random walk past the reconnection vertex.
+    OptixProgramGroupDesc pgdRaygenReSTIRPT{};
+    pgdRaygenReSTIRPT.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+    pgdRaygenReSTIRPT.raygen.module = m_module;
+    pgdRaygenReSTIRPT.raygen.entryFunctionName = "__raygen__restir_pt_init_candidates";
+    logSize = sizeof(logBuf);
+    OPTIX_CHECK(optixProgramGroupCreate(m_ctx, &pgdRaygenReSTIRPT, 1, &pgOptions, logBuf, &logSize, &m_pgRaygenReSTIRPT));
+
     OptixProgramGroupDesc pgdMissR{};
     pgdMissR.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
     pgdMissR.miss.module = m_module;
@@ -276,6 +287,7 @@ bool OptiXBackend::buildPipeline() {
     if (m_pgRaygenReSTIR) groups.push_back(m_pgRaygenReSTIR);
     if (m_pgRaygenReSTIRVis) groups.push_back(m_pgRaygenReSTIRVis);
     if (m_pgRaygenReSTIRGI) groups.push_back(m_pgRaygenReSTIRGI);
+    if (m_pgRaygenReSTIRPT) groups.push_back(m_pgRaygenReSTIRPT);
 
     OptixPipelineLinkOptions linkOptions{};
     linkOptions.maxTraceDepth = 2;  // primary trace can fire shadow trace
@@ -326,10 +338,12 @@ bool OptiXBackend::buildSBT() {
     const bool   haveReSTIR    = (m_pgRaygenReSTIR    != nullptr);
     const bool   haveReSTIRVis = (m_pgRaygenReSTIRVis != nullptr);
     const bool   haveReSTIRGI  = (m_pgRaygenReSTIRGI  != nullptr);
+    const bool   haveReSTIRPT  = (m_pgRaygenReSTIRPT  != nullptr);
     const uint32_t numRaygens = 1u + (haveSplit ? 1u : 0u)
                                    + (haveReSTIR ? 1u : 0u)
                                    + (haveReSTIRVis ? 1u : 0u)
-                                   + (haveReSTIRGI ? 1u : 0u);
+                                   + (haveReSTIRGI ? 1u : 0u)
+                                   + (haveReSTIRPT ? 1u : 0u);
     const size_t total = recSize * (numRaygens + 4u);
 
     CUDA_CHECK(cudaMalloc((void**)&m_sbtRecordsBuf, total));
@@ -339,6 +353,7 @@ bool OptiXBackend::buildSBT() {
     RaygenRecord raygenReSTIRRec;
     RaygenRecord raygenReSTIRVisRec;
     RaygenRecord raygenReSTIRGIRec;
+    RaygenRecord raygenReSTIRPTRec;
     MissRecord   missR;
     MissRecord   missS;
     HitRecord_   hitR;
@@ -355,6 +370,9 @@ bool OptiXBackend::buildSBT() {
     }
     if (haveReSTIRGI) {
         OPTIX_CHECK(optixSbtRecordPackHeader(m_pgRaygenReSTIRGI, &raygenReSTIRGIRec));
+    }
+    if (haveReSTIRPT) {
+        OPTIX_CHECK(optixSbtRecordPackHeader(m_pgRaygenReSTIRPT, &raygenReSTIRPTRec));
     }
     OPTIX_CHECK(optixSbtRecordPackHeader(m_pgMissRadiance, &missR));
     OPTIX_CHECK(optixSbtRecordPackHeader(m_pgMissShadow,   &missS));
@@ -393,6 +411,13 @@ bool OptiXBackend::buildSBT() {
         off += recSize;
     } else {
         m_dRaygenReSTIRGIRecord = 0;
+    }
+    if (haveReSTIRPT) {
+        CUDA_CHECK(cudaMemcpy(base + off, &raygenReSTIRPTRec, recSize, cudaMemcpyHostToDevice));
+        m_dRaygenReSTIRPTRecord = (CUdeviceptr)(base + off);
+        off += recSize;
+    } else {
+        m_dRaygenReSTIRPTRecord = 0;
     }
     CUDA_CHECK(cudaMemcpy(base + off, &missR, recSize, cudaMemcpyHostToDevice)); off += recSize;
     CUDA_CHECK(cudaMemcpy(base + off, &missS, recSize, cudaMemcpyHostToDevice)); off += recSize;
@@ -736,6 +761,59 @@ bool OptiXBackend::launchReSTIRGIInitCandidatesOptiX(
     CUDA_CHECK(cudaStreamSynchronize(m_stream));
 
     // Restore regular raygen.
+    m_sbt.raygenRecord = m_dRaygenRecord;
+    return true;
+}
+
+bool OptiXBackend::launchReSTIRPTInitCandidatesOptiX(
+    const DeviceSceneData& scene,
+    const CameraParams&    camera,
+    void*                  d_ptReservoirsCurr,
+    void*                  d_ptSurfacesCurr,
+    uint32_t               width,
+    uint32_t               height,
+    uint32_t               sampleIndex,
+    bool                   enableEnvironment,
+    uint32_t               pathLength)
+{
+    if (!m_initialized || !m_gasHandle || !m_dRaygenReSTIRPTRecord) return false;
+    if (!d_ptReservoirsCurr || !d_ptSurfacesCurr) return false;
+    // Path-tracer postfix needs SOME light source. Skip when nothing in the
+    // scene can contribute.
+    if ((!scene.d_areaLights || scene.areaLightCount == 0) && !enableEnvironment)
+        return false;
+
+    LaunchParams lp;
+    std::memset(&lp, 0, sizeof(lp));
+    lp.scene  = scene;
+    lp.camera = camera;
+    lp.width       = width;
+    lp.height      = height;
+    lp.sampleIndex = sampleIndex;
+    lp.maxBounces  = pathLength;
+    lp.spp         = 1;
+    lp.enableEnvironment   = enableEnvironment ? 1u : 0u;
+    lp.handle              = m_gasHandle;
+    lp.ptReservoirsCurr    = static_cast<GIReservoir*>(d_ptReservoirsCurr);
+    lp.ptSurfacesCurr      = static_cast<ReSTIRSurface*>(d_ptSurfacesCurr);
+    lp.ptPathLength        = pathLength;
+    // The PT raygen reads `giEnableEnvironment` for the env toggle (sharing
+    // the same field name keeps OptiXPrograms cleaner — no extra param).
+    lp.giEnableEnvironment = enableEnvironment ? 1u : 0u;
+
+    m_sbt.raygenRecord = m_dRaygenReSTIRPTRecord;
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        (void*)m_dLaunchParams, &lp, sizeof(lp),
+        cudaMemcpyHostToDevice, m_stream));
+
+    OPTIX_CHECK_VOID(optixLaunch(
+        m_pipeline, m_stream,
+        m_dLaunchParams, sizeof(LaunchParams),
+        &m_sbt,
+        width, height, 1));
+    CUDA_CHECK(cudaStreamSynchronize(m_stream));
+
     m_sbt.raygenRecord = m_dRaygenRecord;
     return true;
 }

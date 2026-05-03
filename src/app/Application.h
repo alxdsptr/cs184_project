@@ -39,6 +39,7 @@ public:
     // after Renderer::init in Application::init().
     void setReSTIREnabled(bool on)    { m_pendingReSTIRDI = on; }
     void setReSTIRGIEnabled(bool on)  { m_pendingReSTIRGI = on; }
+    void setReSTIRPTEnabled(bool on)  { m_pendingReSTIRPT = on; }
     void setEnvMap(const std::string& path);
     void loadCameraFile(const std::string& path) { m_cameraFilePath = path; }
 
@@ -108,6 +109,7 @@ private:
     // Pending ReSTIR toggles applied to m_renderer right after init().
     bool m_pendingReSTIRDI = true;
     bool m_pendingReSTIRGI = false;
+    bool m_pendingReSTIRPT = false;
     // Normal-map debug visualization. 0 = off; 1 = perturbed N; 2 = tangent
     // handedness; 3 = back-face-after-perturb flag. See DeviceSceneData.
     int m_debugNormalViz = 0;

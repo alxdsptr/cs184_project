@@ -22,6 +22,7 @@ int main(int argc, char** argv) {
     float emissiveTargetLum = 20.0f;
     bool restirDI = true;
     bool restirGI = false;
+    bool restirPT = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -65,6 +66,10 @@ int main(int argc, char** argv) {
             restirGI = true;
         } else if (arg == "--no-restir-gi") {
             restirGI = false;
+        } else if (arg == "--restir-pt") {
+            restirPT = true;
+        } else if (arg == "--no-restir-pt") {
+            restirPT = false;
         } else if (arg == "--emissive-target" && i + 1 < argc) {
             float v = (float)std::atof(argv[++i]);
             if (v > 0.0f) {
@@ -117,6 +122,7 @@ int main(int argc, char** argv) {
     app.setEmissiveTargetLum(emissiveTargetLum);
     app.setReSTIREnabled(restirDI);
     app.setReSTIRGIEnabled(restirGI);
+    app.setReSTIRPTEnabled(restirPT);
     if (!outputPath.empty()) {
         app.setHeadlessOutput(outputPath, samples);
     }

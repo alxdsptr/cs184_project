@@ -41,7 +41,11 @@ public:
                 // ReSTIR toggles (DI = direct lighting, GI = indirect).
                 // Pass nullptr to hide the section.
                 bool* restirDIEnabled = nullptr,
-                bool* restirGIEnabled = nullptr);
+                bool* restirGIEnabled = nullptr,
+                // ReSTIR PT (Lin et al. 2022) toggle + path-length knob.
+                // Pass nullptr to hide the controls.
+                bool* restirPTEnabled = nullptr,
+                int*  restirPTPathLength = nullptr);
 
     // Draw a sparse normal-arrow overlay on top of the path-traced image.
     // Call this once per frame between beginFrame() and endFrame(), only

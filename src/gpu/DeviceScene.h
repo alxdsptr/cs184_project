@@ -58,6 +58,15 @@ struct DeviceSceneData {
     float3*       d_restirGIIndirect    = nullptr;
     int           restirGIEnabled       = 0;
 
+    // ReSTIR PT (Lin et al. 2022) — same shape as the GI buffer above. A
+    // per-pixel float3 indirect-radiance image produced by the PT pipeline
+    // (init → temporal → spatial → shade), consumed at the primary hit on
+    // sample 0 in lieu of continuation bounces. Mutually exclusive with
+    // `d_restirGIIndirect`: when both are bound, PT wins (longer path
+    // postfix → strictly more information than GI's 1-bounce NEE).
+    float3*       d_restirPTIndirect    = nullptr;
+    int           restirPTEnabled       = 0;
+
     // HDR environment map (equirectangular, float4 texture)
     cudaTextureObject_t envMapTex   = 0;
 

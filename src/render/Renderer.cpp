@@ -26,6 +26,7 @@ void Renderer::init(uint32_t width, uint32_t height) {
     m_auxBuffers.init(width, height);
     m_restir.init(width, height);
     m_restirGI.init(width, height);
+    m_restirPT.init(width, height);
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
     m_renderWidth  = width;
     m_renderHeight = height;
@@ -42,6 +43,8 @@ void Renderer::resize(uint32_t width, uint32_t height) {
     m_restir.invalidateHistory();
     m_restirGI.resize(width, height);
     m_restirGI.invalidateHistory();
+    m_restirPT.resize(width, height);
+    m_restirPT.invalidateHistory();
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
     // Non-Native modes rely on shared VkImages sized to the render resolution;
@@ -86,6 +89,7 @@ void Renderer::resetAccumulation() {
 void Renderer::invalidateReSTIRHistory() {
     m_restir.invalidateHistory();
     m_restirGI.invalidateHistory();
+    m_restirPT.invalidateHistory();
 }
 
 void Renderer::renderFrame(
@@ -133,6 +137,19 @@ void Renderer::renderFrame(
                                               backend);
         }
 
+        // ── ReSTIR PT prepass (Lin et al. 2022) ──────────────────
+        // Runs the path-postfix random walk for every pixel; produces a
+        // per-pixel indirect-radiance buffer that the main kernel consumes
+        // in lieu of continuation bounces. Runs *instead of* GI when both
+        // are enabled (PT subsumes GI's 1-bounce NEE).
+        bool restirPTRan = false;
+        if (m_restirPT.enabled()) {
+            restirPTRan = m_restirPT.runFrame(sceneWithBVH, camera,
+                                              m_width, m_height, sampleIndex,
+                                              enableEnvironment,
+                                              backend);
+        }
+
         DeviceSceneData scenePatched = scene;
         if (restirRan) {
             scenePatched.d_restirReservoirs = m_restir.getBuffers().d_reservoirsCurr;
@@ -141,6 +158,13 @@ void Renderer::renderFrame(
         if (restirGIRan) {
             scenePatched.d_restirGIIndirect = m_restirGI.getBuffers().d_indirectOut;
             scenePatched.restirGIEnabled    = 1;
+        }
+        if (restirPTRan) {
+            scenePatched.d_restirPTIndirect = m_restirPT.getBuffers().d_indirectOut;
+            scenePatched.restirPTEnabled    = 1;
+            // PT subsumes GI; turn GI consumption off so the kernel doesn't
+            // double-count even if both contexts populated their buffers.
+            scenePatched.restirGIEnabled    = 0;
         }
 
         backend->launchPathTrace(
@@ -163,6 +187,7 @@ void Renderer::renderFrame(
         m_accumBuffer.addSamples(samplesPerFrame);
         if (restirRan)   m_restir.swapHistory();
         if (restirGIRan) m_restirGI.swapHistory();
+        if (restirPTRan) m_restirPT.swapHistory();
         return;
     }
 
@@ -464,6 +489,7 @@ void Renderer::shutdown() {
     m_auxBuffers.free();
     m_restir.free();
     m_restirGI.free();
+    m_restirPT.free();
 }
 
 // ────────────────────────────────────────────────────────────────
