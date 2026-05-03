@@ -83,7 +83,9 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
                  int*  normalArrowStride,
                  float* normalArrowLength,
                  bool* restirDIEnabled,
-                 bool* restirGIEnabled) {
+                 bool* restirGIEnabled,
+                 bool* restirPTEnabled,
+                 int*  restirPTPathLength) {
     bool changed = false;
     loadEnvMapRequested = false;
 
@@ -182,7 +184,7 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
         }
     }
 
-    if (restirDIEnabled || restirGIEnabled) {
+    if (restirDIEnabled || restirGIEnabled || restirPTEnabled) {
         ImGui::Separator();
         ImGui::Text("ReSTIR");
         if (restirDIEnabled) {
@@ -197,6 +199,21 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
             // restores the path tracer's own continuation bounces.
             if (ImGui::Checkbox("ReSTIR GI", restirGIEnabled)) {
                 changed = true;
+            }
+        }
+        if (restirPTEnabled) {
+            // ReSTIR PT (Lin et al. 2022): multi-bounce path postfix per
+            // reservoir. Subsumes GI when both are on (PT wins at consume
+            // site to avoid double-counting). Path-length slider is the
+            // number of bounces past the reconnection vertex.
+            if (ImGui::Checkbox("ReSTIR PT", restirPTEnabled)) {
+                changed = true;
+            }
+            if (*restirPTEnabled && restirPTPathLength) {
+                if (ImGui::SliderInt("PT postfix bounces", restirPTPathLength, 0, 8)) {
+                    if (*restirPTPathLength < 0) *restirPTPathLength = 0;
+                    changed = true;
+                }
             }
         }
     }

@@ -124,4 +124,22 @@ public:
         bool                   /*enableEnvironment*/) {
         return false;
     }
+
+    // ReSTIR PT initial-candidates pass (Lin et al. 2022). Same reservoir
+    // layout as GI; the backend traces the primary + first-bounce ray, then
+    // walks `pathLength` more bounces past the reconnection vertex to gather
+    // the postfix radiance. Returns true on success; CUDA fallback is taken
+    // when the backend has no native implementation.
+    virtual bool runReSTIRPTInitCandidates(
+        const DeviceSceneData& /*scene*/,
+        const CameraParams&    /*camera*/,
+        void*                  /*d_ptReservoirsCurr*/,
+        void*                  /*d_ptSurfacesCurr*/,
+        uint32_t               /*width*/,
+        uint32_t               /*height*/,
+        uint32_t               /*sampleIndex*/,
+        bool                   /*enableEnvironment*/,
+        uint32_t               /*pathLength*/) {
+        return false;
+    }
 };

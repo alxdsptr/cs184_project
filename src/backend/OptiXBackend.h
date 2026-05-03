@@ -152,6 +152,38 @@ public:
             width, height, sampleIndex, enableEnvironment);
     }
 
+    // ReSTIR PT initial-candidates raygen. Casts the primary ray, the first
+    // BSDF-sampled bounce to the reconnection vertex, then walks `pathLength`
+    // more BSDF→NEE bounces to gather Lo at x_r. Output reservoir layout
+    // matches the CUDA kernel (and ReSTIR GI's) so the temporal/spatial/shade
+    // passes consume either backend's output unchanged.
+    bool launchReSTIRPTInitCandidatesOptiX(
+        const DeviceSceneData& scene,
+        const CameraParams&    camera,
+        void*                  d_ptReservoirsCurr,
+        void*                  d_ptSurfacesCurr,
+        uint32_t               width,
+        uint32_t               height,
+        uint32_t               sampleIndex,
+        bool                   enableEnvironment,
+        uint32_t               pathLength);
+
+    bool runReSTIRPTInitCandidates(
+        const DeviceSceneData& scene,
+        const CameraParams&    camera,
+        void*                  d_ptReservoirsCurr,
+        void*                  d_ptSurfacesCurr,
+        uint32_t               width,
+        uint32_t               height,
+        uint32_t               sampleIndex,
+        bool                   enableEnvironment,
+        uint32_t               pathLength) override
+    {
+        return launchReSTIRPTInitCandidatesOptiX(
+            scene, camera, d_ptReservoirsCurr, d_ptSurfacesCurr,
+            width, height, sampleIndex, enableEnvironment, pathLength);
+    }
+
 private:
     bool loadModule(const std::string& optixirPath);
     bool buildPipeline();
@@ -167,6 +199,7 @@ private:
     OptixProgramGroup       m_pgRaygenReSTIR = nullptr;  // ReSTIR DI init-candidates raygen
     OptixProgramGroup       m_pgRaygenReSTIRVis = nullptr; // ReSTIR DI visibility-reuse raygen
     OptixProgramGroup       m_pgRaygenReSTIRGI = nullptr;  // ReSTIR GI init-candidates raygen
+    OptixProgramGroup       m_pgRaygenReSTIRPT = nullptr;  // ReSTIR PT init-candidates raygen
     OptixProgramGroup       m_pgMissRadiance = nullptr;
     OptixProgramGroup       m_pgMissShadow   = nullptr;
     OptixProgramGroup       m_pgHitRadiance  = nullptr;
@@ -183,6 +216,7 @@ private:
     CUdeviceptr             m_dRaygenReSTIRRecord = 0;
     CUdeviceptr             m_dRaygenReSTIRVisRecord = 0;
     CUdeviceptr             m_dRaygenReSTIRGIRecord = 0;
+    CUdeviceptr             m_dRaygenReSTIRPTRecord = 0;
 
     CUdeviceptr             m_gasOutput      = 0;
     OptixTraversableHandle  m_gasHandle      = 0;

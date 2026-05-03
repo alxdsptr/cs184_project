@@ -1742,3 +1742,7 @@ extern "C" __global__ void __raygen__restir_visibility()
 // readable). Compiled into the same module as the rest of the OptiX
 // programs so it sees `params`, `traceRadianceRay`, etc.
 #include "backend/OptiXProgramsGI.inl"
+
+// ── ReSTIR PT raygen — multi-bounce postfix random walk past the
+// reconnection vertex. Same idea as the GI raygen but with a longer path.
+#include "backend/OptiXProgramsPT.inl"

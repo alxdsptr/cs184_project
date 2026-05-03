@@ -4,6 +4,7 @@
 #include "render/AuxBuffers.h"
 #include "render/ReSTIR.h"
 #include "render/ReSTIRGI.h"
+#include "render/ReSTIRPT.h"
 #include <cuda_runtime.h>
 
 #ifdef __CUDACC__
@@ -61,6 +62,14 @@ struct LaunchParams {
     GIReservoir*     giReservoirsCurr;
     ReSTIRSurface*   giSurfacesCurr;
     unsigned int     giEnableEnvironment;
+
+    // ReSTIR PT init-candidates raygen output. Same reservoir layout as GI
+    // — the difference is in *what's stored*: sampleRadiance is the result
+    // of a multi-bounce random walk past the reconnection vertex (path
+    // length controlled by `ptPathLength`), not just a 1-bounce NEE.
+    GIReservoir*     ptReservoirsCurr;
+    ReSTIRSurface*   ptSurfacesCurr;
+    unsigned int     ptPathLength;        // bounces past x_r
 
     OptixTraversableHandle handle;
 };

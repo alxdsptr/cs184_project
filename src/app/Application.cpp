@@ -183,6 +183,7 @@ bool Application::init(uint32_t width, uint32_t height, const std::string& title
     // Apply ReSTIR toggles set via main.cpp before init()
     m_renderer.setReSTIREnabled(m_pendingReSTIRDI);
     m_renderer.setReSTIRGIEnabled(m_pendingReSTIRGI);
+    m_renderer.setReSTIRPTEnabled(m_pendingReSTIRPT);
 
     bool backendReady = false;
 #ifdef PATHTRACER_OPTIX_ENABLED
@@ -637,6 +638,8 @@ void Application::runGui() {
         // we apply the result via the renderer's setters after render().
         bool guiReSTIRDI = m_renderer.isReSTIREnabled();
         bool guiReSTIRGI = m_renderer.isReSTIRGIEnabled();
+        bool guiReSTIRPT = m_renderer.isReSTIRPTEnabled();
+        int  guiReSTIRPTLen = (int)m_renderer.restirPT().pathLength();
         if (m_showGui) {
             envChanged = m_gui.render(
                 m_fps,
@@ -659,12 +662,22 @@ void Application::runGui() {
                 &m_normalArrowStride,
                 &m_normalArrowLength,
                 &guiReSTIRDI,
-                &guiReSTIRGI);
+                &guiReSTIRGI,
+                &guiReSTIRPT,
+                &guiReSTIRPTLen);
             if (guiReSTIRDI != m_renderer.isReSTIREnabled()) {
                 m_renderer.setReSTIREnabled(guiReSTIRDI);
             }
             if (guiReSTIRGI != m_renderer.isReSTIRGIEnabled()) {
                 m_renderer.setReSTIRGIEnabled(guiReSTIRGI);
+            }
+            if (guiReSTIRPT != m_renderer.isReSTIRPTEnabled()) {
+                m_renderer.setReSTIRPTEnabled(guiReSTIRPT);
+            }
+            if (guiReSTIRPTLen >= 0 &&
+                (uint32_t)guiReSTIRPTLen != m_renderer.restirPT().pathLength()) {
+                m_renderer.restirPT().setPathLength((uint32_t)guiReSTIRPTLen);
+                m_renderer.restirPT().invalidateHistory();
             }
 
             // Arrow overlay renders under/over the same ImGui frame.
