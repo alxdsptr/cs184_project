@@ -25,6 +25,7 @@ void Renderer::init(uint32_t width, uint32_t height) {
     m_accumBuffer.init(width, height);
     m_auxBuffers.init(width, height);
     m_restir.init(width, height);
+    m_restirGI.init(width, height);
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
     m_renderWidth  = width;
     m_renderHeight = height;
@@ -39,6 +40,8 @@ void Renderer::resize(uint32_t width, uint32_t height) {
     m_auxBuffers.resize(width, height);
     m_restir.resize(width, height);
     m_restir.invalidateHistory();
+    m_restirGI.resize(width, height);
+    m_restirGI.invalidateHistory();
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
     // Non-Native modes rely on shared VkImages sized to the render resolution;
@@ -63,6 +66,7 @@ void Renderer::resetAccumulation() {
     // The reservoir history samples light transport that is now stale —
     // keeping it would smear the previous camera's shading into the new one.
     m_restir.invalidateHistory();
+    m_restirGI.invalidateHistory();
 }
 
 void Renderer::renderFrame(
@@ -97,10 +101,26 @@ void Renderer::renderFrame(
                                           backend);
         }
 
+        // ── ReSTIR GI prepass ────────────────────────────────────
+        // Independent of ReSTIR DI: GI replaces *indirect* bounces with a
+        // resampled 1-bounce indirect estimate. Both passes can run
+        // simultaneously — DI handles direct lighting at the primary hit,
+        // GI handles indirect.
+        bool restirGIRan = false;
+        if (m_restirGI.enabled()) {
+            restirGIRan = m_restirGI.runFrame(sceneWithBVH, camera,
+                                              m_width, m_height, sampleIndex,
+                                              enableEnvironment);
+        }
+
         DeviceSceneData scenePatched = scene;
         if (restirRan) {
             scenePatched.d_restirReservoirs = m_restir.getBuffers().d_reservoirsCurr;
             scenePatched.restirEnabled      = 1;
+        }
+        if (restirGIRan) {
+            scenePatched.d_restirGIIndirect = m_restirGI.getBuffers().d_indirectOut;
+            scenePatched.restirGIEnabled    = 1;
         }
 
         backend->launchPathTrace(
@@ -121,7 +141,8 @@ void Renderer::renderFrame(
             m_toneMappingMode
         );
         m_accumBuffer.addSamples(samplesPerFrame);
-        if (restirRan) m_restir.swapHistory();
+        if (restirRan)   m_restir.swapHistory();
+        if (restirGIRan) m_restirGI.swapHistory();
         return;
     }
 
@@ -422,6 +443,7 @@ void Renderer::shutdown() {
     m_accumBuffer.free();
     m_auxBuffers.free();
     m_restir.free();
+    m_restirGI.free();
 }
 
 // ────────────────────────────────────────────────────────────────

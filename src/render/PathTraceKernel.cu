@@ -1096,6 +1096,20 @@ __global__ void pathTraceKernel(
             radiance += throughput * direct;
         }
 
+        // ReSTIR GI consumption: at the primary hit on sample s==0, add the
+        // pre-computed indirect-radiance estimate from the GI reservoir and
+        // skip continuation bounces. Higher spp samples still path-trace
+        // normally so we don't bake a single biased estimate into the
+        // accumulator. Restricted to bounce==0 because the GI buffer is
+        // populated only for camera rays.
+        if (scene.restirGIEnabled != 0 && scene.d_restirGIIndirect != nullptr &&
+            bounce == 0 && s == 0)
+        {
+            float3 indirect = scene.d_restirGIIndirect[pixelIdx];
+            radiance += throughput * indirect;
+            break; // direct lighting at primary hit already added above
+        }
+
         // BRDF sampling: Fresnel-weighted blend between diffuse and specular
         float3 V = -ray.direction;
         float specProb = materialSpecProb(mat, N, V, albedo);
