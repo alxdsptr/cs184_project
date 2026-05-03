@@ -86,6 +86,17 @@ void launchReSTIRInitialCandidates(
     uint32_t               sampleIndex,
     uint32_t               numCandidates);
 
+// Trace one shadow ray per pixel against the held sample; zero W on
+// occlusion so occluded samples don't propagate to neighbors during the
+// spatial/temporal passes (Bitterli 2020 Alg. 5 lines 6-9).
+// Requires scene.d_bvhNodes != nullptr (CUDA traversable BVH); silently
+// returns when null (OptiX backend without a CUDA BVH patch).
+void launchReSTIRVisibilityReuse(
+    const DeviceSceneData& scene,
+    ReSTIRBuffers          buffers,
+    uint32_t               width,
+    uint32_t               height);
+
 // Combine each pixel's reservoir with the one at its reprojected position
 // in the previous frame.
 void launchReSTIRTemporalReuse(

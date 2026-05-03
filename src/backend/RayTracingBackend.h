@@ -87,4 +87,21 @@ public:
         uint32_t               /*numCandidates*/) {
         return false;  // backend has no native ReSTIR — caller falls back.
     }
+
+    // Visibility reuse pass: trace one shadow ray per pixel toward the light
+    // sample held in `d_reservoirsCurr[i]`, zero W on occlusion. Used to keep
+    // occluded samples from poisoning subsequent spatial / temporal reuse
+    // (Bitterli 2020 Alg. 5 lines 6-9).
+    //
+    // Returns true if the pass ran. Returns false when the backend has no
+    // native implementation (caller may fall back to a CUDA `bvh_anyHit`
+    // kernel if `scene.d_bvhNodes` is populated).
+    virtual bool runReSTIRVisibilityReuse(
+        const DeviceSceneData& /*scene*/,
+        void*                  /*d_reservoirsCurr*/,
+        const void*            /*d_surfacesCurr*/,
+        uint32_t               /*width*/,
+        uint32_t               /*height*/) {
+        return false;
+    }
 };

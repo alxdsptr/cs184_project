@@ -101,6 +101,27 @@ public:
             width, height, sampleIndex, numCandidates);
     }
 
+    // Launch the ReSTIR DI visibility-reuse raygen against the GAS. One
+    // shadow ray per pixel, zeroes W on occlusion. Returns false if the
+    // backend isn't initialized.
+    bool launchReSTIRVisibilityReuseOptiX(
+        const DeviceSceneData& scene,
+        void*                  d_reservoirsCurr,
+        const void*            d_surfacesCurr,
+        uint32_t               width,
+        uint32_t               height);
+
+    bool runReSTIRVisibilityReuse(
+        const DeviceSceneData& scene,
+        void*                  d_reservoirsCurr,
+        const void*            d_surfacesCurr,
+        uint32_t               width,
+        uint32_t               height) override
+    {
+        return launchReSTIRVisibilityReuseOptiX(
+            scene, d_reservoirsCurr, d_surfacesCurr, width, height);
+    }
+
 private:
     bool loadModule(const std::string& optixirPath);
     bool buildPipeline();
@@ -114,6 +135,7 @@ private:
     OptixProgramGroup       m_pgRaygen       = nullptr;
     OptixProgramGroup       m_pgRaygenSplit  = nullptr;  // NRD split-output raygen
     OptixProgramGroup       m_pgRaygenReSTIR = nullptr;  // ReSTIR DI init-candidates raygen
+    OptixProgramGroup       m_pgRaygenReSTIRVis = nullptr; // ReSTIR DI visibility-reuse raygen
     OptixProgramGroup       m_pgMissRadiance = nullptr;
     OptixProgramGroup       m_pgMissShadow   = nullptr;
     OptixProgramGroup       m_pgHitRadiance  = nullptr;
@@ -128,6 +150,7 @@ private:
     CUdeviceptr             m_dRaygenRecord       = 0;
     CUdeviceptr             m_dRaygenSplitRecord  = 0;
     CUdeviceptr             m_dRaygenReSTIRRecord = 0;
+    CUdeviceptr             m_dRaygenReSTIRVisRecord = 0;
 
     CUdeviceptr             m_gasOutput      = 0;
     OptixTraversableHandle  m_gasHandle      = 0;

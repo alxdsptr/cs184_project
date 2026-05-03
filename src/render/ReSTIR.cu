@@ -308,6 +308,45 @@ __global__ void kReSTIR_Spatial(
     outRes[pixelIdx] = r;
 }
 
+// ── Kernel 1.5: visibility reuse ────────────────────────────────
+// Bitterli 2020 Alg. 5 lines 6-9: trace one shadow ray per pixel toward the
+// held sample. If occluded, zero W so spatial/temporal reuse won't propagate
+// the occluded sample to neighbors. This keeps RIS from being dominated by
+// visibility noise once M grows large (paper §3.2 "Visibility Reuse").
+__global__ void kReSTIR_Visibility(
+    DeviceSceneData scene,
+    ReSTIRReservoir* reservoirs,
+    const ReSTIRSurface* surfaces,
+    uint32_t width, uint32_t height)
+{
+    uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    uint32_t pixelIdx = y * width + x;
+
+    ReSTIRReservoir r = reservoirs[pixelIdx];
+    if (r.lightIndex == 0xFFFFFFFFu || r.W <= 0.0f) return;
+
+    ReSTIRSurface s = surfaces[pixelIdx];
+    if (s.valid < 0.5f) return;
+
+    GPUAreaLight light = scene.d_areaLights[r.lightIndex];
+    float b0 = 1.0f - r.baryB1 - r.baryB2;
+    float3 pOnLight = light.v0 * b0 + (light.v0 + light.e1) * r.baryB1
+                                    + (light.v0 + light.e2) * r.baryB2;
+    // Origin nudged off the surface along its normal to avoid self-hits;
+    // bvh_anyHit subtracts a tmax epsilon so the light triangle itself
+    // doesn't register as an occluder.
+    float3 origin = s.position + s.normal * 1e-3f;
+    bool occluded = bvh_anyHit(origin, pOnLight,
+                               scene.d_bvhNodes, scene.bvhRootIndex,
+                               scene.d_positions, scene.d_indices);
+    if (occluded) {
+        r.W = 0.0f;
+        reservoirs[pixelIdx] = r;
+    }
+}
+
 // ── Host launchers ──────────────────────────────────────────────
 static inline dim3 makeGrid(uint32_t w, uint32_t h, dim3 block) {
     return dim3((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
@@ -328,6 +367,25 @@ void launchReSTIRInitialCandidates(
         scene, camera,
         buffers.d_reservoirsCurr, buffers.d_surfaceCurr,
         width, height, sampleIndex, numCandidates);
+}
+
+void launchReSTIRVisibilityReuse(
+    const DeviceSceneData& scene,
+    ReSTIRBuffers          buffers,
+    uint32_t               width,
+    uint32_t               height)
+{
+    // No CUDA-traversable BVH (e.g. OptiX backend without patch) — skip.
+    // Without visibility reuse the algorithm is still correct, just noisier
+    // in heavily-occluded scenes.
+    if (!scene.d_bvhNodes || scene.totalTriangles == 0) return;
+    dim3 block(8, 8);
+    dim3 grid = makeGrid(width, height, block);
+    kReSTIR_Visibility<<<grid, block>>>(
+        scene,
+        buffers.d_reservoirsCurr,
+        buffers.d_surfaceCurr,
+        width, height);
 }
 
 void launchReSTIRTemporalReuse(
@@ -456,6 +514,22 @@ bool ReSTIRContext::runFrame(
         launchReSTIRInitialCandidates(
             scene, camera, m_buffers,
             width, height, sampleIndex, m_numCandidates);
+    }
+
+    // Visibility reuse: kill occluded samples before they leak through
+    // spatial/temporal reuse. Bitterli 2020 Alg. 5. Prefer the backend's
+    // native implementation (OptiX raygen → GAS, hardware-accelerated)
+    // when available; fall back to the CUDA SAH-BVH kernel otherwise.
+    bool visRan = false;
+    if (backend) {
+        visRan = backend->runReSTIRVisibilityReuse(
+            scene,
+            (void*)m_buffers.d_reservoirsCurr,
+            (const void*)m_buffers.d_surfaceCurr,
+            width, height);
+    }
+    if (!visRan) {
+        launchReSTIRVisibilityReuse(scene, m_buffers, width, height);
     }
 
     launchReSTIRTemporalReuse(

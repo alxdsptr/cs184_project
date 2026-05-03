@@ -1683,3 +1683,56 @@ extern "C" __global__ void __raygen__restir_init_candidates()
     if (params.restirReservoirsCurr) params.restirReservoirsCurr[pixelIdx] = r;
     if (params.restirSurfacesCurr)   params.restirSurfacesCurr[pixelIdx]   = surf;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// ReSTIR DI visibility-reuse raygen (OptiX path).
+//
+// Mirrors `kReSTIR_Visibility` from render/ReSTIR.cu but traces the shadow
+// ray against the OptiX GAS instead of the CUDA SAH BVH. One ray per pixel
+// toward the held sample's point on the light; zeros W on occlusion so the
+// subsequent temporal / spatial reuse can't propagate occluded samples
+// (Bitterli 2020 Alg. 5 lines 6-9).
+//
+// Reuses the existing shadow SBT (offset 1, miss 1) so we get the same
+// glass-transparency handling as the main shading shadow ray.
+// ─────────────────────────────────────────────────────────────────────────
+extern "C" __global__ void __raygen__restir_visibility()
+{
+    uint3 idx = optixGetLaunchIndex();
+    uint32_t x = idx.x;
+    uint32_t y = idx.y;
+    if (x >= params.width || y >= params.height) return;
+    uint32_t pixelIdx = y * params.width + x;
+
+    if (!params.restirReservoirsCurr || !params.restirSurfacesCurr) return;
+    ReSTIRReservoir r = params.restirReservoirsCurr[pixelIdx];
+    if (r.lightIndex == 0xFFFFFFFFu || r.W <= 0.0f) return;
+
+    ReSTIRSurface s = params.restirSurfacesCurr[pixelIdx];
+    if (s.valid < 0.5f) return;
+
+    const DeviceSceneData& scene = params.scene;
+    GPUAreaLight light = scene.d_areaLights[r.lightIndex];
+    float b0 = 1.0f - r.baryB1 - r.baryB2;
+    float3 pOnLight = light.v0 * b0
+                    + (light.v0 + light.e1) * r.baryB1
+                    + (light.v0 + light.e2) * r.baryB2;
+
+    float3 origin = s.position + s.normal * 1e-3f;
+    float3 toL    = pOnLight - origin;
+    float  dist   = sqrtf(fmaxf(dot(toL, toL), 1e-12f));
+    float3 dir    = toL * (1.0f / dist);
+    // Pull tmax in slightly so the light triangle itself doesn't register.
+    float  tmax   = fmaxf(dist - 2e-3f, 1e-4f);
+
+    float3 transmittance = traceShadowRay(
+        params.handle, origin, dir, 1e-3f, tmax);
+    // Treat fully-occluded (transmittance == 0) as a kill. Glass paths return
+    // partial transmittance > 0; we keep those samples — they're what the
+    // final-shading shadow ray will also accumulate against.
+    float lum = restirLuminance(transmittance);
+    if (lum <= 1e-6f) {
+        r.W = 0.0f;
+        params.restirReservoirsCurr[pixelIdx] = r;
+    }
+}
