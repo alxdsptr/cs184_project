@@ -302,6 +302,10 @@ bool Application::loadScene(const std::string& path) {
     m_backend->buildAccelerationStructure(m_scene);
     m_sceneLoaded = true;
     m_renderer.resetAccumulation();
+    // Scene swap genuinely invalidates ReSTIR reservoirs (the lights they
+    // reference might no longer exist). Camera motion does NOT — that's
+    // why resetAccumulation() no longer drops history on its own.
+    m_renderer.invalidateReSTIRHistory();
 
     std::string ext = lowerString(std::filesystem::path(path).extension().string());
     const SceneCamera& sceneCamera = m_scene.getCamera();
@@ -697,9 +701,13 @@ void Application::runGui() {
         if (envMapLoadRequested) {
             loadEnvMap(std::string(m_envMapPathBuf));
             m_renderer.resetAccumulation();
+            // Lighting changed → previous Lo/Le baked into reservoirs is
+            // wrong. Drop history.
+            m_renderer.invalidateReSTIRHistory();
         }
         if (envChanged) {
             m_renderer.resetAccumulation();
+            m_renderer.invalidateReSTIRHistory();
         }
         m_gui.endFrame();
 

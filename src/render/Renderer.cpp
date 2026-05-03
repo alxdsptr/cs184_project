@@ -63,8 +63,27 @@ void Renderer::resize(uint32_t width, uint32_t height) {
 
 void Renderer::resetAccumulation() {
     m_accumBuffer.reset();
-    // The reservoir history samples light transport that is now stale —
-    // keeping it would smear the previous camera's shading into the new one.
+    // Note: We deliberately do NOT invalidate ReSTIR history here.
+    //
+    // The accumulation buffer must be reset on camera motion because it
+    // averages radiance across frames and different viewpoints can't be
+    // pixel-wise averaged without ghosting. ReSTIR's reservoir history is
+    // a different beast: each frame's temporal pass re-projects the prev
+    // reservoir to the current pixel via prevPixel, then rejects it if
+    // the normal disagrees by >25° or the world-space drift exceeds 10%
+    // of distance. Disocclusion / large jumps therefore *already* fall
+    // back to only the current-frame init candidates — and for pixels
+    // that *do* see the same surface from a slightly different angle,
+    // keeping the reservoir is the entire point of temporal ReSTIR.
+    //
+    // Discarding the reservoir on every camera nudge produced a noisy
+    // first frame after any input and made temporal reuse essentially
+    // useless during interactive navigation. Use invalidateReSTIRHistory()
+    // explicitly when the reservoir genuinely *is* stale (scene reload,
+    // resolution change, toggling a ReSTIR pass on/off).
+}
+
+void Renderer::invalidateReSTIRHistory() {
     m_restir.invalidateHistory();
     m_restirGI.invalidateHistory();
 }

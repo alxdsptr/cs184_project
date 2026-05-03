@@ -37,6 +37,11 @@ public:
     void init(uint32_t width, uint32_t height);
     void resize(uint32_t width, uint32_t height);
     void resetAccumulation();
+    // Forces ReSTIR DI + GI to drop their reservoir history. Call this for
+    // events that actually invalidate the cached samples — scene reload,
+    // resize, toggling a pass — NOT for plain camera motion (the temporal
+    // pass re-projects + gates that itself).
+    void invalidateReSTIRHistory();
 
     // Per-frame entry.
     // `d_ldrOutput` is the CUDA interop buffer from VulkanDisplay::mapForCUDA;
