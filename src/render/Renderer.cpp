@@ -253,11 +253,63 @@ void Renderer::renderFrame(
     if (m_mode == Mode::NRDOnly) {
         cameraForSplit.jitterOffset = make_float2(0.0f, 0.0f);
     }
+
+    // ── ReSTIR prepasses (DI / GI / PT) ──────────────────────────
+    // Identical to the Native path above, but with the (potentially
+    // jitter-zeroed) split camera. ReSTIR's init pass shoots primary rays
+    // against the GAS, so it MUST hit the same surface the split kernel
+    // re-shades — feeding `camera` (with Halton jitter) while the split
+    // kernel uses `cameraForSplit` (no jitter, NRDOnly mode) makes the
+    // reservoir's pHat reference a different sub-pixel surface. The
+    // mismatch shows up as ringing/over-bright on glossy edges.
+    DeviceSceneData sceneWithBVH = scene;
+    backend->patchScene(sceneWithBVH);
+    bool restirRan = false;
+    if (m_restir.enabled()) {
+        restirRan = m_restir.runFrame(sceneWithBVH, cameraForSplit,
+                                      m_renderWidth, m_renderHeight, sampleIndex,
+                                      backend, cameraMoved);
+    }
+    bool restirGIRan = false;
+    if (m_restirGI.enabled()) {
+        restirGIRan = m_restirGI.runFrame(sceneWithBVH, cameraForSplit,
+                                          m_renderWidth, m_renderHeight, sampleIndex,
+                                          enableEnvironment,
+                                          backend, cameraMoved);
+    }
+    bool restirPTRan = false;
+    if (m_restirPT.enabled()) {
+        restirPTRan = m_restirPT.runFrame(sceneWithBVH, cameraForSplit,
+                                          m_renderWidth, m_renderHeight, sampleIndex,
+                                          enableEnvironment,
+                                          backend, cameraMoved);
+    }
+
+    DeviceSceneData scenePatched = scene;
+    if (restirRan) {
+        scenePatched.d_restirReservoirs = m_restir.getBuffers().d_reservoirsCurr;
+        scenePatched.restirEnabled      = 1;
+    }
+    if (restirGIRan) {
+        scenePatched.d_restirGIIndirect = m_restirGI.getBuffers().d_indirectOut;
+        scenePatched.restirGIEnabled    = 1;
+    }
+    if (restirPTRan) {
+        scenePatched.d_restirPTIndirect = m_restirPT.getBuffers().d_indirectOut;
+        scenePatched.restirPTEnabled    = 1;
+        // PT subsumes GI; turn GI consumption off so the kernel doesn't
+        // double-count even if both contexts populated their buffers.
+        scenePatched.restirGIEnabled    = 0;
+    }
+
     backend->launchPathTraceSplit(
-        scene, cameraForSplit, surf,
+        scenePatched, cameraForSplit, surf,
         m_renderWidth, m_renderHeight, sampleIndex,
         enableEnvironment, maxBounces, samplesPerFrame);
     m_accumBuffer.incrementSamples();
+    if (restirRan)   m_restir.swapHistory();
+    if (restirGIRan) m_restirGI.swapHistory();
+    if (restirPTRan) m_restirPT.swapHistory();
 
     // Cache what the pre-present recorder needs; it runs inside present(),
     // long after the `camera` argument (a stack local in the caller) has

@@ -1138,16 +1138,118 @@ void VulkanDisplay::setPrePresentRecorder(void (*fn)(VkCommandBuffer, void*), vo
 }
 
 // ─────────────────────────────────────────────────────────────
-// Screenshot: read the CUDA buffer back to host and PNG-encode.
+// Screenshot: read the displayed image back to host and PNG-encode.
+//
+// Source must be `m_sampledImage` (RGBA8_UNORM), NOT `m_cudaDevPtr`. In
+// non-Native modes (NRDOnly / NRDDLSS / DLSSOnly) the CUDA interop buffer is
+// never written by the kernel — the path-trace output goes through the
+// pre-present recorder (NRD denoise + composite + DLSS) and is rendered
+// directly into `m_sampledImage`. Reading `m_cudaDevPtr` in those modes
+// returns whatever uninitialized GPU memory was allocated to the interop
+// buffer (typically 0xFF on Win32 OPAQUE_WIN32 → pure-white screenshot
+// regardless of the actual on-screen output).
+//
+// We pump the GPU to idle first so that the most recently presented frame is
+// fully resolved into `m_sampledImage`, then issue a one-shot transient
+// command buffer that copies image → host-visible staging buffer.
 // ─────────────────────────────────────────────────────────────
 bool VulkanDisplay::saveToPNG(const std::string& path) const {
-    if (!m_cudaDevPtr || m_width == 0 || m_height == 0) return false;
+    if (m_width == 0 || m_height == 0 || !m_sampledImage) return false;
     std::filesystem::path p(path);
     if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path());
 
-    std::vector<unsigned char> pixels((size_t)m_width * m_height * 4);
-    if (cudaMemcpy(pixels.data(), m_cudaDevPtr, pixels.size(), cudaMemcpyDeviceToHost) != cudaSuccess) {
+    // Make sure the most recent present's writes to m_sampledImage are visible.
+    vkDeviceWaitIdle(m_device);
+
+    const VkDeviceSize size = (VkDeviceSize)m_width * m_height * 4;
+
+    // Host-visible staging buffer.
+    VkBuffer stagingBuf = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMem = VK_NULL_HANDLE;
+    {
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = size;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateBuffer(m_device, &bci, nullptr, &stagingBuf) != VK_SUCCESS) return false;
+
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(m_device, stagingBuf, &req);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = findMemoryType(req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (vkAllocateMemory(m_device, &mai, nullptr, &stagingMem) != VK_SUCCESS) {
+            vkDestroyBuffer(m_device, stagingBuf, nullptr);
+            return false;
+        }
+        vkBindBufferMemory(m_device, stagingBuf, stagingMem, 0);
+    }
+
+    // One-shot command buffer.
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    {
+        VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbai.commandPool = m_commandPool;
+        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(m_device, &cbai, &cmd) != VK_SUCCESS) {
+            vkFreeMemory(m_device, stagingMem, nullptr);
+            vkDestroyBuffer(m_device, stagingBuf, nullptr);
+            return false;
+        }
+    }
+
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    // m_sampledImage was last left in SHADER_READ_ONLY_OPTIMAL by present().
+    // Transition to TRANSFER_SRC for the copy, then back so subsequent frames
+    // observe the layout the present-loop expects.
+    transitionImageLayout(cmd, m_sampledImage,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {m_width, m_height, 1};
+    vkCmdCopyImageToBuffer(cmd, m_sampledImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           stagingBuf, 1, &region);
+
+    transitionImageLayout(cmd, m_sampledImage,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(m_graphicsQueue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_graphicsQueue);
+    vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
+
+    // Map and PNG-encode.
+    std::vector<unsigned char> pixels((size_t)size);
+    void* mapped = nullptr;
+    if (vkMapMemory(m_device, stagingMem, 0, size, 0, &mapped) != VK_SUCCESS) {
+        vkFreeMemory(m_device, stagingMem, nullptr);
+        vkDestroyBuffer(m_device, stagingBuf, nullptr);
         return false;
     }
-    return stbi_write_png(path.c_str(), (int)m_width, (int)m_height, 4, pixels.data(), (int)m_width * 4) != 0;
+    std::memcpy(pixels.data(), mapped, (size_t)size);
+    vkUnmapMemory(m_device, stagingMem);
+
+    vkFreeMemory(m_device, stagingMem, nullptr);
+    vkDestroyBuffer(m_device, stagingBuf, nullptr);
+
+    return stbi_write_png(path.c_str(), (int)m_width, (int)m_height, 4,
+                          pixels.data(), (int)m_width * 4) != 0;
 }
