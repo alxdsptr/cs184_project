@@ -719,8 +719,20 @@ extern "C" __global__ void __raygen__path_trace()
                             // against BSDF sampling — ReSTIR *is* the
                             // light-side strategy at the primary hit.
                             float geom = lightNdot / dist2;
-                            radiance += throughput * shadowTransmittance *
-                                        brdf * Le * (NdotL * geom) * restirW;
+                            float3 neeContrib = throughput * shadowTransmittance *
+                                                brdf * Le * (NdotL * geom) * restirW;
+                            // Mirror PathTraceKernel.cu / Split: cap the per-
+                            // frame contribution so a near-grazing reservoir
+                            // sample doesn't dump a 50-lum spike into the
+                            // accumulator (M7 flash-and-decay artifact).
+                            float lumNee = 0.2126f * neeContrib.x +
+                                           0.7152f * neeContrib.y +
+                                           0.0722f * neeContrib.z;
+                            const float clampMax = 10.0f;
+                            if (lumNee > clampMax) {
+                                neeContrib = neeContrib * (clampMax / lumNee);
+                            }
+                            radiance += neeContrib;
                         } else {
                             float pTri = light.weight / scene.areaLightTotalWeight;
                             float pArea = pTri / fmaxf(light.area, 1e-7f);

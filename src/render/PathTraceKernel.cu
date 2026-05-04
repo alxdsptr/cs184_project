@@ -1182,8 +1182,23 @@ __global__ void pathTraceKernel(
                         // requires a bounded-weight variant beyond the scope
                         // of this implementation.
                         float geom = lightNdot / dist2;
-                        radiance += throughput * shadowTransmittance *
-                                    brdf * Le * (NdotL * geom) * restirW;
+                        float3 neeContrib = throughput * shadowTransmittance *
+                                            brdf * Le * (NdotL * geom) * restirW;
+                        // Per-frame firefly clamp on the ReSTIR-DI NEE term.
+                        // PathTraceKernelSplit.cu already does this (line 580
+                        // with clampFirefly cap=10); the megakernel was
+                        // missing it. Without the clamp a near-grazing
+                        // sample held by the reservoir produces a single-
+                        // frame ~50-luminance spike that survives in the
+                        // accumulator for many frames (M7 flash-and-decay).
+                        float lumNee = 0.2126f * neeContrib.x +
+                                       0.7152f * neeContrib.y +
+                                       0.0722f * neeContrib.z;
+                        const float clampMax = 10.0f;
+                        if (lumNee > clampMax) {
+                            neeContrib = neeContrib * (clampMax / lumNee);
+                        }
+                        radiance += neeContrib;
                     } else {
                         float pTri = pSelect;
                         float pArea = pTri / fmaxf(light.area, 1e-7f);
