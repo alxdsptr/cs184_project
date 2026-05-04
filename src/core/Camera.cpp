@@ -257,25 +257,26 @@ CameraParams Camera::getParams(uint32_t frameIndex) const {
     p.projMatrix   = m_projMatrix;
     p.frameIndex   = frameIndex;
 
-    // ── Halton jitter TEMPORARILY DISABLED ────────────────────────────────
-    // The Halton sub-pixel jitter is here purely for DLSS / NRD: those
-    // upscalers use it as their temporal-accumulation phase. But it leaks
-    // into ReSTIR and the Native path-tracer kernel because the ReSTIR
-    // init pass uses `camera.jitterOffset` for its primary ray, and the
-    // path tracer's bounce-0 must then mirror that exact sub-pixel offset
-    // (otherwise the cached reservoir's pHat/W applies to a different
-    // surface point than the one being shaded). See PathTraceKernel.cu:354
-    // for the lock.
+    // ── Halton sub-pixel jitter ───────────────────────────────────────────
+    // Pixel-space offset in [-0.5, +0.5], applied as `(x + 0.5 + jx)/W` in
+    // ray-gen. Same sign/unit convention as DLSS `JitterOffset` and NRD
+    // `cameraJitter` (both pixel units, top-left origin, +x right / +y down).
     //
-    // Outputting zero makes the primary ray pass through pixel centre for
-    // both ReSTIR and the path tracer — ReSTIR-vs-path-tracer alignment
-    // still holds (both see jitterOffset = 0), and the path tracer's
-    // Native branch falls back to its per-sample random jitter for AA.
+    // Per-mode policy enforced in Renderer.cpp:
+    //   - NRDOnly  : Renderer zeros it (no AA resolver behind NRD; raw
+    //                Halton produces persistent edge shimmer).
+    //   - NRDDLSS  : keep Halton — DLSS consumes it as its AA source signal.
+    //   - DLSSOnly : keep Halton — same reason.
+    //   - Native   : per-sample random jitter is added on top inside the
+    //                kernel for AA. ReSTIR-vs-pathtracer alignment is
+    //                preserved because both see the same `jitterOffset` at
+    //                bounce-0 (PathTraceKernel.cu:354 takes the same Halton
+    //                value when ReSTIR is active).
     //
-    // To restore (when wiring DLSS back up): change the next two lines to
-    //     float2 jitter = haltonJitter(frameIndex);
-    //     p.jitterOffset = jitter;
-    p.jitterOffset = make_float2(0.0f, 0.0f);
+    // 16 phases is the DLSS guide minimum (32 preferred); we keep 16 here so
+    // sample patterns stay short enough that auto-capture sequences are
+    // reproducible across runs.
+    p.jitterOffset = haltonJitter(frameIndex);
 
     // (Kept for future DLSS work — proj matrix is NEVER itself jittered;
     // the offset is applied at ray-gen time in pixel space.)
