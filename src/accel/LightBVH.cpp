@@ -182,7 +182,7 @@ LightBVHData LightBVH::build(const AABB* bounds, const float* weights, uint32_t 
 
     result.rootIndex = buildRecursive(result.nodes, prims, result.orderedLightIndices,
                                       0, lightCount);
-    LOG_INFO("Light BVH: %u nodes, %u lights, root=%u",
-             (uint32_t)result.nodes.size(), lightCount, result.rootIndex);
+    LOG_DEBUG("Light BVH: %u nodes, %u lights, root=%u",
+              (uint32_t)result.nodes.size(), lightCount, result.rootIndex);
     return result;
 }

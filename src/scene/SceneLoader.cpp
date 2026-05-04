@@ -176,9 +176,9 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         if (dt.valid) {
             dt.avgRGB = computeAverageTextureRGB(dt.pixels.data(), dt.width, dt.height);
             dt.avgLum = luminance(dt.avgRGB);
-            LOG_INFO("Decoded emissive texture: %s (%dx%d) avgRGB=(%.4f,%.4f,%.4f) avgLum=%.4f",
-                     texPath.c_str(), dt.width, dt.height,
-                     dt.avgRGB.x, dt.avgRGB.y, dt.avgRGB.z, dt.avgLum);
+            LOG_DEBUG("Decoded emissive texture: %s (%dx%d) avgRGB=(%.4f,%.4f,%.4f) avgLum=%.4f",
+                      texPath.c_str(), dt.width, dt.height,
+                      dt.avgRGB.x, dt.avgRGB.y, dt.avgRGB.z, dt.avgLum);
         } else {
             LOG_WARN("Failed to CPU-decode emissive texture: %s", texPath.c_str());
         }
@@ -195,7 +195,7 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
     const float kTargetTexturedEmissiveLum = std::max(1e-3f, texturedEmissiveTargetLum);
     const float kMinEmissionStrength       = 1.0f;
     const float kMaxEmissionStrength       = 1000.0f;
-    LOG_INFO("Adaptive textured-emissive target luminance: %.2f", kTargetTexturedEmissiveLum);
+    LOG_DEBUG("Adaptive textured-emissive target luminance: %.2f", kTargetTexturedEmissiveLum);
 
     // Materials
     for (unsigned i = 0; i < aiScn->mNumMaterials; i++) {
@@ -238,9 +238,9 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         if (colladaIt != colladaRadiance.end()) {
             mat.emission = colladaIt->second;
             mat.emissionStrength = 1.0f;
-            LOG_INFO("Material '%s': using COLLADA radiance (%.1f, %.1f, %.1f)",
-                     materialName.c_str(),
-                     mat.emission.x, mat.emission.y, mat.emission.z);
+            LOG_DEBUG("Material '%s': using COLLADA radiance (%.1f, %.1f, %.1f)",
+                      materialName.c_str(),
+                      mat.emission.x, mat.emission.y, mat.emission.z);
         } else {
             aiColor3D emissive(0, 0, 0);
             aiMat->Get(AI_MATKEY_COLOR_EMISSIVE, emissive);
@@ -279,8 +279,8 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
             mat.transmission = 1.0f - opacity;
         }
         if (mat.transmission > 0.0f) {
-            LOG_INFO("Material '%s': transmission=%.3f ior=%.3f",
-                     materialName.c_str(), mat.transmission, mat.ior);
+            LOG_DEBUG("Material '%s': transmission=%.3f ior=%.3f",
+                      materialName.c_str(), mat.transmission, mat.ior);
         }
 
         // TransparencyFactor from FBX can appear on many materials including
@@ -290,7 +290,7 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         float transparencyFactor = 0.0f;
         aiMat->Get(AI_MATKEY_TRANSPARENCYFACTOR, transparencyFactor);
         if (transparencyFactor > 0.0f) {
-            LOG_INFO("Material '%s': transparencyFactor=%.3f", materialName.c_str(), transparencyFactor);
+            LOG_DEBUG("Material '%s': transparencyFactor=%.3f", materialName.c_str(), transparencyFactor);
         }
 
         // Texture paths
@@ -352,8 +352,8 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
                 }
                 alphaMean = (float)(aSum / (double)n) * (1.0f / 255.0f);
                 alphaCarriesGloss = (aMax - aMin) >= 4; // ~1.5% range, robust against compression noise
-                LOG_INFO("Material '%s': specular tex alpha range [%d..%d] mean=%.3f carriesGloss=%d",
-                         materialName.c_str(), aMin, aMax, alphaMean, (int)alphaCarriesGloss);
+                LOG_DEBUG("Material '%s': specular tex alpha range [%d..%d] mean=%.3f carriesGloss=%d",
+                          materialName.c_str(), aMin, aMax, alphaMean, (int)alphaCarriesGloss);
             }
 
             // Glossiness factor. Prefer SHININESS_STRENGTH (0..1); fall back
@@ -393,11 +393,11 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
 
             mat.roughness = std::max(0.045f, 1.0f - mat.glossiness);
 
-            LOG_INFO("Material '%s': Specular-Glossiness workflow (specColor=(%.3f,%.3f,%.3f) glossiness=%.3f alphaIsGloss=%d fbxCustom=%d fbxUE=%d)",
-                     materialName.c_str(),
-                     mat.specularColor.x, mat.specularColor.y, mat.specularColor.z,
-                     mat.glossiness, (int)mat.specularGlossAlphaIsGlossiness,
-                     (int)mat.useFBXCustomPacking, (int)mat.useFBXUEPacking);
+            LOG_DEBUG("Material '%s': Specular-Glossiness workflow (specColor=(%.3f,%.3f,%.3f) glossiness=%.3f alphaIsGloss=%d fbxCustom=%d fbxUE=%d)",
+                      materialName.c_str(),
+                      mat.specularColor.x, mat.specularColor.y, mat.specularColor.z,
+                      mat.glossiness, (int)mat.specularGlossAlphaIsGlossiness,
+                      (int)mat.useFBXCustomPacking, (int)mat.useFBXUEPacking);
         }
 
         // If the material has an emissive texture, it is explicitly meant to
@@ -434,19 +434,19 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
                 strength = std::max(kMinEmissionStrength,
                                     std::min(kMaxEmissionStrength, strength));
                 mat.emissionStrength = strength;
-                LOG_INFO("Material '%s': adaptive emissionStrength=%.2f "
-                         "(avgMaxRGB=%.4f, avgLum=%.4f, target=%.2f)",
-                         materialName.c_str(), strength, normMetric,
-                         dt.avgLum, kTargetTexturedEmissiveLum);
+                LOG_DEBUG("Material '%s': adaptive emissionStrength=%.2f "
+                          "(avgMaxRGB=%.4f, avgLum=%.4f, target=%.2f)",
+                          materialName.c_str(), strength, normMetric,
+                          dt.avgLum, kTargetTexturedEmissiveLum);
             } else if (dt.valid && dt.avgLum <= 1e-6f) {
                 // Texture is entirely black — the material isn't actually
                 // emissive even though the FBX tagged it so. Skip it rather
                 // than letting mat.emission=(1,1,1) make it glow white.
                 mat.emission = make_float3(0.0f, 0.0f, 0.0f);
                 mat.emissionStrength = 0.0f;
-                LOG_INFO("Material '%s': emissive texture is all black, "
-                         "treating as non-emissive",
-                         materialName.c_str());
+                LOG_DEBUG("Material '%s': emissive texture is all black, "
+                          "treating as non-emissive",
+                          materialName.c_str());
             } else {
                 // Texture couldn't be decoded at all (e.g. missing file). Keep
                 // a conservative strength so the material visibly emits white
@@ -470,8 +470,8 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
             if (specLum < 0.01f && mat.transmission <= 0.0f && mat.emissionStrength <= 0.0f) {
                 mat.pureDiffuse = true;
                 mat.metallic = 0.0f;
-                LOG_INFO("Material '%s': treating as pure Lambertian (Collada Phong, specular=%.4f)",
-                         materialName.c_str(), specLum);
+                LOG_DEBUG("Material '%s': treating as pure Lambertian (Collada Phong, specular=%.4f)",
+                          materialName.c_str(), specLum);
             }
         }
 
@@ -479,8 +479,8 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         // FBX often sets opacity < 1 on light bulb materials, but they should
         // glow opaquely, not refract light through them.
         if (mat.emissionStrength > 0.0f && mat.transmission > 0.0f) {
-            LOG_INFO("Material '%s': disabling transmission (%.3f) for emissive material",
-                     materialName.c_str(), mat.transmission);
+            LOG_DEBUG("Material '%s': disabling transmission (%.3f) for emissive material",
+                      materialName.c_str(), mat.transmission);
             mat.transmission = 0.0f;
         }
 
@@ -525,39 +525,39 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
                 return (unsigned)aiMat->GetTextureCount(t);
             };
 
-            LOG_INFO("─── Material '%s' (idx=%u) ───", materialName.c_str(), i);
-            LOG_INFO("  Assimp raw: diffuse=(%.3f,%.3f,%.3f) base=(%.3f,%.3f,%.3f) spec=(%.3f,%.3f,%.3f)",
-                     diagDiffuse.r, diagDiffuse.g, diagDiffuse.b,
-                     diagBaseColor.r, diagBaseColor.g, diagBaseColor.b,
-                     diagSpecular.r, diagSpecular.g, diagSpecular.b);
-            LOG_INFO("              emissive=(%.3f,%.3f,%.3f) ambient=(%.3f,%.3f,%.3f) reflective=(%.3f,%.3f,%.3f)",
-                     diagEmissive.r, diagEmissive.g, diagEmissive.b,
-                     diagAmbient.r, diagAmbient.g, diagAmbient.b,
-                     diagReflective.r, diagReflective.g, diagReflective.b);
-            LOG_INFO("              shininess=%.3f shin_strength=%.3f reflectivity=%.3f opacity=%.3f ior=%.3f",
-                     diagShininess, diagShininessStrength, diagReflectivity, diagOpacity, diagIor);
-            LOG_INFO("              metallic_factor=%.3f roughness_factor=%.3f spec_factor=%.3f emissive_intensity=%.3f",
-                     diagMetallic, diagRoughness, diagSpecFactor, diagEmissiveIntensity);
-            LOG_INFO("  Tex counts: BASE=%u DIFFUSE=%u NORMAL=%u METALNESS=%u DIFF_ROUGH=%u SPECULAR=%u EMISSIVE=%u SHININESS=%u",
-                     texCount(aiTextureType_BASE_COLOR),
-                     texCount(aiTextureType_DIFFUSE),
-                     texCount(aiTextureType_NORMALS),
-                     texCount(aiTextureType_METALNESS),
-                     texCount(aiTextureType_DIFFUSE_ROUGHNESS),
-                     texCount(aiTextureType_SPECULAR),
-                     texCount(aiTextureType_EMISSIVE),
-                     texCount(aiTextureType_SHININESS));
-            LOG_INFO("  Resolved -> albedo=(%.3f,%.3f,%.3f) roughness=%.3f metallic=%.3f transmission=%.3f ior=%.3f pureDiffuse=%d",
-                     mat.albedo.x, mat.albedo.y, mat.albedo.z,
-                     mat.roughness, mat.metallic, mat.transmission, mat.ior,
-                     (int)mat.pureDiffuse);
-            LOG_INFO("  Resolved -> emission=(%.3f,%.3f,%.3f) emissionStrength=%.3f",
-                     mat.emission.x, mat.emission.y, mat.emission.z, mat.emissionStrength);
-            LOG_INFO("  Texture paths: albedo='%s' normal='%s' metRough='%s' emissive='%s'",
-                     mat.albedoTexPath.c_str(),
-                     mat.normalTexPath.c_str(),
-                     mat.metallicRoughTexPath.c_str(),
-                     mat.emissiveTexPath.c_str());
+            LOG_DEBUG("─── Material '%s' (idx=%u) ───", materialName.c_str(), i);
+            LOG_DEBUG("  Assimp raw: diffuse=(%.3f,%.3f,%.3f) base=(%.3f,%.3f,%.3f) spec=(%.3f,%.3f,%.3f)",
+                      diagDiffuse.r, diagDiffuse.g, diagDiffuse.b,
+                      diagBaseColor.r, diagBaseColor.g, diagBaseColor.b,
+                      diagSpecular.r, diagSpecular.g, diagSpecular.b);
+            LOG_DEBUG("              emissive=(%.3f,%.3f,%.3f) ambient=(%.3f,%.3f,%.3f) reflective=(%.3f,%.3f,%.3f)",
+                      diagEmissive.r, diagEmissive.g, diagEmissive.b,
+                      diagAmbient.r, diagAmbient.g, diagAmbient.b,
+                      diagReflective.r, diagReflective.g, diagReflective.b);
+            LOG_DEBUG("              shininess=%.3f shin_strength=%.3f reflectivity=%.3f opacity=%.3f ior=%.3f",
+                      diagShininess, diagShininessStrength, diagReflectivity, diagOpacity, diagIor);
+            LOG_DEBUG("              metallic_factor=%.3f roughness_factor=%.3f spec_factor=%.3f emissive_intensity=%.3f",
+                      diagMetallic, diagRoughness, diagSpecFactor, diagEmissiveIntensity);
+            LOG_DEBUG("  Tex counts: BASE=%u DIFFUSE=%u NORMAL=%u METALNESS=%u DIFF_ROUGH=%u SPECULAR=%u EMISSIVE=%u SHININESS=%u",
+                      texCount(aiTextureType_BASE_COLOR),
+                      texCount(aiTextureType_DIFFUSE),
+                      texCount(aiTextureType_NORMALS),
+                      texCount(aiTextureType_METALNESS),
+                      texCount(aiTextureType_DIFFUSE_ROUGHNESS),
+                      texCount(aiTextureType_SPECULAR),
+                      texCount(aiTextureType_EMISSIVE),
+                      texCount(aiTextureType_SHININESS));
+            LOG_DEBUG("  Resolved -> albedo=(%.3f,%.3f,%.3f) roughness=%.3f metallic=%.3f transmission=%.3f ior=%.3f pureDiffuse=%d",
+                      mat.albedo.x, mat.albedo.y, mat.albedo.z,
+                      mat.roughness, mat.metallic, mat.transmission, mat.ior,
+                      (int)mat.pureDiffuse);
+            LOG_DEBUG("  Resolved -> emission=(%.3f,%.3f,%.3f) emissionStrength=%.3f",
+                      mat.emission.x, mat.emission.y, mat.emission.z, mat.emissionStrength);
+            LOG_DEBUG("  Texture paths: albedo='%s' normal='%s' metRough='%s' emissive='%s'",
+                      mat.albedoTexPath.c_str(),
+                      mat.normalTexPath.c_str(),
+                      mat.metallicRoughTexPath.c_str(),
+                      mat.emissiveTexPath.c_str());
         }
 
         scene.getMaterials().push_back(std::move(mat));
@@ -568,10 +568,10 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         const aiLight* aiL = aiScn->mLights[i];
         if (!aiL) continue;
 
-        LOG_INFO("Light[%u] '%s': type=%d color=(%.2f,%.2f,%.2f) atten=(%.4f,%.4f,%.4f)",
-                 i, aiL->mName.C_Str(), (int)aiL->mType,
-                 aiL->mColorDiffuse.r, aiL->mColorDiffuse.g, aiL->mColorDiffuse.b,
-                 aiL->mAttenuationConstant, aiL->mAttenuationLinear, aiL->mAttenuationQuadratic);
+        LOG_DEBUG("Light[%u] '%s': type=%d color=(%.2f,%.2f,%.2f) atten=(%.4f,%.4f,%.4f)",
+                  i, aiL->mName.C_Str(), (int)aiL->mType,
+                  aiL->mColorDiffuse.r, aiL->mColorDiffuse.g, aiL->mColorDiffuse.b,
+                  aiL->mAttenuationConstant, aiL->mAttenuationLinear, aiL->mAttenuationQuadratic);
 
         // Currently only point and spot lights are supported (treat spot as point)
         if (aiL->mType != aiLightSource_POINT && aiL->mType != aiLightSource_SPOT) {
@@ -591,8 +591,8 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         // emissive mesh geometry — keeping the point light on top double-lit
         // the scene (visible on CBbunny.dae as a washed-out look).
         if (!colladaCGLAreaLights.empty()) {
-            LOG_INFO("Skipping point light '%s': COLLADA file uses CGL area-light extension",
-                     aiL->mName.C_Str());
+            LOG_DEBUG("Skipping point light '%s': COLLADA file uses CGL area-light extension",
+                      aiL->mName.C_Str());
             continue;
         }
 

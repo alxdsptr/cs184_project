@@ -148,7 +148,7 @@ cudaTextureObject_t TextureManager::loadTexture(const std::string& path, bool sR
     CUDA_CHECK(cudaCreateTextureObject(&texObj, &resDesc, &texDesc, nullptr));
 
     m_textures.push_back({cuArray, texObj});
-    LOG_INFO("Loaded texture: %s (%dx%d, sRGB=%d)", path.c_str(), w, h, (int)sRGB);
+    LOG_DEBUG("Loaded texture: %s (%dx%d, sRGB=%d)", path.c_str(), w, h, (int)sRGB);
     return texObj;
 }
 
@@ -195,7 +195,7 @@ cudaTextureObject_t TextureManager::loadHDRTexture(const std::string& path, int&
     CUDA_CHECK(cudaCreateTextureObject(&texObj, &resDesc, &texDesc, nullptr));
 
     m_textures.push_back({cuArray, texObj});
-    LOG_INFO("Loaded HDR texture: %s (%dx%d)", path.c_str(), w, h);
+    LOG_DEBUG("Loaded HDR texture: %s (%dx%d)", path.c_str(), w, h);
     return texObj;
 }
 

@@ -209,8 +209,8 @@ BVHData SAH_BVH::build(const float3* positions, const uint32_t* indices, uint32_
 
     result.rootIndex = buildRecursive(result.nodes, prims, result.orderedPrimIndices, 0, triCount);
 
-    LOG_INFO("SAH BVH: %u nodes, %u triangles, root=%u",
-             (uint32_t)result.nodes.size(), triCount, result.rootIndex);
+    LOG_DEBUG("SAH BVH: %u nodes, %u triangles, root=%u",
+              (uint32_t)result.nodes.size(), triCount, result.rootIndex);
 
     return result;
 }
