@@ -3,14 +3,17 @@
 # run_quality_sweep.sh — capture each ReSTIR mode along an identical
 # camera path, then run tools/compare_quality.py for an HTML report.
 #
+# By default this script does NOT regenerate the reference sequence; it
+# expects reference_*.png to already exist in the output directory (from
+# a prior run of tools/run_reference_sweep.sh). That keeps repeat test
+# runs cheap — the expensive long-dwell reference is rendered once.
+#
 # Workflow:
-#   1. REFERENCE sweep — runs the exact same camera path as the tests but
-#      tells the path tracer to dwell for REFERENCE_DWELL frames at every
-#      capture point before saving (--capture-dwell). Motion is paused
-#      during the dwell, so the engine's accumulator integrates many
-#      samples into the same pose. The result is a per-pose near-converged
-#      ground-truth sequence reference_NNNNNN.png that lines up frame-for-
-#      frame with the test sweeps.
+#   1. (Optional) REFERENCE sweep — only when --render-reference is given.
+#      Same camera path as the tests, but each capture point dwells for
+#      REFERENCE_DWELL frames with motion paused, so the accumulator
+#      integrates a near-converged ground truth at every pose. Prefer
+#      running tools/run_reference_sweep.sh once instead.
 #   2. Native + ReSTIR DI / GI / PT sweeps along the same camera path,
 #      with dwell=1 (one render per capture point).
 #   3. Compare every captured frame against the reference frame at the
@@ -19,23 +22,30 @@
 # Usage (run from anywhere — script resolves project root from $0):
 #     tools/run_quality_sweep.sh <scene_file> [extra_pathtracer_flags ...]
 #
+# Typical flow:
+#     # 1) Render the reference once (slow):
+#     tools/run_reference_sweep.sh assets/scene.fbx --camera mycam.txt
+#
+#     # 2) Run the test sweeps as many times as you like (fast):
+#     tools/run_quality_sweep.sh assets/scene.fbx --camera mycam.txt
+#
 # Examples:
-#     # default: optix backend, 2000-frame dwell reference, dolly motion
+#     # default: optix backend, dolly motion, reuses existing reference
 #     tools/run_quality_sweep.sh assets/scene.fbx --camera mycam.txt
 #
 #     # cuda backend
 #     tools/run_quality_sweep.sh assets/scene.fbx --backend cuda
 #
-#     # crank up reference quality
-#     tools/run_quality_sweep.sh assets/scene.fbx --reference-dwell 4000
+#     # one-shot: render reference inline (equivalent to old behavior)
+#     tools/run_quality_sweep.sh assets/scene.fbx --render-reference
+#
+#     # crank up reference quality (only meaningful with --render-reference)
+#     tools/run_quality_sweep.sh assets/scene.fbx --render-reference \
+#         --reference-dwell 4000
 #
 #     # static camera (best for "is restir converging at this fixed pose?")
 #     tools/run_quality_sweep.sh assets/scene.fbx --camera mycam.txt \
 #         --capture-speed 0
-#
-#     # bring your own per-frame reference sequence and skip the ref sweep
-#     tools/run_quality_sweep.sh assets/scene.fbx \
-#         --skip-reference-sweep   # reuses prior reference_*.png in --out
 #
 # Recognised script flags (consumed before forwarding):
 #     --backend <cuda|optix>  Which backend to drive at RUNTIME. Default:
@@ -43,11 +53,13 @@
 #                             --backend <cuda|optix>; the build-optix exe
 #                             supports both code paths so we always launch
 #                             the same binary.
-#     --reference-dwell <N>   Dwell frames per capture point during the
-#                             reference sweep (default 2000). Higher → more
-#                             converged ref images, longer runtime.
-#     --skip-reference-sweep  Don't render a fresh reference (reuse a prior
-#                             reference_*.png sequence in the out dir).
+#     --render-reference      Render the reference sequence inline before
+#                             the test sweeps. Off by default — usually
+#                             you should use tools/run_reference_sweep.sh
+#                             once and reuse its output.
+#     --reference-dwell <N>   Dwell frames per capture point when
+#                             --render-reference is set (default 2000).
+#                             Higher → more converged ref, longer runtime.
 #     --pathtracer <exe>      Override the pathtracer.exe path.
 #                             Default: build-optix/Release/pathtracer.exe.
 #     --out <dir>             Output directory.
@@ -68,7 +80,7 @@
 set -euo pipefail
 
 usage() {
-    sed -n '2,66p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 1
 }
 
@@ -84,7 +96,7 @@ shift
 
 BACKEND="optix"
 REFERENCE_DWELL=2000
-SKIP_REFERENCE_SWEEP=0
+RENDER_REFERENCE=0
 # The build-optix exe carries both backends; --backend selects which path
 # is used at runtime. Override via --pathtracer if you have a different
 # build layout.
@@ -97,7 +109,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --backend)                BACKEND="$2"; shift 2 ;;
         --reference-dwell)        REFERENCE_DWELL="$2"; shift 2 ;;
-        --skip-reference-sweep)   SKIP_REFERENCE_SWEEP=1; shift ;;
+        --render-reference)       RENDER_REFERENCE=1; shift ;;
         --pathtracer)             PATHTRACER_REL="$2"; shift 2 ;;
         --out)                    OUTDIR_REL="$2"; shift 2 ;;
         --skip-compare)           SKIP_COMPARE=1; shift ;;
@@ -206,25 +218,28 @@ run_sweep() {
         "${FORWARD_W[@]+"${FORWARD_W[@]}"}"
 }
 
-# ── Reference sweep ──────────────────────────────────────────────────────
+# ── Optional inline reference sweep ──────────────────────────────────────
 # Same camera path as the tests, but each capture point dwells for
 # REFERENCE_DWELL frames with motion paused, so the accumulator converges
 # at every pose. Disabling all ReSTIR variants ensures the reference is
-# pure path-traced ground truth.
-if [[ "${SKIP_REFERENCE_SWEEP}" -eq 0 ]]; then
+# pure path-traced ground truth. Off by default — prefer the standalone
+# tools/run_reference_sweep.sh so the expensive sequence is rendered once
+# and reused across many test runs.
+if [[ "${RENDER_REFERENCE}" -eq 1 ]]; then
     echo
     echo "=== Reference sweep: native, dwell=${REFERENCE_DWELL} per capture point ==="
     run_sweep "reference" "${REFERENCE_DWELL}" \
         --no-restir --no-restir-gi --no-restir-pt
 fi
 
-# Quick sanity: at least one reference frame must exist for compare to work.
-if [[ "${SKIP_COMPARE}" -eq 0 ]]; then
-    if ! ls "${OUTDIR}"/reference_[0-9]*.png >/dev/null 2>&1; then
-        echo "ERROR: no reference_*.png in ${OUTDIR}." >&2
-        echo "       Drop --skip-reference-sweep so we can render one." >&2
-        exit 1
-    fi
+# Reference frames must already exist (either rendered above, or by a
+# prior tools/run_reference_sweep.sh run).
+if ! ls "${OUTDIR}"/reference_[0-9]*.png >/dev/null 2>&1; then
+    echo "ERROR: no reference_*.png in ${OUTDIR}." >&2
+    echo "       Render one with:" >&2
+    echo "           tools/run_reference_sweep.sh ${SCENE_ARG} [flags...]" >&2
+    echo "       Or pass --render-reference to render it inline." >&2
+    exit 1
 fi
 
 # ── Test sweeps (4 modes, identical camera path, dwell=1) ────────────────

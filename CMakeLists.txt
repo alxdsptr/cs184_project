@@ -19,7 +19,9 @@ option(PATHTRACER_ENABLE_NRD_DLSS
     OFF)
 
 # Location of the prebuilt DLSS SDK (only consulted when the option is ON).
-set(PATHTRACER_DLSS_SDK_DIR "D:/examples/DLSS" CACHE PATH
+# Defaults to the bundled submodule at external/DLSS; override on the cmake
+# command line to point at a different SDK install if needed.
+set(PATHTRACER_DLSS_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/DLSS" CACHE PATH
     "Path to the NVIDIA DLSS (NGX) SDK root (contains include/ and lib/Windows_x86_64/)")
 
 # ── OptiX master switch ──────────────────────────────────────

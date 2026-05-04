@@ -4,3 +4,6 @@
 [submodule "external/NRD"]
 	path = external/NRD
 	url = https://github.com/NVIDIA-RTX/NRD.git
+[submodule "external/DLSS"]
+	path = external/DLSS
+	url = https://github.com/NVIDIA/DLSS.git
