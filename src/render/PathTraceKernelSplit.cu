@@ -601,9 +601,11 @@ __global__ void pathTraceKernelSplit(
             } // end !restirSkip
         }
 
-        // Point lights are delta emitters (see PathTraceKernel.cu comment).
-        // Sample them in addition to area lights, not as an alternative.
-        if (scene.d_pointLights && scene.pointLightCount > 0) {
+        // Point lights: only sampled when no area lights, matching
+        // PathTraceKernel.cu and the OptiX raygens. Scenes with emissive
+        // textures use area lights; point lights are a fallback for scenes
+        // that ship no area lights at all.
+        else if (scene.d_pointLights && scene.pointLightCount > 0) {
             float3 V = -ray.direction;
             float3 direct = make_float3(0,0,0);
             for (uint32_t li = 0; li < scene.pointLightCount; li++) {

@@ -1492,8 +1492,11 @@ extern "C" __global__ void __raygen__path_trace_split()
                 } // end !restirSkip
             }
 
-            // Point lights (delta emitters; sampled in addition to area lights).
-            if (scene.d_pointLights && scene.pointLightCount > 0) {
+            // Point lights: only sampled when no area lights (matches the
+            // non-split CUDA / OptiX raygens). Mixed scenes prefer area-light
+            // emissive geometry; explicit point lights are a fallback for
+            // scenes that have no area lights at all.
+            else if (scene.d_pointLights && scene.pointLightCount > 0) {
                 float3 V = -ray.direction;
                 float3 direct = make_float3(0,0,0);
                 for (uint32_t li = 0; li < scene.pointLightCount; li++) {
