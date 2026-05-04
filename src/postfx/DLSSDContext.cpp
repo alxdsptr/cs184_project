@@ -145,6 +145,10 @@ bool DLSSDContext::createFeature(
     flags |= NVSDK_NGX_DLSS_Feature_Flags_MVLowRes; // motion vectors at render res
     // DLSS-RR §3.7: Auto-Exposure is unsupported. Do NOT set the flag.
     cp.InFeatureCreateFlags = flags;
+    // §3.13 — leave the preset hint unset (Default model). Preset E was tested
+    // empirically and produced ~2.59 mean_abs_diff during dolly motion vs ~2.17
+    // for default; Preset D's transformer handles our noisy 1-spp / no-ReSTIR
+    // input regime better on Bistro, so we stay on Default.
 
     NVSDK_NGX_Result r = NGX_VULKAN_CREATE_DLSSD_EXT1(
         m_impl->device, cmd,
