@@ -270,6 +270,39 @@ bool Application::loadScene(const std::string& path) {
         return false;
     }
 
+    // Volumetric-medium override: if the user set any --medium-* flag on the
+    // command line, prefer those values over what the scene file declared
+    // (no loader parses media today, so this is the only path to enable a
+    // medium). Otherwise inherit the scene's medium (which is "off" until
+    // set elsewhere) so subsequent toggles in the GUI start from defaults.
+    if (m_hasMediumOverride) {
+        m_scene.getMedium() = m_medium;
+    } else {
+        m_medium = m_scene.getMedium();
+    }
+    // Default the medium's bounding box to the scene AABB (slightly padded
+    // so geometry on the boundary stays inside the medium). Skipped if the
+    // user already configured bounds. Without this, a global "constant"
+    // medium has no extent and delta tracking would loop on miss rays.
+    if (!m_medium.bounded) {
+        const AABB& sceneBounds = m_scene.getBounds();
+        if (!sceneBounds.empty()) {
+            float3 size = sceneBounds.bmax - sceneBounds.bmin;
+            float3 pad = size * 0.05f;
+            m_medium.bmin = sceneBounds.bmin - pad;
+            m_medium.bmax = sceneBounds.bmax + pad;
+            m_medium.bounded = true;
+            // Sensible defaults for the height-falloff modes — yBase at the
+            // scene floor, falloff height ~ 30% of scene height. These only
+            // matter when the user picks a heterogeneous density kind.
+            m_medium.yBase = sceneBounds.bmin.y;
+            m_medium.falloffHeight = fmaxf(size.y * 0.3f, 1.0f);
+            m_medium.fbmFrequency = 1.0f / fmaxf(fmaxf(size.x, size.z), 1.0f) * 4.0f;
+        }
+    }
+    m_medium.recomputeMajorant();
+    m_scene.getMedium() = m_medium;
+
     // Load textures and bind CUDA texture objects per material.
     // Cache key = (path, sRGB) since the same file may appear as both a
     // colour texture (needs sRGB decode) and a data texture (must stay
@@ -502,6 +535,10 @@ void Application::renderSceneSample(uchar4* d_pbo, bool timeHeadless) {
         CameraParams camParams = m_camera.getParams(m_frameIndex);
         DeviceSceneData sceneData = m_backend->getSceneData();
         sceneData.envMapTex = m_envMapTex;
+        // Refresh medium each frame — the host m_medium can be tweaked at
+        // runtime (CLI override at load, future GUI), and the backend's
+        // cached copy is stale otherwise.
+        sceneData.medium = m_medium;
         sceneData.d_shEnvCoeffs = m_d_shEnvCoeffs;
         sceneData.envUseSH = (m_useSHEnvIrradiance && m_d_shEnvCoeffs) ? 1 : 0;
         sceneData.debugNormalViz = m_debugNormalViz;

@@ -1,5 +1,6 @@
 #pragma once
 #include "core/Camera.h"
+#include "core/VolumeMedium.h"
 #include "display/VulkanDisplay.h"
 #include "gui/GUI.h"
 #include "scene/Scene.h"
@@ -34,6 +35,16 @@ public:
     // emissionStrength normalisation. Passed through to SceneLoader at
     // loadScene().
     void setEmissiveTargetLum(float v) { m_emissiveTargetLum = v; }
+    // Volumetric-medium overrides applied at scene load time. Setting any of
+    // these flips m_hasMediumOverride so the loader knows to use the
+    // command-line-supplied parameters in place of whatever the scene file
+    // declared (which is currently nothing — no loaders parse media).
+    void setMediumEnabled(bool enabled) { m_medium.enabled = enabled; m_hasMediumOverride = true; }
+    void setMediumSigmaA(const float3& sigmaA) { m_medium.sigmaA = sigmaA; m_hasMediumOverride = true; }
+    void setMediumSigmaS(const float3& sigmaS) { m_medium.sigmaS = sigmaS; m_hasMediumOverride = true; }
+    void setMediumDensity(float density) { m_medium.density = density; m_hasMediumOverride = true; }
+    void setMediumAnisotropy(float g) { m_medium.anisotropy = g; m_hasMediumOverride = true; }
+    void setMediumDensityKind(uint32_t k) { m_medium.densityKind = k; m_hasMediumOverride = true; }
     void setHeadlessOutput(const std::string& outputPath, uint32_t sampleCount);
 
     // ── Capture mode: deterministic camera path + periodic screenshot dump ─
@@ -134,6 +145,8 @@ private:
     int m_backendKind = 0;  // 0 = CUDA, 1 = OptiX
     SGWorkflowMode m_sgMode = SGWorkflowMode::Off;
     float m_emissiveTargetLum = 20.0f;
+    VolumeMedium m_medium;
+    bool m_hasMediumOverride = false;
 
     bool       m_sceneLoaded = false;
     InputState m_input;

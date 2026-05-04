@@ -1,4 +1,5 @@
 #include "app/Application.h"
+#include "core/Types.h"
 #include "scene/SceneLoader.h"
 #include "util/Log.h"
 
@@ -23,6 +24,14 @@ int main(int argc, char** argv) {
     bool restirDI = true;
     bool restirGI = false;
     bool restirPT = false;
+    bool mediumEnabled = false;
+    float3 mediumSigmaA = make_float3(0.0f, 0.0f, 0.0f);
+    float3 mediumSigmaS = make_float3(0.0f, 0.0f, 0.0f);
+    float mediumDensity = 1.0f;
+    float mediumAnisotropy = 0.0f;
+    uint32_t mediumDensityKind = 0;  // 0=Constant, 1=HeightFalloff, 2=FBM, 3=HeightFBM
+    bool mediumAnyOverride = false;
+    bool mediumKindOverride = false;
 
     // Capture-mode CLI state. Setting --capture-tag activates it.
     Application::CaptureOptions capOpts;
@@ -83,6 +92,57 @@ int main(int argc, char** argv) {
             } else {
                 LOG_WARN("Invalid --emissive-target value: %s", argv[i]);
             }
+        } else if (arg == "--medium" && i + 1 < argc) {
+            std::string v = argv[++i];
+            if (v == "on" || v == "1" || v == "true") {
+                mediumEnabled = true;
+                mediumAnyOverride = true;
+            } else if (v == "off" || v == "0" || v == "false") {
+                mediumEnabled = false;
+                mediumAnyOverride = true;
+            } else {
+                LOG_WARN("Invalid --medium value: %s (use on|off)", v.c_str());
+            }
+        } else if (arg == "--sigma-a" && i + 3 < argc) {
+            // Read sequentially — argument-evaluation order in a single
+            // function call is unspecified in C++, so MSVC could (and does)
+            // grab args right-to-left and silently transpose RGB→BGR.
+            float r = (float)std::atof(argv[++i]);
+            float g = (float)std::atof(argv[++i]);
+            float b = (float)std::atof(argv[++i]);
+            mediumSigmaA = make_float3(r, g, b);
+            mediumAnyOverride = true;
+        } else if (arg == "--sigma-s" && i + 3 < argc) {
+            float r = (float)std::atof(argv[++i]);
+            float g = (float)std::atof(argv[++i]);
+            float b = (float)std::atof(argv[++i]);
+            mediumSigmaS = make_float3(r, g, b);
+            mediumAnyOverride = true;
+        } else if (arg == "--medium-density" && i + 1 < argc) {
+            float v = (float)std::atof(argv[++i]);
+            if (v >= 0.0f) {
+                mediumDensity = v;
+                mediumAnyOverride = true;
+            } else {
+                LOG_WARN("Invalid --medium-density value: %s", argv[i]);
+            }
+        } else if (arg == "--medium-g" && i + 1 < argc) {
+            float v = (float)std::atof(argv[++i]);
+            if (v >= -0.99f && v <= 0.99f) {
+                mediumAnisotropy = v;
+                mediumAnyOverride = true;
+            } else {
+                LOG_WARN("Invalid --medium-g value: %s (range -0.99..0.99)", argv[i]);
+            }
+        } else if (arg == "--medium-kind" && i + 1 < argc) {
+            std::string v = argv[++i];
+            if      (v == "constant" || v == "homogeneous") mediumDensityKind = 0;
+            else if (v == "height" || v == "height-falloff") mediumDensityKind = 1;
+            else if (v == "fbm" || v == "noise")             mediumDensityKind = 2;
+            else if (v == "height-fbm" || v == "smoke")      mediumDensityKind = 3;
+            else { LOG_WARN("Invalid --medium-kind value: %s (constant|height|fbm|height-fbm)", v.c_str()); continue; }
+            mediumKindOverride = true;
+            mediumAnyOverride = true;
         } else if ((arg == "--spp" || arg == "-p") && i + 1 < argc) {
             int value = std::atoi(argv[++i]);
             if (value > 0) {
@@ -183,6 +243,14 @@ int main(int argc, char** argv) {
     app.setReSTIREnabled(restirDI);
     app.setReSTIRGIEnabled(restirGI);
     app.setReSTIRPTEnabled(restirPT);
+    if (mediumAnyOverride) {
+        app.setMediumEnabled(mediumEnabled);
+        app.setMediumSigmaA(mediumSigmaA);
+        app.setMediumSigmaS(mediumSigmaS);
+        app.setMediumDensity(mediumDensity);
+        app.setMediumAnisotropy(mediumAnisotropy);
+        if (mediumKindOverride) app.setMediumDensityKind(mediumDensityKind);
+    }
     if (!outputPath.empty()) {
         app.setHeadlessOutput(outputPath, samples);
     }
