@@ -130,10 +130,17 @@ bool DLSSDContext::createFeature(
     // We pack roughness into worldNormalRoughness.w — RR §3.4.4.2 says set
     // RoughnessMode to Packed in that case.
     cp.InRoughnessMode  = NVSDK_NGX_DLSS_Roughness_Mode_Packed;
-    // Linear viewZ vs HW depth — we feed NDC clip.z/clip.w via specHitT
-    // matrices and treat the depth buffer as linear (set to Linear, since
-    // it's not actually a HW-format depth buffer).
-    cp.InUseHWDepth     = NVSDK_NGX_DLSS_Depth_Type_Linear;
+    // Depth-buffer convention: must match the data we actually feed.
+    // We bind `ndcDepth` from the split kernel — that's post-perspective
+    // NDC z (clip.z/clip.w mapped to [0,1]), i.e. HW-style depth, NOT
+    // linear view-space Z. RR §3.4.7 accepts either form but `InUseHWDepth`
+    // must agree with the buffer. Previously set to `Linear` even though
+    // we fed HW depth; the empirical shimmer impact is below measurement
+    // noise (`measure_shimmer.py` reads identical means before/after on
+    // Bistro motion), but the flag is now consistent with the buffer
+    // semantics, matching DLSS-SR's behavior (DLSS-SR doesn't expose a
+    // matching flag and treats its bound `ndcDepth` as HW depth).
+    cp.InUseHWDepth     = NVSDK_NGX_DLSS_Depth_Type_HW;
     cp.InWidth          = renderW;
     cp.InHeight         = renderH;
     cp.InTargetWidth    = outputW;
