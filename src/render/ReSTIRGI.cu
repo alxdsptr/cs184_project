@@ -255,7 +255,19 @@ __device__ inline float3 giDirectLightingAtSample(
     float pTri  = pSelect;
     float pArea = pTri / fmaxf(light.area, 1e-7f);
     float pdfOmega = pArea * d2 / fmaxf(lightCos, 1e-7f);
-    return brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f));
+    float3 Li = brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f));
+    // Source-side firefly clamp: bound the per-vertex NEE contribution so a
+    // grazing-on-emitter sample (lightCos→0 → pdfOmega→0 → Li→huge) doesn't
+    // get *stored* in the GI reservoir as `sampleRadiance`. Without this
+    // bound the temporal pass propagates the firefly forward for ~mCap
+    // frames; the destination shade-pass clamp can't undo it cleanly
+    // because the bright Lo also feeds the pHat used during merge MIS.
+    // 50 luminance matches the per-frame radiance clamp the megakernel
+    // applies to non-ReSTIR paths (PathTraceKernel.cu line 1208).
+    float lumLi = restirLuminance(Li);
+    const float liCap = 50.0f;
+    if (lumLi > liCap) Li = Li * (liCap / lumLi);
+    return Li;
 }
 
 } // anonymous namespace
@@ -632,11 +644,18 @@ __global__ void kReSTIRGI_Shade(
             // but giConnect set r2=1 and cosS=1, so the form is the same.
             L = brdf * r.sampleRadiance * (cosQ * r.W);
         }
-        // Firefly clamp — long-distance reuse can occasionally produce bright
-        // outliers that take many frames to wash out. 50.0 luminance is the
-        // standard "be aggressive but don't kill physics" cap.
+        // Firefly clamp — long-distance reuse can occasionally produce
+        // bright outliers that take many frames to wash out. Tightened
+        // from 50 → 8 luminance to fix the M7 flash-and-decay artifact
+        // (sudden ~10x bright pixel that decays over ~mCap frames). M7
+        // has 9759 small emissive triangles, so the GRIS pairwise-MIS
+        // denominator can occasionally let a near-grazing NEE-fire
+        // sample (Lo·W ≈ tens of luminance) win temporal reuse. The
+        // tighter cap bounds the per-frame indirect contribution, so a
+        // bad reservoir that survives ~mCap frames in history can't
+        // brighten the running accumulator beyond the cap.
         float lum = restirLuminance(L);
-        const float clampMax = 50.0f;
+        const float clampMax = 8.0f;
         if (lum > clampMax) L = L * (clampMax / lum);
         if (isnan(L.x) || isnan(L.y) || isnan(L.z) ||
             isinf(L.x) || isinf(L.y) || isinf(L.z)) L = make_float3(0,0,0);

@@ -237,7 +237,17 @@ __device__ inline float3 ptDirectLightingAtVertex(
     float pTri  = pSelect;
     float pArea = pTri / fmaxf(light.area, 1e-7f);
     float pdfOmega = pArea * d2 / fmaxf(lightCos, 1e-7f);
-    return brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f));
+    float3 Li = brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f));
+    // Source-side firefly clamp at the indirect bounce. Mirrors the GI
+    // path's clamp in giDirectLightingAtSample. See ReSTIRGI.cu for the
+    // rationale; in short: a grazing NEE-firefly stored in `sampleRadiance`
+    // would get propagated forward for ~mCap frames by the temporal pass.
+    // 25 luminance is tighter than GI's 50 because PT's path postfix can
+    // multiply Li through several throughput stages (random-walk bounces).
+    float lumLi = restirLuminance(Li);
+    const float liCap = 25.0f;
+    if (lumLi > liCap) Li = Li * (liCap / lumLi);
+    return Li;
 }
 
 // Resolve a BVH closest-hit into shading attributes.
@@ -749,9 +759,13 @@ __global__ void kReSTIRPT_Shade(
         // Aggressive firefly clamp on the final estimator (paper §5.4
         // bounded variance still allows occasional outliers; this caps
         // them to keep the displayed image stable while we're still in
-        // the few-sample-per-pixel regime).
+        // the few-sample-per-pixel regime). Tightened from 50 → 8 to
+        // fix the M7 flash-and-decay artifact: with 9759 emissive tris
+        // a near-grazing NEE-firefly (Le * NdotL / pdfOmega) can ride
+        // pairwise-MIS through temporal reuse and stick for ~mCap
+        // frames, brightening the accumulator long after the spike.
         float lum = restirLuminance(L);
-        const float clampMax = 50.0f;
+        const float clampMax = 8.0f;
         if (lum > clampMax) L = L * (clampMax / lum);
         if (isnan(L.x) || isnan(L.y) || isnan(L.z) ||
             isinf(L.x) || isinf(L.y) || isinf(L.z)) L = make_float3(0,0,0);
