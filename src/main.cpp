@@ -24,6 +24,10 @@ int main(int argc, char** argv) {
     bool restirGI = false;
     bool restirPT = false;
 
+    // Capture-mode CLI state. Setting --capture-tag activates it.
+    Application::CaptureOptions capOpts;
+    bool captureEnabled = false;
+
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "-e" && i + 1 < argc) {
@@ -88,6 +92,60 @@ int main(int argc, char** argv) {
             outputPath = argv[++i];
         } else if (arg == "--camera" && i + 1 < argc) {
             cameraPath = argv[++i];
+        } else if (arg == "--capture-tag" && i + 1 < argc) {
+            capOpts.tag = argv[++i];
+            captureEnabled = true;
+        } else if (arg == "--capture-out" && i + 1 < argc) {
+            capOpts.outDir = argv[++i];
+        } else if (arg == "--capture-warmup" && i + 1 < argc) {
+            int v = std::atoi(argv[++i]);
+            if (v >= 0) capOpts.warmupFrames = (uint32_t)v;
+        } else if (arg == "--capture-frames" && i + 1 < argc) {
+            int v = std::atoi(argv[++i]);
+            if (v > 0) capOpts.captureFrames = (uint32_t)v;
+        } else if (arg == "--capture-stride" && i + 1 < argc) {
+            int v = std::atoi(argv[++i]);
+            if (v > 0) capOpts.captureStride = (uint32_t)v;
+        } else if (arg == "--capture-dwell" && i + 1 < argc) {
+            // Frames to hold the camera still at each capture point before
+            // saving. Default 1 = original behavior. Use a large value (e.g.
+            // 2000) for a "near-converged reference" sweep that shares the
+            // same camera path as the test sweeps.
+            int v = std::atoi(argv[++i]);
+            if (v > 0) capOpts.dwellFrames = (uint32_t)v;
+        } else if (arg == "--capture-fps" && i + 1 < argc) {
+            // Virtual frame rate driving the camera path during the motion
+            // phase. Decoupled from the real render fps, so frame N is at
+            // the same camera pose across all ReSTIR modes regardless of
+            // their actual throughput. Default 60.
+            float v = (float)std::atof(argv[++i]);
+            if (v > 0.0f) capOpts.fixedStepFps = v;
+        // Motion-mode selector: --capture-orbit switches from the default
+        // forward-dolly to a circular orbit. Mutually exclusive with the
+        // dolly knobs (which are simply ignored when orbit is selected).
+        } else if (arg == "--capture-orbit") {
+            capOpts.motion = Application::CaptureMotion::Orbit;
+        } else if (arg == "--capture-dolly") {
+            // Explicit form for clarity; same as the default.
+            capOpts.motion = Application::CaptureMotion::Dolly;
+        } else if (arg == "--capture-speed" && i + 1 < argc) {
+            // Dolly speed in world units per second. Default 0.3 — slow
+            // enough that a 5-second capture moves the camera ~1.5 units,
+            // useful for medium-scale scenes (Sponza ~30 units across).
+            // Allow 0 explicitly: static camera is a useful capture mode
+            // for "render N spp at one fixed pose" workflows (reference
+            // sweep in run_quality_sweep.sh).
+            float v = (float)std::atof(argv[++i]);
+            if (v >= 0.0f) capOpts.dollySpeed = v;
+        } else if (arg == "--capture-period" && i + 1 < argc) {
+            // Orbit period (seconds per revolution). Only used in orbit mode.
+            float v = (float)std::atof(argv[++i]);
+            if (v > 0.0f) capOpts.orbitPeriodSeconds = v;
+        } else if (arg == "--capture-radius" && i + 1 < argc) {
+            float v = (float)std::atof(argv[++i]);
+            if (v > 0.0f) capOpts.orbitRadius = v;
+        } else if (arg == "--capture-pitch" && i + 1 < argc) {
+            capOpts.orbitPitchDeg = (float)std::atof(argv[++i]);
         } else if (arg == "-r" && i + 2 < argc) {
             int parsedWidth = std::atoi(argv[++i]);
             int parsedHeight = std::atoi(argv[++i]);
@@ -128,6 +186,9 @@ int main(int argc, char** argv) {
     }
     if (!cameraPath.empty()) {
         app.loadCameraFile(cameraPath);
+    }
+    if (captureEnabled) {
+        app.setCaptureOptions(capOpts);
     }
 
     if (!app.init(width, height, "CUDA Path Tracer", outputPath.empty())) {

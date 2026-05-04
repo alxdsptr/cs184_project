@@ -65,7 +65,72 @@ void Camera::setAspect(float a) {
     m_moved = true;
 }
 
+void Camera::setAutoDolly(float speedUnitsPerSec) {
+    m_autoMotion = AutoMotion::Dolly;
+    m_autoDollyOrigin = m_position;
+    m_autoDollyDirection = m_forward;     // freeze direction at enable time
+    m_autoDollySpeed = speedUnitsPerSec;
+    m_autoMotionElapsed = 0.0f;
+    m_moved = true;
+}
+
+void Camera::setAutoOrbit(float3 center, float radius, float periodSeconds, float pitchDeg) {
+    m_autoMotion = AutoMotion::Orbit;
+    m_autoOrbitCenter = center;
+    m_autoOrbitRadius = fmaxf(radius, 1e-3f);
+    m_autoOrbitPeriod = fmaxf(periodSeconds, 0.1f);
+    m_autoOrbitPitchDeg = clampf(pitchDeg, -89.0f, 89.0f);
+    m_autoMotionElapsed = 0.0f;
+    m_moved = true;
+}
+
 void Camera::update(float dt, const InputState& input) {
+    // ── Auto-motion override (dispatch on m_autoMotion) ───────────────────
+    // Ignores InputState. Pure function of m_autoMotionElapsed, so the same
+    // elapsed time always yields the same pose (reproducible captures).
+    if (m_autoMotion == AutoMotion::Dolly) {
+        m_autoMotionElapsed += dt;
+        float3 newPos = m_autoDollyOrigin
+                      + m_autoDollyDirection * (m_autoDollySpeed * m_autoMotionElapsed);
+        if (length(newPos - m_position) > 1e-6f) {
+            m_position = newPos;
+            // Forward stays frozen — no need to touch yaw/pitch or rebuild
+            // them, the look direction matrix is unchanged. We still need a
+            // viewMatrix update because translation changes lookAt.
+            rebuildMatrices();
+            m_moved = true;
+        } else {
+            m_moved = false;
+        }
+        return;
+    }
+    if (m_autoMotion == AutoMotion::Orbit) {
+        m_autoMotionElapsed += dt;
+        const float TWO_PI = 6.28318530718f;
+        float angle = TWO_PI * (m_autoMotionElapsed / m_autoOrbitPeriod);
+        float pitchRad = m_autoOrbitPitchDeg * (float)M_PI / 180.0f;
+        float cy = cosf(pitchRad);
+        float sy = sinf(pitchRad);
+        float3 offset = make_float3(
+            m_autoOrbitRadius * cosf(angle) * cy,
+            m_autoOrbitRadius * sy,
+            m_autoOrbitRadius * sinf(angle) * cy);
+        float3 newPos = m_autoOrbitCenter + offset;
+        float3 newFwd = normalize(m_autoOrbitCenter - newPos);
+        if (length(newPos - m_position) > 1e-6f ||
+            length(newFwd  - m_forward ) > 1e-6f) {
+            m_position = newPos;
+            m_forward  = newFwd;
+            m_yaw   = atan2f(m_forward.z, m_forward.x) * 180.0f / (float)M_PI;
+            m_pitch = asinf(clampf(m_forward.y, -0.999f, 0.999f)) * 180.0f / (float)M_PI;
+            rebuildMatrices();
+            m_moved = true;
+        } else {
+            m_moved = false;
+        }
+        return;
+    }
+
     m_moved = false;
     float speed = m_moveSpeed * dt;
 
@@ -192,24 +257,45 @@ CameraParams Camera::getParams(uint32_t frameIndex) const {
     p.projMatrix   = m_projMatrix;
     p.frameIndex   = frameIndex;
 
-    // Jittered view-proj for rendering
-    float2 jitter = haltonJitter(frameIndex);
-    p.jitterOffset = jitter;
+    // ── Halton jitter TEMPORARILY DISABLED ────────────────────────────────
+    // The Halton sub-pixel jitter is here purely for DLSS / NRD: those
+    // upscalers use it as their temporal-accumulation phase. But it leaks
+    // into ReSTIR and the Native path-tracer kernel because the ReSTIR
+    // init pass uses `camera.jitterOffset` for its primary ray, and the
+    // path tracer's bounce-0 must then mirror that exact sub-pixel offset
+    // (otherwise the cached reservoir's pHat/W applies to a different
+    // surface point than the one being shaded). See PathTraceKernel.cu:354
+    // for the lock.
+    //
+    // Outputting zero makes the primary ray pass through pixel centre for
+    // both ReSTIR and the path tracer — ReSTIR-vs-path-tracer alignment
+    // still holds (both see jitterOffset = 0), and the path tracer's
+    // Native branch falls back to its per-sample random jitter for AA.
+    //
+    // To restore (when wiring DLSS back up): change the next two lines to
+    //     float2 jitter = haltonJitter(frameIndex);
+    //     p.jitterOffset = jitter;
+    p.jitterOffset = make_float2(0.0f, 0.0f);
 
-    // Apply sub-pixel jitter to projection matrix
-    float4x4 jitteredProj = m_projMatrix;
-    // Jitter offset is in pixel units; convert to NDC for the projection matrix
-    // Not applied here (done in kernel via ray offset) -- store for DLSS
+    // (Kept for future DLSS work — proj matrix is NEVER itself jittered;
+    // the offset is applied at ray-gen time in pixel space.)
     p.viewProjMatrix    = mat4_multiply(m_projMatrix, m_viewMatrix);
     p.prevViewProjMatrix = m_prevViewProj;
     p.prevViewMatrix     = m_prevViewMatrix;
     p.prevProjMatrix     = m_prevProjMatrix;
 
-    // Update prev for next frame (const_cast needed since we cache prev)
-    Camera* self = const_cast<Camera*>(this);
-    self->m_prevViewProj    = p.viewProjMatrix;
-    self->m_prevViewMatrix  = m_viewMatrix;
-    self->m_prevProjMatrix  = m_projMatrix;
+    // NB: prev-frame matrices are advanced explicitly by the per-frame
+    // tick (Camera::advanceFrame), not as a side-effect of getParams().
+    // Otherwise any GUI/overlay code that calls getParams() a second time
+    // in the same frame (e.g. the normal-arrow overlay) would overwrite
+    // the prev matrices with the current ones, zeroing out the next
+    // frame's motion vectors and breaking ReSTIR temporal reprojection.
 
     return p;
+}
+
+void Camera::advanceFrame() {
+    m_prevViewProj    = mat4_multiply(m_projMatrix, m_viewMatrix);
+    m_prevViewMatrix  = m_viewMatrix;
+    m_prevProjMatrix  = m_projMatrix;
 }

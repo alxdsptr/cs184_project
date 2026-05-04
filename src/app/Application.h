@@ -35,6 +35,75 @@ public:
     // loadScene().
     void setEmissiveTargetLum(float v) { m_emissiveTargetLum = v; }
     void setHeadlessOutput(const std::string& outputPath, uint32_t sampleCount);
+
+    // ── Capture mode: deterministic camera path + periodic screenshot dump ─
+    // Two motion modes, selected by CaptureOptions::motion:
+    //
+    //   Dolly  (default) — camera slides forward along its starting view
+    //     direction at `dollySpeed` units/sec. Best for stress-testing ReSTIR
+    //     temporal reprojection: linear translation along the view axis lets
+    //     most pixels keep their reservoir history through the geometric
+    //     reuse gates.
+    //   Orbit            — camera circles a centre at `orbitPeriodSeconds`
+    //     per revolution. Stresses the gates much harder; more dramatic
+    //     visible difference between modes but harsher conditions for
+    //     ReSTIR. Use this when you specifically want to evaluate behaviour
+    //     under rotation.
+    //
+    // Other knobs:
+    //   warmupFrames     — frames to render BEFORE motion starts, so ReSTIR
+    //                       temporal can build up a healthy reservoir at the
+    //                       start pose.
+    //   captureFrames    — total frames in the motion phase.
+    //   captureStride    — save one PNG every K frames during the motion.
+    //
+    // Output layout:  <outDir>/<tag>_NNNNNN.png  +  <outDir>/<tag>_meta.json
+    //
+    // Setting m_captureEnabled = true (via setCaptureOptions) activates the
+    // pipeline; the app exits after the last frame is saved.
+    enum class CaptureMotion { Dolly, Orbit };
+    struct CaptureOptions {
+        std::string tag = "capture";
+        std::string outDir = "screenshots";
+        uint32_t warmupFrames = 60;
+        uint32_t captureFrames = 600;
+        uint32_t captureStride = 30;
+
+        // At every capture point, hold the camera still for this many frames
+        // before saving. Motion is paused for the dwell (camera receives dt=0)
+        // so the path-tracer accumulator keeps integrating into the same
+        // pose's image. With dwell=1 (default) the loop behaves as before:
+        // capture every Kth motion frame at 1 spp. With dwell=2000 the
+        // reference sweep produces a near-converged image at each capture
+        // point, sharing the exact same camera path as the test sweeps so
+        // per-frame-index comparison stays meaningful.
+        uint32_t dwellFrames = 1;
+
+        // Fixed virtual frame rate driving the camera path during the motion
+        // phase. We override the real `dt` inside the capture loop so that
+        // frame N maps to a deterministic camera pose regardless of how fast
+        // each ReSTIR mode actually renders. Without this, fps differences
+        // (native ~100 fps vs restir-pt ~30 fps) cause the same frame index
+        // across modes to land at very different camera positions, making
+        // per-frame-index image comparison meaningless.
+        float fixedStepFps = 60.0f;
+
+        // Which motion to run. Default is Dolly — empirically friendlier to
+        // ReSTIR temporal reuse and what most users want when they say
+        // "render the scene with the camera moving slowly".
+        CaptureMotion motion = CaptureMotion::Dolly;
+
+        // Dolly knobs.
+        float dollySpeed = 0.3f;    // world units / second along start fwd
+
+        // Orbit knobs (only used when motion == Orbit).
+        float    orbitPeriodSeconds = 12.0f;
+        float    orbitRadius = 0.0f;     // 0 → derived from initial camera distance to scene centre
+        float    orbitPitchDeg = 15.0f;
+        float3   orbitCenter = make_float3(0, 0, 0);
+        bool     orbitCenterFromScene = true; // if true, use scene AABB centre
+    };
+    void setCaptureOptions(const CaptureOptions& o) { m_captureOpts = o; m_captureEnabled = true; }
     // Toggle ReSTIR DI / GI passes. Pre-init these are stored and applied
     // after Renderer::init in Application::init().
     void setReSTIREnabled(bool on)    { m_pendingReSTIRDI = on; }
@@ -135,4 +204,25 @@ private:
     uint32_t m_targetSamples = 1;
     double m_headlessRenderMs = 0.0;
     double m_headlessTotalMs = 0.0;
+
+    // Capture-mode state.
+    bool   m_captureEnabled = false;
+    CaptureOptions m_captureOpts;
+    uint32_t m_captureFramesElapsed = 0;
+    uint32_t m_captureFramesSaved   = 0;
+    // Per-saved-frame timing (ms). Dumped to <outDir>/<tag>_meta.json.
+    std::vector<double> m_captureFrameMs;
+    std::vector<uint32_t> m_captureSavedIndices;
+    // Cumulative wall-clock at capture start so meta.json can report mean fps.
+    double m_captureStartTime = 0.0;
+    // Dwell/motion state machine (post-warmup). At each capture point we
+    // dwell for dwellFrames frames with motion paused (so the path-tracer
+    // accumulator integrates more samples at the same pose), then advance
+    // the camera by `captureStride` motion frames at fixedStepFps before
+    // the next dwell. Saved-file index uses m_captureMotionFrames so all
+    // sweeps that share warmup/captureFrames/captureStride/fixedStepFps land
+    // on the same per-pose camera path regardless of dwell.
+    uint32_t m_captureMotionFrames    = 0;  // motion frames issued since warmup
+    uint32_t m_captureDwellRemaining  = 0;  // >0 means we're in a dwell phase
+    uint32_t m_captureMotionRemaining = 0;  // >0 means we're advancing motion
 };

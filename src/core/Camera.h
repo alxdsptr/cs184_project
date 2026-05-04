@@ -47,6 +47,13 @@ public:
     void setClipPlanes(float nearPlane, float farPlane);
 
     CameraParams getParams(uint32_t frameIndex) const;
+    // Call EXACTLY once per displayed frame, after the renderer has consumed
+    // CameraParams. Snapshots the current view/proj as "prev" for the next
+    // frame's motion vectors. `getParams()` itself is now side-effect-free,
+    // so GUI/overlay code may call it freely without disturbing temporal
+    // reprojection (the bug that broke ReSTIR PT/GI history when the normal-
+    // arrow overlay was on).
+    void advanceFrame();
     bool hasMoved() const { return m_moved; }
     void setAspect(float a);
 
@@ -58,6 +65,33 @@ public:
     void lockMovementFrame();
     void unlockMovementFrame() { m_frameLocked = false; }
     bool isMovementFrameLocked() const { return m_frameLocked; }
+
+    // ── Deterministic auto-motion (for benchmarking / captures) ───────────
+    // Two modes available:
+    //
+    //   AUTO_DOLLY  (default for capture mode) — slides the camera along its
+    //     `m_forward` axis at constant speed. The forward direction is frozen
+    //     at enable time so the camera keeps pointing in whatever direction
+    //     the user/scene placed it. Best for stress-testing ReSTIR temporal
+    //     reprojection: translation along the view axis is sympathetic to
+    //     normal-dot and position-drift gates, so most pixels keep history.
+    //
+    //   AUTO_ORBIT  — circles `center` on a horizontal arc of `radius` with
+    //     `pitchDeg` elevation. Always looks at the centre. Stresses the
+    //     reprojection gates much harder; useful when you want to see how
+    //     ReSTIR copes with continuous rotation.
+    //
+    // Both are pure functions of their elapsed time, so identical capture
+    // settings → identical frame sequence between runs → meaningful per-mode
+    // quality comparison.
+    void setAutoDolly(float speedUnitsPerSec);
+    void setAutoOrbit(float3 center, float radius, float periodSeconds,
+                      float pitchDeg = 15.0f);
+    void clearAutoMotion() { m_autoMotion = AutoMotion::None; }
+    bool isAutoMoving() const { return m_autoMotion != AutoMotion::None; }
+    // Resets phase so subsequent updates trace a reproducible path regardless
+    // of when auto-motion was enabled in the session.
+    void resetAutoMotionPhase() { m_autoMotionElapsed = 0.0f; }
 
     bool saveToFile(const std::string& path) const;
     bool loadFromFile(const std::string& path);
@@ -72,7 +106,9 @@ private:
     float  m_aspect   = 16.0f / 9.0f;
     float  m_nearPlane = 0.01f;
     float  m_farPlane  = 1000.0f;
-    float  m_moveSpeed  = 3.0f;
+    // Default move speed — was 3.0; lowered to 0.9 (=30%) per user feedback;
+    // 3.0 was uncomfortably fast for fine-grained inspection.
+    float  m_moveSpeed  = 0.9f;
     float  m_mouseSens  = 0.15f;
 
     float3   m_forward = make_float3(0, 0, -1);
@@ -92,4 +128,20 @@ private:
     float3 m_lockedForward = make_float3(0, 0, -1);
     float3 m_lockedRight   = make_float3(1, 0, 0);
     float3 m_lockedUp      = make_float3(0, 1, 0);
+
+    // Auto-motion state. When m_autoMotion != None, update() ignores input.
+    enum class AutoMotion { None, Dolly, Orbit };
+    AutoMotion m_autoMotion = AutoMotion::None;
+    float      m_autoMotionElapsed = 0.0f;
+
+    // Dolly: linear slide along a frozen forward direction.
+    float3 m_autoDollyOrigin    = make_float3(0, 0, 0);
+    float3 m_autoDollyDirection = make_float3(0, 0, -1);
+    float  m_autoDollySpeed     = 0.5f;
+
+    // Orbit: rotate around centre with pitch elevation, looking at centre.
+    float3 m_autoOrbitCenter    = make_float3(0, 0, 0);
+    float  m_autoOrbitRadius    = 1.0f;
+    float  m_autoOrbitPeriod    = 8.0f;
+    float  m_autoOrbitPitchDeg  = 15.0f;
 };

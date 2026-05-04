@@ -15,10 +15,19 @@
 #include <cctype>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <map>
 #include <unordered_map>
+
+#ifdef _WIN32
+// For GetModuleFileNameW — used in init() to resolve the .exe directory so
+// runtime assets (optix_programs.optixir) are found regardless of CWD.
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
@@ -189,10 +198,23 @@ bool Application::init(uint32_t width, uint32_t height, const std::string& title
 #ifdef PATHTRACER_OPTIX_ENABLED
     if (m_backendKind == 1) {
         auto optix = std::make_unique<OptiXBackend>();
-        std::filesystem::path exeDir = std::filesystem::current_path();
+        // Resolve the actual .exe directory (not the CWD). This used to use
+        // current_path(), which broke when the exe was launched with a full
+        // path from a different working directory (e.g. our capture-mode
+        // batch script that runs `pathtracer.exe` while CWD is the project
+        // root so scene paths resolve naturally). VulkanDisplay already does
+        // the GetModuleFileNameW dance for shaders/; mirror it here.
+        std::filesystem::path exeDir;
+#ifdef _WIN32
+        wchar_t buf[MAX_PATH];
+        DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+        if (n > 0) exeDir = std::filesystem::path(std::wstring(buf, n)).parent_path();
+#endif
+        if (exeDir.empty()) exeDir = std::filesystem::current_path();
         std::filesystem::path irPath = exeDir / "optix_programs.optixir";
         if (!std::filesystem::exists(irPath)) {
-            // Fall back: some IDEs set CWD to project root, not exe dir.
+            // Fall back to CWD-relative — preserved for backwards compat with
+            // older invocations that copy the .optixir into the project root.
             irPath = std::filesystem::path("optix_programs.optixir");
         }
         if (optix->init(irPath.string())) {
@@ -328,6 +350,45 @@ bool Application::loadScene(const std::string& path) {
     }
 
     m_renderer.resetAccumulation();
+
+    // ── Capture-mode: configure deterministic motion at scene load ────────
+    // We DON'T enable auto-motion yet — leave the camera static for the
+    // warmup phase so ReSTIR temporal can build a healthy reservoir at the
+    // start pose. Motion kicks in after warmupFrames inside the run loop.
+    if (m_captureEnabled) {
+        const char* motionName =
+            (m_captureOpts.motion == CaptureMotion::Dolly) ? "dolly" : "orbit";
+        if (m_captureOpts.motion == CaptureMotion::Dolly) {
+            LOG_INFO("Capture mode: tag='%s' motion=dolly speed=%.3f u/s "
+                     "warmup=%u capture=%u stride=%u",
+                     m_captureOpts.tag.c_str(),
+                     m_captureOpts.dollySpeed,
+                     m_captureOpts.warmupFrames,
+                     m_captureOpts.captureFrames,
+                     m_captureOpts.captureStride);
+        } else {
+            const AABB& bounds = m_scene.getBounds();
+            float3 center = m_captureOpts.orbitCenterFromScene
+                ? (bounds.empty() ? make_float3(0, 0, 0) : bounds.center())
+                : m_captureOpts.orbitCenter;
+            float radius = m_captureOpts.orbitRadius;
+            if (radius <= 0.0f) {
+                float3 d = m_camera.getPosition() - center;
+                radius = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
+                if (radius < 0.5f) radius = 0.5f;
+            }
+            LOG_INFO("Capture mode: tag='%s' motion=orbit center=(%.3f,%.3f,%.3f) "
+                     "radius=%.3f period=%.2fs warmup=%u capture=%u stride=%u",
+                     m_captureOpts.tag.c_str(),
+                     center.x, center.y, center.z, radius,
+                     m_captureOpts.orbitPeriodSeconds,
+                     m_captureOpts.warmupFrames,
+                     m_captureOpts.captureFrames,
+                     m_captureOpts.captureStride);
+        }
+        (void)motionName;
+    }
+
     return true;
 }
 
@@ -481,7 +542,8 @@ void Application::renderSceneSample(uchar4* d_pbo, bool timeHeadless) {
         m_renderer.renderFrame(camParams, sceneData, m_backend.get(), d_pbo,
                                m_enableEnvironment, m_maxBounces,
                                m_samplesPerFrame,
-                               &m_display, m_frameIndex);
+                               &m_display, m_frameIndex,
+                               m_camera.hasMoved());
 
         // Read back the sparse arrow samples for the GUI overlay to draw.
         if (m_showNormalArrows && m_d_debugArrows && m_debugArrowGridW > 0) {
@@ -526,7 +588,25 @@ void Application::runGui() {
         }
 
         processInput();
-        m_camera.update(dt, m_input);
+        // In capture mode, once we're in the motion phase, ignore the real
+        // wall-clock dt and feed the camera a fixed virtual time step. This
+        // keeps the camera path purely a function of frame index, so the
+        // same frame N across different ReSTIR modes (each rendering at a
+        // different real fps) lands at exactly the same camera pose.
+        // Without this, frame N is at a different position in each mode and
+        // per-frame-index image comparison is meaningless.
+        //
+        // While we're dwelling at a capture point (dwellRemaining > 0), feed
+        // dt=0 so the auto-motion clock doesn't advance — the path-tracer
+        // accumulator can keep integrating at the same pose. Motion only
+        // advances during the explicit "advance to next capture point" phase.
+        float updateDt = dt;
+        if (m_captureEnabled && m_sceneLoaded && m_camera.isAutoMoving()) {
+            float fps = m_captureOpts.fixedStepFps > 0.0f
+                ? m_captureOpts.fixedStepFps : 60.0f;
+            updateDt = (m_captureDwellRemaining > 0) ? 0.0f : (1.0f / fps);
+        }
+        m_camera.update(updateDt, m_input);
 
         if (fabs(m_pendingScrollY) > 1e-6) {
             float zoomFactor = powf(0.88f, (float)m_pendingScrollY);
@@ -612,6 +692,134 @@ void Application::runGui() {
             } else {
                 LOG_ERROR("Failed to save screenshot: %s", name.str().c_str());
             }
+        }
+
+        // ── Capture-mode driver ──────────────────────────────────────────
+        // Phase 1 (warmup): camera static, ReSTIR temporal hot-up.
+        // Phase 2 (capture): alternate dwell (motion paused, accumulate) and
+        //                    advance (motion runs forward by `stride` frames).
+        //                    On the final frame of each dwell we save a PNG
+        //                    indexed by motion-frame count, so all sweeps
+        //                    share the same per-pose camera path.
+        // Phase 3: write meta.json and quit.
+        if (m_captureEnabled && m_sceneLoaded) {
+            uint32_t capIdx = m_captureFramesElapsed;
+            uint32_t dwellFrames = m_captureOpts.dwellFrames > 0
+                ? m_captureOpts.dwellFrames : 1;
+            if (capIdx == m_captureOpts.warmupFrames) {
+                // Transition into capture phase: enable the configured motion
+                // and queue up the first dwell at motion frame 0.
+                if (m_captureOpts.motion == CaptureMotion::Dolly) {
+                    m_camera.setAutoDolly(m_captureOpts.dollySpeed);
+                    LOG_INFO("Capture: warmup done, dolly speed=%.3f for %u motion frames "
+                             "(dwell=%u, stride=%u)",
+                             m_captureOpts.dollySpeed,
+                             m_captureOpts.captureFrames,
+                             dwellFrames,
+                             m_captureOpts.captureStride);
+                } else {
+                    const AABB& bounds = m_scene.getBounds();
+                    float3 center = m_captureOpts.orbitCenterFromScene
+                        ? (bounds.empty() ? make_float3(0, 0, 0) : bounds.center())
+                        : m_captureOpts.orbitCenter;
+                    float radius = m_captureOpts.orbitRadius;
+                    if (radius <= 0.0f) {
+                        float3 d = m_camera.getPosition() - center;
+                        radius = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
+                        if (radius < 0.5f) radius = 0.5f;
+                    }
+                    m_camera.setAutoOrbit(center, radius,
+                                          m_captureOpts.orbitPeriodSeconds,
+                                          m_captureOpts.orbitPitchDeg);
+                    LOG_INFO("Capture: warmup done, orbit for %u motion frames "
+                             "(dwell=%u, stride=%u)",
+                             m_captureOpts.captureFrames,
+                             dwellFrames,
+                             m_captureOpts.captureStride);
+                }
+                m_captureStartTime = glfwGetTime();
+                m_captureMotionFrames    = 0;
+                m_captureDwellRemaining  = dwellFrames;
+                m_captureMotionRemaining = 0;
+            }
+            if (capIdx >= m_captureOpts.warmupFrames) {
+                m_captureFrameMs.push_back((double)dt * 1000.0);
+
+                if (m_captureDwellRemaining > 0) {
+                    // Final dwell frame at this capture point: save then queue
+                    // up the next advance (or finish if we'd exceed the budget).
+                    if (m_captureDwellRemaining == 1) {
+                        std::filesystem::create_directories(m_captureOpts.outDir);
+                        std::ostringstream name;
+                        name << m_captureOpts.outDir << "/" << m_captureOpts.tag << "_"
+                             << std::setw(6) << std::setfill('0')
+                             << m_captureMotionFrames << ".png";
+                        if (m_display.saveToPNG(name.str())) {
+                            m_captureSavedIndices.push_back(m_captureMotionFrames);
+                            m_captureFramesSaved++;
+                        } else {
+                            LOG_ERROR("Capture: failed to save %s", name.str().c_str());
+                        }
+                        // Decide whether another capture point fits.
+                        uint32_t nextMotionIdx = m_captureMotionFrames
+                                                + m_captureOpts.captureStride;
+                        if (nextMotionIdx >= m_captureOpts.captureFrames) {
+                            m_captureMotionRemaining = 0;
+                            // Dump meta.json and quit.
+                            double totalSec = glfwGetTime() - m_captureStartTime;
+                            double meanFps = totalSec > 0.0
+                                ? (double)m_captureFramesElapsed / totalSec
+                                : 0.0;
+                            std::filesystem::create_directories(m_captureOpts.outDir);
+                            std::ostringstream meta;
+                            meta << m_captureOpts.outDir << "/" << m_captureOpts.tag << "_meta.json";
+                            std::ofstream mf(meta.str());
+                            if (mf.is_open()) {
+                                mf << "{\n";
+                                mf << "  \"tag\": \"" << m_captureOpts.tag << "\",\n";
+                                mf << "  \"warmup_frames\": " << m_captureOpts.warmupFrames << ",\n";
+                                mf << "  \"capture_frames\": " << m_captureOpts.captureFrames << ",\n";
+                                mf << "  \"capture_stride\": " << m_captureOpts.captureStride << ",\n";
+                                mf << "  \"dwell_frames\": " << dwellFrames << ",\n";
+                                mf << "  \"orbit_period_s\": " << m_captureOpts.orbitPeriodSeconds << ",\n";
+                                mf << "  \"saved_count\": " << m_captureFramesSaved << ",\n";
+                                mf << "  \"total_seconds\": " << totalSec << ",\n";
+                                mf << "  \"mean_fps\": " << meanFps << ",\n";
+                                mf << "  \"width\": " << m_width << ",\n";
+                                mf << "  \"height\": " << m_height << ",\n";
+                                mf << "  \"frame_ms\": [";
+                                for (size_t i = 0; i < m_captureFrameMs.size(); i++) {
+                                    if (i) mf << ", ";
+                                    mf << m_captureFrameMs[i];
+                                }
+                                mf << "],\n";
+                                mf << "  \"saved_indices\": [";
+                                for (size_t i = 0; i < m_captureSavedIndices.size(); i++) {
+                                    if (i) mf << ", ";
+                                    mf << m_captureSavedIndices[i];
+                                }
+                                mf << "]\n";
+                                mf << "}\n";
+                                LOG_INFO("Capture: wrote %s (%u images, mean %.1f fps over %.2fs)",
+                                         meta.str().c_str(), m_captureFramesSaved, meanFps, totalSec);
+                            }
+                            glfwSetWindowShouldClose(m_window, true);
+                        } else {
+                            m_captureMotionRemaining = m_captureOpts.captureStride;
+                        }
+                    }
+                    m_captureDwellRemaining--;
+                } else if (m_captureMotionRemaining > 0) {
+                    // Motion advance frame: camera dt was 1/fps, so the camera
+                    // pose moved one virtual step toward the next capture point.
+                    m_captureMotionFrames++;
+                    m_captureMotionRemaining--;
+                    if (m_captureMotionRemaining == 0) {
+                        m_captureDwellRemaining = dwellFrames;
+                    }
+                }
+            }
+            m_captureFramesElapsed++;
         }
 
         m_gui.beginFrame();
@@ -725,6 +933,12 @@ void Application::runGui() {
         m_gui.endFrame();
 
         m_display.present();
+        // Snapshot current view/proj as "prev" for next frame's motion
+        // vectors. Must come AFTER all getParams() calls of this frame
+        // (renderer + any GUI overlay), otherwise the next frame's
+        // reprojection would compare against this-frame matrices and
+        // motion vectors would collapse to zero.
+        m_camera.advanceFrame();
         m_frameIndex++;
     }
 }
@@ -751,6 +965,7 @@ void Application::runHeadless() {
             glfwSetWindowShouldClose(m_window, true);
         }
 
+        m_camera.advanceFrame();
         m_frameIndex++;
     }
 }

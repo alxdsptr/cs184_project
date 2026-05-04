@@ -12,4 +12,6 @@ dae/
 *.png
 build1
 build-*/
-tools/
+tools/optix_uchar4_repro
+optix-native/
+*.bat
