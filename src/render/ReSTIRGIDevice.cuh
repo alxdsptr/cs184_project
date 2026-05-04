@@ -242,6 +242,25 @@ __device__ inline float giJacobian(
 //                           defensive pairwise MIS (paper Eq. 38). Single-
 //                           pass and order-independent in expectation.
 //
+// ── Defensive resampling-weight clamps (M7 flash-and-decay fix) ─────────────
+// Same rationale as the DI clamps in ReSTIRDevice.cuh: with 9759+ small
+// emissive triangles, BSDF-sampled candidates that land near-grazing on a
+// triangle produce p̂/p_src ratios of order 1e6+ in fp32. Once such a sample
+// wins RIS, GRIS's m_i · p̂(y_i) · W_i · jac propagates it through every
+// peer's MIS denominator and the spatial/temporal merge keeps it dominant
+// for ~mCap frames. Lin et al. §5.4 explicitly warns the resampling weight
+// must be bounded for the convergence proof of Thm A.4 to hold; clamping
+// here enforces that bound.
+#ifndef RESTIR_GI_MAX_WCAND
+#define RESTIR_GI_MAX_WCAND 1.0e4f
+#endif
+#ifndef RESTIR_GI_MAX_W
+#define RESTIR_GI_MAX_W     1.0e4f
+#endif
+#ifndef RESTIR_GI_MAX_MERGE_W
+#define RESTIR_GI_MAX_MERGE_W 1.0e6f
+#endif
+
 // Initial-candidate RIS finalisation. For an M-candidate canonical RIS pass
 // (Talbot weights m_i = 1/M, paper Eq. 5):
 //     W = (1/M) · Σ p̂/p_src / p̂(Y)
@@ -252,7 +271,16 @@ __device__ inline void giReservoirFinalize(GIReservoir& r, float wSum) {
         r.W = 0.0f;
         return;
     }
-    r.W = wSum / (r.pHat * r.M);
+    float W = wSum / (r.pHat * r.M);
+    // Bound the contribution weight: once W is large, the next frame's
+    // temporal pass cap-then-merges it with new candidates, and the
+    // multiplier `M·p̂·W` in pairwise MIS keeps the bad sample winning.
+    // The spatial pass then broadcasts it to neighbors. Capping here is
+    // the cleanest single point of defense that survives both the
+    // temporal-cap displacement window AND the spatial broadcast.
+    if (W > RESTIR_GI_MAX_W) W = RESTIR_GI_MAX_W;
+    if (!isfinite(W)) W = 0.0f;
+    r.W = W;
 }
 
 // Append a canonical candidate produced at the destination surface.
@@ -278,6 +306,12 @@ __device__ inline bool gris_streamCandidate(
     if (!(pSrc > 0.0f) || !(pHat > 0.0f)) return false;
 
     float w = pHat / pSrc;
+    // Defensive clamp at the source: a near-zero pSrc (e.g. very narrow
+    // GGX lobe BSDF sample landing on a near-grazing emitter) can blow w
+    // up. Lin et al. Thm A.4 needs bounded w for Var[Σwᵢ] convergence;
+    // we enforce that bound directly.
+    if (w > RESTIR_GI_MAX_WCAND) w = RESTIR_GI_MAX_WCAND;
+    if (!isfinite(w)) return false;
     wSum += w;
     if (u01 * wSum < w) {
         r.visiblePos     = visiblePos;
@@ -379,6 +413,11 @@ __device__ inline void gris_mergeMultiPair(
         }
         // Eq. 19 with identity shift: w_dst = m_dst · p̂(y_R) · W_dst.
         float w_dst = m_dst * pHatR * held.W;
+        if (!isfinite(w_dst) || !(w_dst > 0.0f)) {
+            w_dst = 0.0f;
+        } else if (w_dst > RESTIR_GI_MAX_MERGE_W) {
+            w_dst = RESTIR_GI_MAX_MERGE_W;
+        }
         if (w_dst > 0.0f) wSum += w_dst;
     }
 
@@ -418,7 +457,10 @@ __device__ inline void gris_mergeMultiPair(
 
         // Eq. 19: w_i = m_i · p̂(y_i) · W_i · jac
         float w_i = m_i * pHatYi * src.W * jac;
-        if (!(w_i > 0.0f)) continue;
+        if (!isfinite(w_i) || !(w_i > 0.0f)) continue;
+        // Same bound as the held term — a peer with an outsized W·M·jac
+        // product would otherwise hijack the destination's reservoir.
+        if (w_i > RESTIR_GI_MAX_MERGE_W) w_i = RESTIR_GI_MAX_MERGE_W;
 
         wSum += w_i;
 
@@ -442,7 +484,10 @@ __device__ inline void gris_mergeMultiPair(
     // Update confidence sum, finalise W via Eq. 22.
     dst.M = M;
     if (dst.valid && dst.pHat > 0.0f) {
-        dst.W = wSum / dst.pHat;
+        float W = wSum / dst.pHat;
+        if (W > RESTIR_GI_MAX_W) W = RESTIR_GI_MAX_W;
+        if (!isfinite(W)) W = 0.0f;
+        dst.W = W;
     } else {
         dst.W = 0.0f;
     }

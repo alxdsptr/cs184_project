@@ -160,7 +160,14 @@ __device__ inline float3 ptDirectLightingAtVertexOptiX(
     float pTri  = pSelect;
     float pArea = pTri / fmaxf(light.area, 1e-7f);
     float pdfOmega = pArea * d2 / fmaxf(lightCos, 1e-7f);
-    return brdf * Le * trans * (NdotL / fmaxf(pdfOmega, 1e-7f));
+    float3 Li = brdf * Le * trans * (NdotL / fmaxf(pdfOmega, 1e-7f));
+    // Source-side firefly clamp — see render/ReSTIRPT.cu and
+    // OptiXProgramsGI.inl for the M7 flash-and-decay rationale.
+    // Match the CUDA kernel's PT-tightened cap (25, vs GI's 50).
+    float lumLi = restirLuminance(Li);
+    const float liCap = 25.0f;
+    if (lumLi > liCap) Li = Li * (liCap / lumLi);
+    return Li;
 }
 
 // Resolve a hit record (from rp = traceRadianceRay) into shading attributes.

@@ -157,7 +157,16 @@ __device__ inline float3 giDirectLightingAtSampleOptiX(
     float pTri  = pSelect;
     float pArea = pTri / fmaxf(light.area, 1e-7f);
     float pdfOmega = pArea * d2 / fmaxf(lightCos, 1e-7f);
-    return brdf * Le * trans * (NdotL / fmaxf(pdfOmega, 1e-7f));
+    float3 Li = brdf * Le * trans * (NdotL / fmaxf(pdfOmega, 1e-7f));
+    // Source-side firefly clamp — mirror the CUDA kernel
+    // (render/ReSTIRGI.cu giDirectLightingAtSample). M7 with 9759 small
+    // emissive triangles produces grazing NEE samples whose 1/pdfOmega
+    // term spikes Li. Without this clamp the bright Lo gets stored in
+    // the GI reservoir's `sampleRadiance` and persists for ~mCap frames.
+    float lumLi = restirLuminance(Li);
+    const float liCap = 50.0f;
+    if (lumLi > liCap) Li = Li * (liCap / lumLi);
+    return Li;
 }
 
 } // namespace gi_optix
