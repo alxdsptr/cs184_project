@@ -273,9 +273,11 @@ CameraParams Camera::getParams(uint32_t frameIndex) const {
     //                bounce-0 (PathTraceKernel.cu:354 takes the same Halton
     //                value when ReSTIR is active).
     //
-    // 16 phases is the DLSS guide minimum (32 preferred); we keep 16 here so
-    // sample patterns stay short enough that auto-capture sequences are
-    // reproducible across runs.
+    // 32 phases satisfies the DLSS guide minimum up through Performance
+    // quality (Programming Guide §3.7.1.1: 18 / 24 / 32 phases for
+    // Quality / Balanced / Performance respectively). The previous default
+    // of 16 was *below* minimum for every quality except DLAA and caused
+    // the per-pattern repetition itself to appear as motion shimmer.
     p.jitterOffset = haltonJitter(frameIndex);
 
     // (Kept for future DLSS work — proj matrix is NEVER itself jittered;
