@@ -1901,8 +1901,15 @@ extern "C" __global__ void __raygen__restir_init_candidates()
                 if (!lightBVH_sample(scene.d_lightBVHNodes,
                                      scene.lightBVHRootIndex,
                                      surf.position, u, slot, pSelect) ||
-                    !(pSelect > 0.0f))
+                    !(pSelect > 0.0f)) {
+                    // Parity with render/ReSTIR.cu kReSTIR_InitCandidates:
+                    // count failed BVH descents toward M so finalize divides
+                    // by the true number of candidates considered. Otherwise
+                    // shading points where the BVH frequently rejects (above
+                    // / behind a tight light cluster) get an inflated W.
+                    r.M += 1.0f;
                     continue;
+                }
                 uint32_t lightIdx = scene.d_lightOrderedIndices[slot];
                 GPUAreaLight light = scene.d_areaLights[lightIdx];
 
