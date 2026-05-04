@@ -74,8 +74,12 @@ __global__ void kReSTIR_InitCandidates(
     // Dedicated RNG stream so ReSTIR and the main kernel don't correlate.
     // A different salt (0xA1B2C3D4u) ensures independent trajectories even
     // when sampleIndex matches.
-    uint32_t rng = pcg32_seed(pixelIdx * 0xA1B2C3D4u + sampleIndex,
-                              sampleIndex * 0xDEADBEEFu + 1u);
+    // Mix camera.frameIndex into the salt: sampleIndex is reset to 0 by
+    // resetAccumulation() on every camera tick, so without frameIndex the
+    // ReSTIR canonical sample would be identical every frame during motion.
+    uint32_t seedSalt = sampleIndex + camera.frameIndex * 0x9E3779B9u;
+    uint32_t rng = pcg32_seed(pixelIdx * 0xA1B2C3D4u + seedSalt,
+                              seedSalt * 0xDEADBEEFu + 1u);
 
     float jx = camera.jitterOffset.x;
     float jy = camera.jitterOffset.y;
@@ -209,6 +213,7 @@ __global__ void kReSTIR_Temporal(
     uint32_t width, uint32_t height,
     uint32_t prevWidth, uint32_t prevHeight,
     uint32_t sampleIndex,
+    uint32_t frameIndex,
     uint32_t mCap)
 {
     uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -220,8 +225,9 @@ __global__ void kReSTIR_Temporal(
     ReSTIRSurface   s = surfCurr[pixelIdx];
     if (s.valid < 0.5f) { return; }
 
-    uint32_t rng = pcg32_seed(pixelIdx * 0x5F356495u + sampleIndex,
-                              sampleIndex * 0xB5297A4Du + 2u);
+    uint32_t seedSalt = sampleIndex + frameIndex * 0x9E3779B9u;
+    uint32_t rng = pcg32_seed(pixelIdx * 0x5F356495u + seedSalt,
+                              seedSalt * 0xB5297A4Du + 2u);
 
     // Reproject. `s.prevPixel` holds the pixel coordinate in the previous
     // frame for this shading point.
@@ -271,6 +277,7 @@ __global__ void kReSTIR_Spatial(
     const ReSTIRSurface*   surf,
     uint32_t width, uint32_t height,
     uint32_t sampleIndex,
+    uint32_t frameIndex,
     uint32_t numNeighbors,
     float    radiusPixels)
 {
@@ -283,8 +290,9 @@ __global__ void kReSTIR_Spatial(
     ReSTIRSurface   s = surf[pixelIdx];
     if (s.valid < 0.5f) { outRes[pixelIdx] = r; return; }
 
-    uint32_t rng = pcg32_seed(pixelIdx * 0x71937573u + sampleIndex,
-                              sampleIndex * 0x9E3779B1u + 3u);
+    uint32_t seedSalt = sampleIndex + frameIndex * 0x9E3779B9u;
+    uint32_t rng = pcg32_seed(pixelIdx * 0x71937573u + seedSalt,
+                              seedSalt * 0x9E3779B1u + 3u);
 
     float wSum = r.pHat * r.M * r.W;
 
@@ -403,6 +411,7 @@ void launchReSTIRTemporalReuse(
     uint32_t               width,
     uint32_t               height,
     uint32_t               sampleIndex,
+    uint32_t               frameIndex,
     uint32_t               temporalMCap)
 {
     if (!buffers.historyValid) return;
@@ -417,7 +426,7 @@ void launchReSTIRTemporalReuse(
         buffers.d_surfacePrev,
         width, height,
         buffers.prevWidth, buffers.prevHeight,
-        sampleIndex, temporalMCap);
+        sampleIndex, frameIndex, temporalMCap);
 }
 
 void launchReSTIRSpatialReuse(
@@ -426,6 +435,7 @@ void launchReSTIRSpatialReuse(
     uint32_t               width,
     uint32_t               height,
     uint32_t               sampleIndex,
+    uint32_t               frameIndex,
     uint32_t               numNeighbors,
     float                  radiusPixels)
 {
@@ -439,7 +449,7 @@ void launchReSTIRSpatialReuse(
         buffers.d_reservoirsCurr,
         buffers.d_reservoirsSpatial,
         buffers.d_surfaceCurr,
-        width, height, sampleIndex,
+        width, height, sampleIndex, frameIndex,
         numNeighbors, radiusPixels);
 }
 
@@ -501,8 +511,13 @@ void ReSTIRContext::invalidateHistory() {
 bool ReSTIRContext::runFrame(
     const DeviceSceneData& scene, const CameraParams& camera,
     uint32_t width, uint32_t height, uint32_t sampleIndex,
-    RayTracingBackend* backend)
+    RayTracingBackend* backend,
+    bool cameraMoved)
 {
+    // While the camera is moving, clamp the temporal reuse cap aggressively
+    // so this frame's reservoir doesn't get dominated by 20 frames of stale
+    // history (visibility/normals may have drifted past the geometric gate).
+    uint32_t effectiveTemporalMCap = cameraMoved ? m_motionMCap : m_temporalMCap;
     if (!m_enabled) return false;
     if (!scene.d_lightBVHNodes || !scene.d_areaLights ||
         scene.areaLightCount == 0) return false;
@@ -543,10 +558,11 @@ bool ReSTIRContext::runFrame(
 
     launchReSTIRTemporalReuse(
         scene, m_buffers,
-        width, height, sampleIndex, m_temporalMCap);
+        width, height, sampleIndex, camera.frameIndex, effectiveTemporalMCap);
     launchReSTIRSpatialReuse(
         scene, m_buffers,
-        width, height, sampleIndex, m_numNeighbors, m_spatialRadius);
+        width, height, sampleIndex, camera.frameIndex,
+        m_numNeighbors, m_spatialRadius);
     // Spatial pass's output lives in d_reservoirsSpatial — swap with
     // d_reservoirsCurr so the main kernel reads the post-spatial result.
     ReSTIRReservoir* t = m_buffers.d_reservoirsCurr;

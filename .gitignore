@@ -16,3 +16,4 @@ tools/optix_uchar4_repro
 optix-native/
 *.bat
 imgui.ini
+camera*.txt

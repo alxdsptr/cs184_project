@@ -62,6 +62,7 @@ struct LaunchParams {
     GIReservoir*     giReservoirsCurr;
     ReSTIRSurface*   giSurfacesCurr;
     unsigned int     giEnableEnvironment;
+    unsigned int     giNumCandidates;     // M for the per-pixel RIS (paper §4.1)
 
     // ReSTIR PT init-candidates raygen output. Same reservoir layout as GI
     // — the difference is in *what's stored*: sampleRadiance is the result
@@ -70,6 +71,7 @@ struct LaunchParams {
     GIReservoir*     ptReservoirsCurr;
     ReSTIRSurface*   ptSurfacesCurr;
     unsigned int     ptPathLength;        // bounces past x_r
+    unsigned int     ptNumCandidates;     // M for the per-pixel RIS (paper §4.1)
 
     OptixTraversableHandle handle;
 };

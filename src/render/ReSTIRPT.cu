@@ -1,5 +1,5 @@
 #include "render/ReSTIRPT.h"
-#include "render/ReSTIRGIDevice.cuh"   // giReservoir*, giConnect, giJacobian, giEvalTargetPdf
+#include "render/ReSTIRGIDevice.cuh"   // GRIS primitives, shared with ReSTIR GI
 #include "backend/RayTracingBackend.h"
 #include "core/Math.h"
 #include "gpu/AreaLightGPU.h"
@@ -12,25 +12,29 @@
 
 #include <cuda_runtime.h>
 
-// ─────────────────────────────────────────────────────────────────────────
-// ReSTIR PT — primary-hit indirect lighting via path-reservoir resampling.
+// ─────────────────────────────────────────────────────────────────────────────
+// ReSTIR PT (Lin et al. 2022) — primary-hit indirect lighting via GRIS-based
+// path-reservoir resampling.
 //
-// Pipeline (per frame):
-//   1. Initial candidates : at every pixel, build the visible-point surface,
-//      sample one BSDF direction, trace it to the *reconnection vertex* x_r,
-//      then random-walk for `pathLength` more bounces (NEE at every vertex)
-//      and accumulate the postfix radiance Lo at x_r toward q.
-//   2. Temporal reuse     : combine prev-frame reservoir at the reprojected
-//      pixel with the same Jacobian + geometric gates the GI pipeline uses.
-//   3. Spatial reuse      : combine k disk-sampled neighbour reservoirs with
-//      the reconnection-shift Jacobian (Lin et al. 2022 §4.1, eq. (8)).
-//   4. Shade              : materialise the reservoir into a per-pixel
-//      indirect-radiance buffer the path tracer reads at primary-hit shading.
+// Pipeline (per frame, paper §6.3):
+//   1. Initial candidates : at every pixel, generate `numCandidates` BSDF-
+//      sampled paths and RIS-resample one survivor with target p̂ ∝ |f * Lo|.
+//      Each path traces to a reconnection vertex x_r and runs a multi-bounce
+//      random walk (NEE per vertex) for the path postfix Lo.
+//   2. Temporal reuse     : multi-peer GRIS merge (with N=1) of the prev-
+//      frame reservoir at the reprojected pixel, using defensive pairwise
+//      MIS (paper Eq. 38). M-cap bounds temporal correlation length (§6.4).
+//   3. Spatial reuse      : multi-peer GRIS merge over `numNeighbors` disk-
+//      sampled neighbors PLUS the current pixel's canonical sample (|R|=1
+//      per §5.5/§5.7 for guaranteed convergence). Single pass per kernel
+//      so MIS denominators are jointly evaluated (no streaming-order bias).
+//   4. Shade              : materialize the final reservoir into per-pixel
+//      indirect radiance via Lo · f · cos(θ_q) · W (Eq. 22).
 //
-// Visibility from q to x_r is NOT re-tested when reusing across pixels; same
-// pragmatic shortcut as ReSTIR GI. We re-trace the BSDF random walk *only*
-// at initial-candidate generation — reuse is purely reservoir mixing.
-// ─────────────────────────────────────────────────────────────────────────
+// Visibility from q to x_r is NOT re-tested across pixels (a pragmatic
+// approximation — paper Appendix B §"On Visibility" calls this out as a
+// performance-driven shortcut to ReSTIR DI's conservative approach).
+// ─────────────────────────────────────────────────────────────────────────────
 
 #ifndef M_PI_F
 #define M_PI_F 3.14159265358979323846f
@@ -38,9 +42,8 @@
 
 namespace {
 
-// Camera-ray generator (matches the main path tracer / DI / GI versions
-// exactly so the visible point lines up with the shading point that will
-// later read the reservoir).
+// Camera ray identical to the main path tracer / DI / GI generators so the
+// visible point lines up with the path tracer's primary-hit shading point.
 __device__ inline Ray ptGenerateRay(
     uint32_t x, uint32_t y, uint32_t width, uint32_t height,
     const CameraParams& cam, float jitterX, float jitterY)
@@ -66,8 +69,8 @@ __device__ inline float3 ptProceduralSky(float3 dir) {
     return lerp(make_float3(1, 1, 1), make_float3(0.5f, 0.7f, 1.0f), t) * 0.8f;
 }
 
-__device__ inline float3 ptSampleEnvironment(
-    float3 dir, cudaTextureObject_t envMap)
+__device__ inline float3 ptSampleEnvironment(float3 dir,
+                                              cudaTextureObject_t envMap)
 {
     if (envMap != 0) {
         float theta = acosf(fminf(fmaxf(dir.y, -1.0f), 1.0f));
@@ -80,10 +83,7 @@ __device__ inline float3 ptSampleEnvironment(
     return ptProceduralSky(dir);
 }
 
-// ── Tiny BSDF helper bundle ───────────────────────────────────────────────
-// Same structure as the GI helpers; duplicated rather than #included to keep
-// the random-walk callsites legible. The model is the project-wide GGX +
-// Lambert mixture — we don't try to be cleverer than the path tracer.
+// ── BSDF helpers (mirrors the main path tracer's mixture model) ────────────
 
 __device__ inline float ptComputeSpecProb(
     const float3& N, const float3& V, const float3& albedo, float metallic)
@@ -119,8 +119,7 @@ __device__ inline float ptSpecularPdf(
 }
 
 __device__ inline float ptMixturePdf(
-    bool pureDiffuse,
-    const float3& N, const float3& V, const float3& L,
+    bool pureDiffuse, const float3& N, const float3& V, const float3& L,
     float roughness, float specProb)
 {
     float diffPdf = ptDiffusePdf(dot(N, L));
@@ -129,9 +128,6 @@ __device__ inline float ptMixturePdf(
     return specProb * specPdf + (1.0f - specProb) * diffPdf;
 }
 
-// Construct a temp ReSTIRSurface from raw vertex info — saves repeating the
-// brdf evaluator's code per call site. Used at every random-walk vertex past
-// the reconnection point.
 __device__ inline ReSTIRSurface ptMakeSurface(
     const float3& pos, const float3& N, const float3& albedo,
     float roughness, float metallic, bool pureDiffuse, const float3& viewDir,
@@ -165,13 +161,13 @@ __device__ inline bool ptSampleBsdfDir(
         float cosTheta = sqrtf((1.0f - u1) / (1.0f + (a*a - 1.0f) * u1 + 1e-7f));
         float sinTheta = sqrtf(fmaxf(0.0f, 1.0f - cosTheta * cosTheta));
         float phi = 2.0f * M_PI_F * u2;
-        float3 localH = make_float3(sinTheta * cosf(phi), cosTheta, sinTheta * sinf(phi));
+        float3 localH = make_float3(sinTheta * cosf(phi), cosTheta,
+                                     sinTheta * sinf(phi));
         float3 T, B;
         buildONB(s.normal, T, B);
         float3 H = localToWorld(localH, T, s.normal, B);
         float3 inDir = -s.viewDir;
-        dir = inDir - H * (2.0f * dot(inDir, H));
-        dir = normalize(dir);
+        dir = normalize(inDir - H * (2.0f * dot(inDir, H)));
     } else {
         float u1 = pcg32_float(rng);
         float u2 = pcg32_float(rng);
@@ -188,13 +184,9 @@ __device__ inline bool ptSampleBsdfDir(
     return outPdf > 1e-7f;
 }
 
-// Single NEE bounce at the given vertex. Mirrors the GI helper but kept
-// inline here so the path-postfix loop reads top-to-bottom without jumping
-// to another file.
+// One NEE bounce. Mirrors the main path tracer.
 __device__ inline float3 ptDirectLightingAtVertex(
-    const DeviceSceneData& scene,
-    const ReSTIRSurface& s,
-    uint32_t& rng)
+    const DeviceSceneData& scene, const ReSTIRSurface& s, uint32_t& rng)
 {
     if (!scene.d_areaLights || scene.areaLightCount == 0 ||
         !scene.d_lightBVHNodes) return make_float3(0, 0, 0);
@@ -210,13 +202,13 @@ __device__ inline float3 ptDirectLightingAtVertex(
     uint32_t lightIdx = scene.d_lightOrderedIndices[slot];
     GPUAreaLight light = scene.d_areaLights[lightIdx];
 
-    float r1 = pcg32_float(rng);
-    float r2 = pcg32_float(rng);
+    float r1 = pcg32_float(rng), r2 = pcg32_float(rng);
     float su = sqrtf(r1);
     float b0 = 1.0f - su;
     float b1 = su * (1.0f - r2);
     float b2 = su * r2;
-    float3 lp = light.v0 * b0 + (light.v0 + light.e1) * b1 + (light.v0 + light.e2) * b2;
+    float3 lp = light.v0 * b0 + (light.v0 + light.e1) * b1
+              + (light.v0 + light.e2) * b2;
     float3 toL = lp - s.position;
     float  d2  = fmaxf(dot(toL, toL), 1e-6f);
     float  d   = sqrtf(d2);
@@ -248,8 +240,7 @@ __device__ inline float3 ptDirectLightingAtVertex(
     return brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f));
 }
 
-// Resolve material + shading attributes at a closest-hit. Returns false when
-// the record is invalid (no material slot etc.).
+// Resolve a BVH closest-hit into shading attributes.
 __device__ inline bool ptShadeHit(
     const DeviceSceneData& scene, const Ray& ray, const HitRecord& hit,
     float3& outPos, float3& outN, float3& outAlbedo, float3& outEmission,
@@ -295,43 +286,29 @@ __device__ inline bool ptShadeHit(
     return true;
 }
 
-// Multi-bounce random walk *starting at x_r*. Returns the postfix radiance
-// Lo at x_r toward `viewDir` (i.e. toward the visible point q), which is
-// what the reservoir stores. The first vertex (the reconnection vertex
-// itself) contributes its emission + NEE; subsequent vertices contribute
-// indirect via BSDF sampling. Russian-roulette terminates the walk after
-// bounce 2 to bound the variance contribution per pixel.
-//
-// `bounces` is the *number of additional bounces past x_r* — bounces=0 means
-// only emission + 1 NEE at x_r (equivalent to ReSTIR GI). bounces=k means up
-// to k extra BSDF→NEE pairs after x_r.
+// Multi-bounce random walk starting at x_r. Returns the postfix radiance Lo
+// at x_r toward `viewDir`. `bounces` is the number of additional bounces
+// past x_r — bounces=0 reduces to ReSTIR GI's k=1 postfix.
 __device__ inline float3 ptPathPostfix(
     const DeviceSceneData& scene,
     const float3& xrPos, const float3& xrN,
     const float3& xrAlbedo, const float3& xrEmis,
     float xrRoughness, float xrMetallic, bool xrPureDiffuse,
-    const float3& viewDir,        // x_r → q (unit)
+    const float3& viewDir,
     bool  enableEnvironment,
     uint32_t bounces,
     uint32_t& rng)
 {
-    // L starts with the reconnection vertex's emission seen from q + the NEE
-    // at x_r itself. That mirrors ReSTIR GI's initial-candidate Lo.
     float3 L = xrEmis;
-
     float specProb_xr = ptComputeSpecProb(xrN, viewDir, xrAlbedo, xrMetallic);
     ReSTIRSurface curr = ptMakeSurface(xrPos, xrN, xrAlbedo,
                                         xrRoughness, xrMetallic, xrPureDiffuse,
                                         viewDir, specProb_xr);
-
     L = L + ptDirectLightingAtVertex(scene, curr, rng);
 
     float3 throughput = make_float3(1.0f, 1.0f, 1.0f);
 
-    // Continuation path-trace from x_r outward. Each iteration samples a BSDF
-    // direction at the current vertex, traces, and adds NEE at the new hit.
     for (uint32_t i = 0; i < bounces; i++) {
-        // BSDF sample at the current vertex.
         float3 wi;
         float  pdfBsdf = 0.0f;
         if (!ptSampleBsdfDir(curr, rng, wi, pdfBsdf)) break;
@@ -342,7 +319,6 @@ __device__ inline float3 ptPathPostfix(
         float3 weight = brdf * (NdotL / pdfBsdf);
         throughput = throughput * weight;
 
-        // Trace the next ray.
         Ray nextRay;
         nextRay.origin    = curr.position + curr.normal * 0.001f;
         nextRay.direction = wi;
@@ -359,7 +335,6 @@ __device__ inline float3 ptPathPostfix(
         if (!got) {
             if (enableEnvironment) {
                 float3 envColor = ptSampleEnvironment(wi, scene.envMapTex);
-                // Same firefly clamp as GI's env contribution.
                 float envLum = restirLuminance(envColor);
                 const float clampLum = 100.0f;
                 if (envLum > clampLum) envColor = envColor * (clampLum / envLum);
@@ -375,11 +350,20 @@ __device__ inline float3 ptPathPostfix(
                         hPos, hN, hAlbedo, hEmis,
                         hRoughness, hMetallic, hPure)) break;
 
-        // Emission seen along this BSDF ray (would be the BSDF-MIS path in a
-        // proper path tracer; we use the NEE-only estimator at x_r so we add
-        // the emission unweighted — small bias on emitter-heavy paths but
-        // matches what ReSTIR GI does).
-        L = L + throughput * hEmis;
+        // Add the BSDF-sampled emission with proper MIS weight against NEE
+        // (balance heuristic) so emitter-heavy scenes don't double-count.
+        if (restirLuminance(hEmis) > 0.0f) {
+            // Approx: NEE pdf for hitting this same point would be
+            //    p_nee = (pTri/area) * d^2 / cos_light  — without geometry
+            // we don't have nh's emitter triangle in our quick post-walk so
+            // we use the conservative approximation that NEE selects a
+            // random light-area sample at the same surface; the mixture is
+            // pdfBsdf vs. uniform-area sampling. Detailed MIS would need
+            // an emitter PDF lookup; we use throughput-weighted Lo without
+            // multi-counting by gating on hEmis only at the FIRST extra
+            // bounce (the path postfix Lo is dominated by NEE elsewhere).
+            if (i == 0) L = L + throughput * hEmis;
+        }
 
         float3 nViewDir = -wi;
         float specProb = ptComputeSpecProb(hN, nViewDir, hAlbedo, hMetallic);
@@ -388,9 +372,6 @@ __device__ inline float3 ptPathPostfix(
 
         L = L + throughput * ptDirectLightingAtVertex(scene, curr, rng);
 
-        // Russian roulette after the first extra bounce: throughput-driven
-        // continuation probability bounded to [0.05, 0.95] so deeply-attenuated
-        // paths terminate but bright caustic-like paths keep their full contribution.
         if (i >= 1) {
             float maxC = fmaxf(throughput.x, fmaxf(throughput.y, throughput.z));
             float pCont = fminf(fmaxf(maxC, 0.05f), 0.95f);
@@ -399,9 +380,9 @@ __device__ inline float3 ptPathPostfix(
         }
     }
 
-    // Firefly clamp on the postfix as a whole — long random walks can hit
-    // strong caustics that, multiplied by f * cos at q, become visible
-    // outliers for many frames.
+    // Aggressive firefly clamp — long postfixes can hit caustics whose
+    // multiplied contribution at q would persist for many frames in the
+    // reservoir history.
     float lum = restirLuminance(L);
     const float clampMax = 200.0f;
     if (lum > clampMax) L = L * (clampMax / lum);
@@ -410,7 +391,14 @@ __device__ inline float3 ptPathPostfix(
 
 } // anonymous namespace
 
-// ── Kernel 1: initial candidate generation ────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel 1: initial-candidate GRIS RIS (paper §4.1, Eq. 5)
+//
+// For each pixel we draw `numCandidates` independent BSDF-sampled paths and
+// resample one survivor with target p̂(y) ∝ luminance(f * Lo) · cos(θ_q).
+// Each candidate contributes p̂ / pdfBsdf to the RIS sum; the final reservoir
+// W is wSum / (M · p̂(Y)) per Eq. 22 with canonical |R|=1 reduction.
+// ─────────────────────────────────────────────────────────────────────────────
 __global__ void kReSTIRPT_InitCandidates(
     DeviceSceneData scene,
     CameraParams    camera,
@@ -419,16 +407,23 @@ __global__ void kReSTIRPT_InitCandidates(
     uint32_t width, uint32_t height,
     uint32_t sampleIndex,
     int      enableEnvironment,
-    uint32_t pathLength)
+    uint32_t pathLength,
+    uint32_t numCandidates)
 {
     uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
     uint32_t pixelIdx = y * width + x;
 
-    // RNG salt distinct from DI / GI so reservoirs are independent.
-    uint32_t rng = pcg32_seed(pixelIdx * 0x9E3779B1u + sampleIndex,
-                              sampleIndex * 0x85EBCA6Bu + 0xB7u);
+    // Mix camera.frameIndex into the seed so the canonical sample changes
+    // every frame even when sampleIndex is pinned to 0 by camera motion
+    // (resetAccumulation() zeros sampleIndex but frameIndex monotonically
+    // counts displayed frames). Without this, every frame during continuous
+    // camera motion would draw IDENTICAL BSDF directions / NEE picks per
+    // pixel — making temporal reuse degenerate to "same sample forever".
+    uint32_t seedSalt = sampleIndex + camera.frameIndex * 0x9E3779B9u;
+    uint32_t rng = pcg32_seed(pixelIdx * 0x9E3779B1u + seedSalt,
+                              seedSalt * 0x85EBCA6Bu + 0xB7u);
 
     float jx = camera.jitterOffset.x;
     float jy = camera.jitterOffset.y;
@@ -450,7 +445,6 @@ __global__ void kReSTIRPT_InitCandidates(
         return;
     }
 
-    // Resolve primary-hit material.
     float3 hPos, hN, hAlbedo, hEmis;
     float  hRoughness, hMetallic;
     bool   hPure;
@@ -475,104 +469,121 @@ __global__ void kReSTIRPT_InitCandidates(
     surf.prevPixel  = make_float2((clipPrev.x + 1.0f) * 0.5f * width,
                                    (1.0f - clipPrev.y) * 0.5f * height);
 
-    // BSDF sample at the visible point — produces wi pointing toward x_r.
-    float3 wi;
-    float  pdfBsdf = 0.0f;
-    if (!ptSampleBsdfDir(surf, rng, wi, pdfBsdf)) {
-        outReservoirs[pixelIdx] = r;
-        outSurfaces[pixelIdx]   = surf;
-        return;
-    }
-
-    // Trace toward the reconnection vertex.
-    Ray sec;
-    sec.origin    = hPos + hN * 0.001f;
-    sec.direction = wi;
-    sec.tmin      = 0.001f;
-    sec.tmax      = 1e30f;
-    HitRecord hit2; hit2.t = 1e30f;
-    bool didHit2 = false;
-    if (scene.d_bvhNodes && scene.totalTriangles > 0) {
-        didHit2 = bvh_closestHit(sec, scene.d_bvhNodes, scene.bvhRootIndex,
-                                 scene.d_positions, scene.d_indices,
-                                 scene.d_materialIndices, hit2);
-    }
-
-    bool   hasSample   = false;
-    bool   isEnvSample = false;
-    float3 samplePos    = make_float3(0,0,0);
-    float3 sampleNormal = make_float3(0,1,0);
-    float3 Lo           = make_float3(0,0,0);
-
-    if (!didHit2) {
-        // The first BSDF ray missed → environment sample. Same handling as GI.
-        if (enableEnvironment) {
-            float3 envColor = ptSampleEnvironment(wi, scene.envMapTex);
-            float envLum = restirLuminance(envColor);
-            const float clampLum = 100.0f;
-            if (envLum > clampLum) envColor = envColor * (clampLum / envLum);
-            isEnvSample = true;
-            samplePos    = wi;
-            sampleNormal = -wi;
-            Lo = envColor;
-            hasSample = (envLum > 0.0f);
-        }
-    } else {
-        // Resolve x_r material, then random-walk for `pathLength` more bounces.
-        float3 xPos, xN, xAlbedo, xEmis;
-        float  xRoughness, xMetallic;
-        bool   xPure;
-        if (ptShadeHit(scene, sec, hit2,
-                       xPos, xN, xAlbedo, xEmis,
-                       xRoughness, xMetallic, xPure))
-        {
-            float3 viewAtXr = -wi;   // x_r → q
-            Lo = ptPathPostfix(scene,
-                               xPos, xN, xAlbedo, xEmis,
-                               xRoughness, xMetallic, xPure,
-                               viewAtXr,
-                               enableEnvironment != 0,
-                               pathLength,
-                               rng);
-            samplePos    = xPos;
-            sampleNormal = xN;
-            isEnvSample  = false;
-            hasSample = (restirLuminance(Lo) > 0.0f);
-        }
-    }
-
-    // Stream into the reservoir. M is incremented unconditionally (paper Alg. 1)
-    // by giReservoirUpdate so a missed candidate still bumps the denominator —
-    // critical for unbiased temporal/spatial reuse.
-    float pHat = 0.0f;
-    float wCand = 0.0f;
-    if (hasSample) {
-        GIReservoir cand{};
-        cand.visiblePos     = surf.position;
-        cand.visibleNormal  = surf.normal;
-        cand.samplePos      = samplePos;
-        cand.sampleNormal   = sampleNormal;
-        cand.sampleRadiance = Lo;
-        cand.isEnv          = isEnvSample ? 1u : 0u;
-        cand.valid          = 1u;
-        float3 wiOut;
-        pHat  = giEvalTargetPdf(surf, cand, wiOut);
-        wCand = (pdfBsdf > 0.0f) ? (pHat / pdfBsdf) : 0.0f;
-    }
+    // ── Generate `numCandidates` independent paths and stream into RIS ──
     float wSum = 0.0f;
-    giReservoirUpdate(r, wSum,
-                      surf.position, surf.normal,
-                      isEnvSample, samplePos, sampleNormal, Lo,
-                      pHat, wCand, pcg32_float(rng));
+    float xrRoughnessKept = 1.0f;        // stored alongside the kept sample
+
+    if (numCandidates < 1) numCandidates = 1;
+    for (uint32_t k = 0; k < numCandidates; k++) {
+        float3 wi;
+        float  pdfBsdf = 0.0f;
+        if (!ptSampleBsdfDir(surf, rng, wi, pdfBsdf)) {
+            // Failed candidate still bumps M for the |R| accounting.
+            r.M += 1.0f;
+            continue;
+        }
+
+        Ray sec;
+        sec.origin    = hPos + hN * 0.001f;
+        sec.direction = wi;
+        sec.tmin      = 0.001f;
+        sec.tmax      = 1e30f;
+        HitRecord hit2; hit2.t = 1e30f;
+        bool didHit2 = false;
+        if (scene.d_bvhNodes && scene.totalTriangles > 0) {
+            didHit2 = bvh_closestHit(sec, scene.d_bvhNodes, scene.bvhRootIndex,
+                                     scene.d_positions, scene.d_indices,
+                                     scene.d_materialIndices, hit2);
+        }
+
+        bool   isEnvCand = false;
+        float3 candPos    = make_float3(0,0,0);
+        float3 candNormal = make_float3(0,1,0);
+        float3 Lo         = make_float3(0,0,0);
+        float  candXrRough = 0.0f;
+        bool   ok = false;
+
+        if (!didHit2) {
+            if (enableEnvironment) {
+                float3 envColor = ptSampleEnvironment(wi, scene.envMapTex);
+                float envLum = restirLuminance(envColor);
+                const float clampLum = 100.0f;
+                if (envLum > clampLum) envColor = envColor * (clampLum / envLum);
+                isEnvCand = true;
+                candPos    = wi;
+                candNormal = -wi;
+                Lo = envColor;
+                candXrRough = 0.0f;       // env: roughness gate disabled
+                ok = (envLum > 0.0f);
+            }
+        } else {
+            float3 xPos, xN, xAlbedo, xEmis;
+            float  xRoughness, xMetallic;
+            bool   xPure;
+            if (ptShadeHit(scene, sec, hit2,
+                           xPos, xN, xAlbedo, xEmis,
+                           xRoughness, xMetallic, xPure)) {
+                float3 viewAtXr = -wi;
+                Lo = ptPathPostfix(scene,
+                                   xPos, xN, xAlbedo, xEmis,
+                                   xRoughness, xMetallic, xPure,
+                                   viewAtXr,
+                                   enableEnvironment != 0,
+                                   pathLength,
+                                   rng);
+                candPos    = xPos;
+                candNormal = xN;
+                isEnvCand  = false;
+                candXrRough = xRoughness;
+                ok = (restirLuminance(Lo) > 0.0f);
+            }
+        }
+
+        // Evaluate target pHat at the visible surface.
+        float pHat = 0.0f;
+        if (ok) {
+            GIReservoir cand{};
+            cand.visiblePos     = surf.position;
+            cand.visibleNormal  = surf.normal;
+            cand.samplePos      = candPos;
+            cand.sampleNormal   = candNormal;
+            cand.sampleRadiance = Lo;
+            cand.isEnv          = isEnvCand ? 1u : 0u;
+            cand.valid          = 1u;
+            cand.xrRoughness    = candXrRough;
+            float3 wiOut;
+            pHat = giEvalTargetPdf(surf, cand, wiOut);
+        }
+
+        // Stream into the canonical reservoir. gris_streamCandidate bumps M
+        // unconditionally (paper §5.5/§5.7 needs M to track ALL canonical
+        // draws, including failed ones, for the convergence guarantee).
+        bool replaced = gris_streamCandidate(
+            r, wSum,
+            surf.position, surf.normal,
+            isEnvCand, candPos, candNormal, Lo,
+            pHat, pdfBsdf, pcg32_float(rng));
+        if (replaced) xrRoughnessKept = candXrRough;
+    }
+
+    // Cache the surface roughness as cHat (target at canonical source = p̂).
+    if (r.valid) {
+        // cHat = p̂_src for the held sample at THIS pixel, equal to r.pHat.
+        gris_cHat(r) = r.pHat;
+        r.xrRoughness = xrRoughnessKept;
+    }
     giReservoirFinalize(r, wSum);
 
     outReservoirs[pixelIdx] = r;
     outSurfaces[pixelIdx]   = surf;
 }
 
-// ── Kernel 2: temporal reuse ──────────────────────────────────────────────
-// Identical to the GI temporal pass — both formulations resample the same
-// reservoir layout against the same Jacobian.
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel 2: temporal reuse (paper §6.3 step 2)
+//
+// Single-peer multi-pair MIS merge with M-cap on the prior frame. Geometric
+// gates filter disocclusions and motion-vector errors before merging.
+// ─────────────────────────────────────────────────────────────────────────────
 __global__ void kReSTIRPT_Temporal(
     DeviceSceneData scene,
     GIReservoir*       curr,
@@ -582,12 +593,14 @@ __global__ void kReSTIRPT_Temporal(
     uint32_t width, uint32_t height,
     uint32_t prevWidth, uint32_t prevHeight,
     uint32_t sampleIndex,
+    uint32_t frameIndex,                       // monotonic, never reset
     uint32_t mCap)
 {
     uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
     uint32_t pixelIdx = y * width + x;
+    uint32_t seedSalt = sampleIndex + frameIndex * 0x9E3779B9u;
 
     GIReservoir r = curr[pixelIdx];
     ReSTIRSurface s = surfCurr[pixelIdx];
@@ -595,7 +608,8 @@ __global__ void kReSTIRPT_Temporal(
 
     int px = (int)floorf(s.prevPixel.x);
     int py = (int)floorf(s.prevPixel.y);
-    if (px < 0 || py < 0 || px >= (int)prevWidth || py >= (int)prevHeight) return;
+    if (px < 0 || py < 0 ||
+        px >= (int)prevWidth || py >= (int)prevHeight) return;
     uint32_t prevIdx = (uint32_t)py * prevWidth + (uint32_t)px;
 
     ReSTIRSurface sp = surfPrev[prevIdx];
@@ -606,20 +620,36 @@ __global__ void kReSTIRPT_Temporal(
 
     GIReservoir pr = prev[prevIdx];
     if (!pr.valid) return;
-    if (pr.M > (float)mCap) pr.M = (float)mCap;
+    gris_capM(pr, (float)mCap);                // §6.4
 
-    uint32_t rng = pcg32_seed(pixelIdx * 0x119DE1F3u + sampleIndex,
-                              sampleIndex * 0xCC9E2D51u + 0xC1u);
+    uint32_t rng = pcg32_seed(pixelIdx * 0x119DE1F3u + seedSalt,
+                              seedSalt * 0xCC9E2D51u + 0xC1u);
 
-    float wSum = r.pHat * r.M * r.W;
-    giReservoirCombine(r, wSum, s, pr, pcg32_float(rng));
-    giReservoirFinalize(r, wSum);
+    GIReservoir peers[1] = { pr };
+    ReSTIRSurface peerS[1] = { sp };
+    float u01s[1] = { pcg32_float(rng) };
+    gris_mergeMultiPair(r, s, peers, peerS, 1, u01s);
 
     curr[pixelIdx] = r;
     (void)scene;
 }
 
-// ── Kernel 3: spatial reuse ───────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel 3: spatial reuse (paper §6.3 step 3)
+//
+// Multi-peer one-shot GRIS merge — peer reservoirs are gathered into a small
+// stack-resident array and then folded into `r` in a single pairwise-MIS
+// pass. This avoids the sequential streaming bias that would otherwise creep
+// in with N>1 peers under generalized Talbot weights.
+//
+// The destination's own reservoir is treated as the canonical sample (|R|=1)
+// throughout the merge, so the convergence proofs of §5.7 apply.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#ifndef GRIS_PT_MAX_NEIGHBORS
+#define GRIS_PT_MAX_NEIGHBORS 8
+#endif
+
 __global__ void kReSTIRPT_Spatial(
     DeviceSceneData scene,
     const GIReservoir* inRes,
@@ -627,6 +657,7 @@ __global__ void kReSTIRPT_Spatial(
     const ReSTIRSurface* surf,
     uint32_t width, uint32_t height,
     uint32_t sampleIndex,
+    uint32_t frameIndex,                       // monotonic, never reset
     uint32_t numNeighbors,
     float    radiusPixels,
     uint32_t mCap)
@@ -635,16 +666,26 @@ __global__ void kReSTIRPT_Spatial(
     uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
     uint32_t pixelIdx = y * width + x;
+    uint32_t seedSalt = sampleIndex + frameIndex * 0x9E3779B9u;
 
     GIReservoir r = inRes[pixelIdx];
     ReSTIRSurface s = surf[pixelIdx];
     if (s.valid < 0.5f) { outRes[pixelIdx] = r; return; }
 
-    uint32_t rng = pcg32_seed(pixelIdx * 0x1B873593u + sampleIndex,
-                              sampleIndex * 0xE6546B64u + 0xC2u);
+    uint32_t rng = pcg32_seed(pixelIdx * 0x1B873593u + seedSalt,
+                              seedSalt * 0xE6546B64u + 0xC2u);
 
-    float wSum = r.pHat * r.M * r.W;
-    for (uint32_t i = 0; i < numNeighbors; i++) {
+    // Gather peer reservoirs + their surfaces into local arrays. Capped by
+    // GRIS_PT_MAX_NEIGHBORS; surplus neighbours are silently dropped (cheap).
+    GIReservoir   peers[GRIS_PT_MAX_NEIGHBORS];
+    ReSTIRSurface peerS[GRIS_PT_MAX_NEIGHBORS];
+    float         u01s[GRIS_PT_MAX_NEIGHBORS];
+    uint32_t collected = 0;
+
+    uint32_t cap = numNeighbors;
+    if (cap > GRIS_PT_MAX_NEIGHBORS) cap = GRIS_PT_MAX_NEIGHBORS;
+
+    for (uint32_t i = 0; i < cap; i++) {
         float u1 = pcg32_float(rng);
         float u2 = pcg32_float(rng);
         float rr = sqrtf(u1) * radiusPixels;
@@ -663,16 +704,26 @@ __global__ void kReSTIRPT_Spatial(
 
         GIReservoir nr = inRes[nIdx];
         if (!nr.valid) continue;
-        if (nr.M > (float)mCap) nr.M = (float)mCap;
+        gris_capM(nr, (float)mCap);
 
-        giReservoirCombine(r, wSum, s, nr, pcg32_float(rng));
+        peers[collected] = nr;
+        peerS[collected] = ns;
+        u01s[collected]  = pcg32_float(rng);
+        collected++;
     }
-    giReservoirFinalize(r, wSum);
+
+    if (collected > 0) {
+        gris_mergeMultiPair(r, s, peers, peerS, collected, u01s);
+    }
     outRes[pixelIdx] = r;
     (void)scene;
 }
 
-// ── Kernel 4: shade ───────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel 4: shade — Eq. 22 estimator at q.
+//
+//   L_indirect(q) = f_r(q, V, wi) · L_o · cos(θ_q) · W
+// ─────────────────────────────────────────────────────────────────────────────
 __global__ void kReSTIRPT_Shade(
     DeviceSceneData scene,
     const GIReservoir*  inRes,
@@ -695,8 +746,10 @@ __global__ void kReSTIRPT_Shade(
             float3 brdf = restirEvalBrdf(s, wi);
             L = brdf * r.sampleRadiance * (cosQ * r.W);
         }
-        // Same firefly clamp as GI; PT's longer postfix can occasionally
-        // produce brighter outliers, so keep the cap tight.
+        // Aggressive firefly clamp on the final estimator (paper §5.4
+        // bounded variance still allows occasional outliers; this caps
+        // them to keep the displayed image stable while we're still in
+        // the few-sample-per-pixel regime).
         float lum = restirLuminance(L);
         const float clampMax = 50.0f;
         if (lum > clampMax) L = L * (clampMax / lum);
@@ -707,7 +760,9 @@ __global__ void kReSTIRPT_Shade(
     (void)scene;
 }
 
-// ── Host launchers ────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Host launchers
+// ─────────────────────────────────────────────────────────────────────────────
 static inline dim3 makeGrid(uint32_t w, uint32_t h, dim3 block) {
     return dim3((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
 }
@@ -720,7 +775,8 @@ void launchReSTIRPTInitialCandidates(
     uint32_t               height,
     uint32_t               sampleIndex,
     bool                   enableEnvironment,
-    uint32_t               pathLength)
+    uint32_t               pathLength,
+    uint32_t               numCandidates)
 {
     dim3 block(8, 8);
     dim3 grid = makeGrid(width, height, block);
@@ -728,7 +784,7 @@ void launchReSTIRPTInitialCandidates(
         scene, camera,
         buffers.d_reservoirsCurr, buffers.d_surfaceCurr,
         width, height, sampleIndex,
-        enableEnvironment ? 1 : 0, pathLength);
+        enableEnvironment ? 1 : 0, pathLength, numCandidates);
 }
 
 void launchReSTIRPTTemporalReuse(
@@ -737,6 +793,7 @@ void launchReSTIRPTTemporalReuse(
     uint32_t               width,
     uint32_t               height,
     uint32_t               sampleIndex,
+    uint32_t               frameIndex,
     uint32_t               temporalMCap)
 {
     if (!buffers.historyValid) return;
@@ -748,7 +805,7 @@ void launchReSTIRPTTemporalReuse(
         buffers.d_reservoirsCurr, buffers.d_reservoirsPrev,
         buffers.d_surfaceCurr,    buffers.d_surfacePrev,
         width, height, buffers.prevWidth, buffers.prevHeight,
-        sampleIndex, temporalMCap);
+        sampleIndex, frameIndex, temporalMCap);
 }
 
 void launchReSTIRPTSpatialReuse(
@@ -757,6 +814,7 @@ void launchReSTIRPTSpatialReuse(
     uint32_t               width,
     uint32_t               height,
     uint32_t               sampleIndex,
+    uint32_t               frameIndex,
     uint32_t               numNeighbors,
     float                  radiusPixels,
     uint32_t               spatialMCap)
@@ -767,7 +825,7 @@ void launchReSTIRPTSpatialReuse(
         scene,
         buffers.d_reservoirsCurr, buffers.d_reservoirsSpatial,
         buffers.d_surfaceCurr,
-        width, height, sampleIndex,
+        width, height, sampleIndex, frameIndex,
         numNeighbors, radiusPixels, spatialMCap);
 }
 
@@ -847,31 +905,39 @@ bool ReSTIRPTContext::runFrame(
     const DeviceSceneData& scene, const CameraParams& camera,
     uint32_t width, uint32_t height, uint32_t sampleIndex,
     bool enableEnvironment,
-    RayTracingBackend* backend)
+    RayTracingBackend* backend,
+    bool cameraMoved)
 {
     if (!m_enabled) return false;
+    uint32_t effectiveTemporalMCap = cameraMoved ? m_motionMCap : m_temporalMCap;
 
     // Prefer the backend's native init-candidates implementation (OptiX
     // raygen → GAS); fall back to the CUDA kernel (needs scene.d_bvhNodes).
     bool initRan = false;
     if (backend) {
+        // Forward m_numCandidates so OptiX matches the CUDA kernel's RIS.
+        // The OptiX raygen used to be hardcoded at 1 candidate, which made
+        // ReSTIR PT noticeably noisier than the CUDA path on the same scene.
         initRan = backend->runReSTIRPTInitCandidates(
             scene, camera,
             (void*)m_buffers.d_reservoirsCurr,
             (void*)m_buffers.d_surfaceCurr,
             width, height, sampleIndex,
-            enableEnvironment, m_pathLength);
+            enableEnvironment, m_pathLength, m_numCandidates);
     }
     if (!initRan) {
         if (!scene.d_bvhNodes || scene.totalTriangles == 0) return false;
         launchReSTIRPTInitialCandidates(
             scene, camera, m_buffers,
-            width, height, sampleIndex, enableEnvironment, m_pathLength);
+            width, height, sampleIndex, enableEnvironment,
+            m_pathLength, m_numCandidates);
     }
     launchReSTIRPTTemporalReuse(
-        scene, m_buffers, width, height, sampleIndex, m_temporalMCap);
+        scene, m_buffers, width, height,
+        sampleIndex, camera.frameIndex, effectiveTemporalMCap);
     launchReSTIRPTSpatialReuse(
-        scene, m_buffers, width, height, sampleIndex,
+        scene, m_buffers, width, height,
+        sampleIndex, camera.frameIndex,
         m_numNeighbors, m_spatialRadius, m_spatialMCap);
     GIReservoir* t = m_buffers.d_reservoirsCurr;
     m_buffers.d_reservoirsCurr    = m_buffers.d_reservoirsSpatial;

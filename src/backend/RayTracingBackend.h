@@ -121,15 +121,18 @@ public:
         uint32_t               /*width*/,
         uint32_t               /*height*/,
         uint32_t               /*sampleIndex*/,
-        bool                   /*enableEnvironment*/) {
+        bool                   /*enableEnvironment*/,
+        uint32_t               /*numCandidates*/ = 1) {
         return false;
     }
 
     // ReSTIR PT initial-candidates pass (Lin et al. 2022). Same reservoir
     // layout as GI; the backend traces the primary + first-bounce ray, then
     // walks `pathLength` more bounces past the reconnection vertex to gather
-    // the postfix radiance. Returns true on success; CUDA fallback is taken
-    // when the backend has no native implementation.
+    // the postfix radiance. `numCandidates` is the M for the per-pixel RIS
+    // (paper §4.1) — must be >= 1; >1 reduces single-frame variance at the
+    // cost of more BSDF samples + secondary rays per pixel. Returns true on
+    // success; CUDA fallback is taken when the backend has no native impl.
     virtual bool runReSTIRPTInitCandidates(
         const DeviceSceneData& /*scene*/,
         const CameraParams&    /*camera*/,
@@ -139,7 +142,8 @@ public:
         uint32_t               /*height*/,
         uint32_t               /*sampleIndex*/,
         bool                   /*enableEnvironment*/,
-        uint32_t               /*pathLength*/) {
+        uint32_t               /*pathLength*/,
+        uint32_t               /*numCandidates*/ = 1) {
         return false;
     }
 };

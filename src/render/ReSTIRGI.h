@@ -41,11 +41,19 @@ struct GIReservoir {
     float    pHat;
     float    W;
     float    M;
-    // Flags + padding (struct must stay 16-byte aligned for coalesced loads).
+    // Flags + auxiliary fields (struct stays 16-byte aligned).
     uint32_t isEnv;           // 1 = environment hit, samplePos is direction
     uint32_t valid;           // 1 = reservoir holds a usable sample
+    // _pad0 caches `c_i = p̂_i^src` evaluated at the source surface where the
+    //   sample was born — needed by the generalised pairwise MIS denominator
+    //   (Lin et al. 2022 Eq. 38). Accessed via gris_cHat() in the device
+    //   header. Repurposing the pad keeps the struct binary-compatible with
+    //   prior cudaMalloc/Memset blocks and OptiX launch params.
     float    _pad0;
-    float    _pad1;
+    // xrRoughness — reconnection-vertex GGX roughness. Used by the paper §7.5
+    //   roughness-based connectability gate during shift evaluation. 0 means
+    //   "unknown / pure-diffuse" (always reconnectable); env samples set 0.
+    float    xrRoughness;
     float    _pad2;
 };
 
@@ -80,12 +88,16 @@ void launchReSTIRGIInitialCandidates(
     bool                   enableEnvironment,
     uint32_t               temporalMCap);
 
+// `frameIndex` is the monotonic per-display-frame counter (camera.frameIndex).
+// Mixed into the kernel RNG seed so ReSTIR keeps exploring path space even
+// when sampleIndex is pinned to 0 by continuous camera motion.
 void launchReSTIRGITemporalReuse(
     const DeviceSceneData& scene,
     GIBuffers              buffers,
     uint32_t               width,
     uint32_t               height,
     uint32_t               sampleIndex,
+    uint32_t               frameIndex,
     uint32_t               temporalMCap);
 
 void launchReSTIRGISpatialReuse(
@@ -94,6 +106,7 @@ void launchReSTIRGISpatialReuse(
     uint32_t               width,
     uint32_t               height,
     uint32_t               sampleIndex,
+    uint32_t               frameIndex,
     uint32_t               numNeighbors,
     float                  radiusPixels,
     uint32_t               spatialMCap);
@@ -122,10 +135,13 @@ public:
     // Returns true when `d_indirectOut` was freshly populated this frame and
     // is safe for the path tracer to consume; false when the pass was
     // skipped (e.g., scene has no BVH built CPU-side).
+    // `cameraMoved` clamps temporal M to m_motionMCap for this frame —
+    // pass m_camera.hasMoved() from the renderer.
     bool runFrame(const DeviceSceneData& scene, const CameraParams& camera,
                   uint32_t width, uint32_t height, uint32_t sampleIndex,
                   bool enableEnvironment,
-                  class RayTracingBackend* backend = nullptr);
+                  class RayTracingBackend* backend = nullptr,
+                  bool cameraMoved = false);
 
     // Runtime tuning knobs.
     void setTemporalMCap(uint32_t n) { m_temporalMCap = n; }
@@ -142,7 +158,10 @@ public:
 
 private:
     GIBuffers m_buffers;
-    uint32_t m_temporalMCap  = 30;    // Bitterli-style M cap on history
+    uint32_t m_temporalMCap  = 20;    // Bitterli/Lin-style cap on history.
+                                       // Lower (~5) is auto-applied while the
+                                       // camera is moving; see runFrame().
+    uint32_t m_motionMCap    = 5;     // applied while camera is moving
     uint32_t m_spatialMCap   = 500;   // higher cap once spatially fused
     uint32_t m_numNeighbors  = 0;     // spatial reuse off by default
                                        // (combined with temporal reuse it

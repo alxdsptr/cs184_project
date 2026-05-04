@@ -280,8 +280,12 @@ __global__ void kReSTIRGI_InitCandidates(
     uint32_t pixelIdx = y * width + x;
 
     // Independent RNG stream from the DI pass.
-    uint32_t rng = pcg32_seed(pixelIdx * 0x517CC1B7u + sampleIndex,
-                              sampleIndex * 0xCAFEF00Du + 0x67u);
+    // Mix camera.frameIndex into the salt so the canonical sample changes
+    // every displayed frame even when sampleIndex is pinned to 0 by camera
+    // motion (resetAccumulation zeroes sampleIndex; frameIndex doesn't reset).
+    uint32_t seedSalt = sampleIndex + camera.frameIndex * 0x9E3779B9u;
+    uint32_t rng = pcg32_seed(pixelIdx * 0x517CC1B7u + seedSalt,
+                              seedSalt * 0xCAFEF00Du + 0x67u);
 
     float jx = camera.jitterOffset.x;
     float jy = camera.jitterOffset.y;
@@ -372,6 +376,7 @@ __global__ void kReSTIRGI_InitCandidates(
     float3 samplePos    = make_float3(0, 0, 0);
     float3 sampleNormal = make_float3(0, 1, 0);
     float3 Lo           = make_float3(0, 0, 0);
+    float  xrRoughness  = 0.0f;        // §7.5 connectability gate uses this
 
     if (!didHit2) {
         if (enableEnvironment) {
@@ -384,6 +389,7 @@ __global__ void kReSTIRGI_InitCandidates(
             sampleNormal = -wi;        // unused but keep something sensible
             Lo = envColor;
             hasSample = (envLum > 0.0f);
+            xrRoughness = 0.0f;        // env: gate disabled
         }
     } else if (hit2.materialIndex >= 0 &&
                (uint32_t)hit2.materialIndex < scene.materialCount) {
@@ -425,6 +431,7 @@ __global__ void kReSTIRGI_InitCandidates(
         sampleNormal = N2;
         isEnvSample  = false;
         hasSample = (restirLuminance(Lo) > 0.0f);
+        xrRoughness = fmaxf(mat2.roughness, 0.04f);
     }
 
     // Always treat this pixel as having drawn 1 RIS candidate, even if it
@@ -446,18 +453,25 @@ __global__ void kReSTIRGI_InitCandidates(
             cand.sampleRadiance = Lo;
             cand.isEnv          = isEnvSample ? 1u : 0u;
             cand.valid          = 1u;
+            cand.xrRoughness    = xrRoughness;     // §7.5 gate
             float3 wiOut;
             pHat  = giEvalTargetPdf(surf, cand, wiOut);
             wCand = (pdfBsdf > 0.0f) ? (pHat / pdfBsdf) : 0.0f;
         }
         float wSum = 0.0f;
-        // giReservoirUpdate already increments M unconditionally now (paper
-        // Algorithm 1) so this single call covers both the successful and
-        // failed cases.
+        // gris_streamCandidate (via the legacy giReservoirUpdate shim) bumps
+        // M unconditionally per paper §5.5/§5.7. Initial-candidate finalize
+        // now applies wSum/(M·p̂) to absorb the 1/M Talbot factor (Eq. 5).
         giReservoirUpdate(r, wSum,
                           surf.position, surf.normal,
                           isEnvSample, samplePos, sampleNormal, Lo,
                           pHat, wCand, pcg32_float(rng));
+        if (r.valid) {
+            // For canonical samples c_i ≡ p̂; cache for downstream MIS.
+            gris_cHat(r) = r.pHat;
+            // Reconnection-vertex roughness for §7.5 connectability gate.
+            r.xrRoughness = xrRoughness;
+        }
         giReservoirFinalize(r, wSum);
     }
 
@@ -475,6 +489,7 @@ __global__ void kReSTIRGI_Temporal(
     uint32_t width, uint32_t height,
     uint32_t prevWidth, uint32_t prevHeight,
     uint32_t sampleIndex,
+    uint32_t frameIndex,
     uint32_t mCap)
 {
     uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -499,19 +514,16 @@ __global__ void kReSTIRGI_Temporal(
 
     GIReservoir pr = prev[prevIdx];
     if (!pr.valid) return;
-    if (pr.M > (float)mCap) {
-        // Cap M to bound temporal correlation. wSum stays consistent because
-        // W = wSum/(M*pHat) — scaling M without touching W effectively scales
-        // wSum by the same factor, exactly the "reduce influence" effect.
-        pr.M = (float)mCap;
-    }
+    gris_capM(pr, (float)mCap);          // §6.4
 
-    uint32_t rng = pcg32_seed(pixelIdx * 0x12345678u + sampleIndex,
-                              sampleIndex * 0x9E3779B1u + 0xA5u);
+    uint32_t seedSalt = sampleIndex + frameIndex * 0x9E3779B9u;
+    uint32_t rng = pcg32_seed(pixelIdx * 0x12345678u + seedSalt,
+                              seedSalt * 0x9E3779B1u + 0xA5u);
 
-    float wSum = r.pHat * r.M * r.W;
-    giReservoirCombine(r, wSum, s, pr, pcg32_float(rng));
-    giReservoirFinalize(r, wSum);
+    GIReservoir peers[1] = { pr };
+    ReSTIRSurface peerS[1] = { sp };
+    float u01s[1] = { pcg32_float(rng) };
+    gris_mergeMultiPair(r, s, peers, peerS, 1, u01s);
 
     curr[pixelIdx] = r;
     (void)scene;
@@ -525,6 +537,7 @@ __global__ void kReSTIRGI_Spatial(
     const ReSTIRSurface* surf,
     uint32_t width, uint32_t height,
     uint32_t sampleIndex,
+    uint32_t frameIndex,
     uint32_t numNeighbors,
     float    radiusPixels,
     uint32_t mCap)
@@ -538,12 +551,23 @@ __global__ void kReSTIRGI_Spatial(
     ReSTIRSurface s = surf[pixelIdx];
     if (s.valid < 0.5f) { outRes[pixelIdx] = r; return; }
 
-    uint32_t rng = pcg32_seed(pixelIdx * 0xDEADBEEFu + sampleIndex,
-                              sampleIndex * 0x85EBCA77u + 0xC1u);
+    uint32_t seedSalt = sampleIndex + frameIndex * 0x9E3779B9u;
+    uint32_t rng = pcg32_seed(pixelIdx * 0xDEADBEEFu + seedSalt,
+                              seedSalt * 0x85EBCA77u + 0xC1u);
 
-    float wSum = r.pHat * r.M * r.W;
+    // Gather peers + surfaces, then perform a single GRIS multi-pair merge
+    // (paper §5.6 defensive pairwise MIS). Stack-resident arrays bound by
+    // GRIS_GI_MAX_NEIGHBORS — surplus neighbours silently dropped.
+    constexpr uint32_t GRIS_GI_MAX_NEIGHBORS = 8;
+    GIReservoir   peers[GRIS_GI_MAX_NEIGHBORS];
+    ReSTIRSurface peerS[GRIS_GI_MAX_NEIGHBORS];
+    float         u01s[GRIS_GI_MAX_NEIGHBORS];
+    uint32_t collected = 0;
 
-    for (uint32_t i = 0; i < numNeighbors; i++) {
+    uint32_t cap = numNeighbors;
+    if (cap > GRIS_GI_MAX_NEIGHBORS) cap = GRIS_GI_MAX_NEIGHBORS;
+
+    for (uint32_t i = 0; i < cap; i++) {
         float u1 = pcg32_float(rng);
         float u2 = pcg32_float(rng);
         float rr = sqrtf(u1) * radiusPixels;
@@ -562,11 +586,17 @@ __global__ void kReSTIRGI_Spatial(
 
         GIReservoir nr = inRes[nIdx];
         if (!nr.valid) continue;
-        if (nr.M > (float)mCap) nr.M = (float)mCap;
+        gris_capM(nr, (float)mCap);
 
-        giReservoirCombine(r, wSum, s, nr, pcg32_float(rng));
+        peers[collected] = nr;
+        peerS[collected] = ns;
+        u01s[collected]  = pcg32_float(rng);
+        collected++;
     }
-    giReservoirFinalize(r, wSum);
+
+    if (collected > 0) {
+        gris_mergeMultiPair(r, s, peers, peerS, collected, u01s);
+    }
     outRes[pixelIdx] = r;
     (void)scene;
 }
@@ -644,6 +674,7 @@ void launchReSTIRGITemporalReuse(
     uint32_t               width,
     uint32_t               height,
     uint32_t               sampleIndex,
+    uint32_t               frameIndex,
     uint32_t               temporalMCap)
 {
     if (!buffers.historyValid) return;
@@ -655,7 +686,7 @@ void launchReSTIRGITemporalReuse(
         buffers.d_reservoirsCurr, buffers.d_reservoirsPrev,
         buffers.d_surfaceCurr,    buffers.d_surfacePrev,
         width, height, buffers.prevWidth, buffers.prevHeight,
-        sampleIndex, temporalMCap);
+        sampleIndex, frameIndex, temporalMCap);
 }
 
 void launchReSTIRGISpatialReuse(
@@ -664,6 +695,7 @@ void launchReSTIRGISpatialReuse(
     uint32_t               width,
     uint32_t               height,
     uint32_t               sampleIndex,
+    uint32_t               frameIndex,
     uint32_t               numNeighbors,
     float                  radiusPixels,
     uint32_t               spatialMCap)
@@ -674,7 +706,7 @@ void launchReSTIRGISpatialReuse(
         scene,
         buffers.d_reservoirsCurr, buffers.d_reservoirsSpatial,
         buffers.d_surfaceCurr,
-        width, height, sampleIndex,
+        width, height, sampleIndex, frameIndex,
         numNeighbors, radiusPixels, spatialMCap);
 }
 
@@ -754,9 +786,11 @@ bool ReSTIRGIContext::runFrame(
     const DeviceSceneData& scene, const CameraParams& camera,
     uint32_t width, uint32_t height, uint32_t sampleIndex,
     bool enableEnvironment,
-    RayTracingBackend* backend)
+    RayTracingBackend* backend,
+    bool cameraMoved)
 {
     if (!m_enabled) return false;
+    uint32_t effectiveTemporalMCap = cameraMoved ? m_motionMCap : m_temporalMCap;
 
     // Prefer backend's native init (OptiX raygen → GAS). Falls back to the
     // CUDA BVH kernel when the backend has no implementation or returns
@@ -765,11 +799,17 @@ bool ReSTIRGIContext::runFrame(
     // until the fall-back path.
     bool initRan = false;
     if (backend) {
+        // GI uses a single candidate per pixel (CUDA path matches), but we
+        // pass it explicitly so OptiX picks the same M instead of its old
+        // hardcoded 1. If we ever expose a numCandidates knob in
+        // ReSTIRGIContext, plumb it through here.
+        const uint32_t kGINumCandidates = 1;
         initRan = backend->runReSTIRGIInitCandidates(
             scene, camera,
             (void*)m_buffers.d_reservoirsCurr,
             (void*)m_buffers.d_surfaceCurr,
-            width, height, sampleIndex, enableEnvironment);
+            width, height, sampleIndex, enableEnvironment,
+            kGINumCandidates);
     }
     if (!initRan) {
         if (!scene.d_bvhNodes || scene.totalTriangles == 0) return false;
@@ -778,9 +818,11 @@ bool ReSTIRGIContext::runFrame(
             width, height, sampleIndex, enableEnvironment, m_temporalMCap);
     }
     launchReSTIRGITemporalReuse(
-        scene, m_buffers, width, height, sampleIndex, m_temporalMCap);
+        scene, m_buffers, width, height,
+        sampleIndex, camera.frameIndex, effectiveTemporalMCap);
     launchReSTIRGISpatialReuse(
-        scene, m_buffers, width, height, sampleIndex,
+        scene, m_buffers, width, height,
+        sampleIndex, camera.frameIndex,
         m_numNeighbors, m_spatialRadius, m_spatialMCap);
     // Spatial output lives in d_reservoirsSpatial — swap with curr so the
     // shade pass and (next frame's) temporal reuse see the post-spatial

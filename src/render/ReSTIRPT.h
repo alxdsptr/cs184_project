@@ -67,14 +67,19 @@ void launchReSTIRPTInitialCandidates(
     uint32_t               height,
     uint32_t               sampleIndex,
     bool                   enableEnvironment,
-    uint32_t               pathLength); // bounces past x_r (k+1 vertices total)
+    uint32_t               pathLength,    // bounces past x_r (k+1 vertices total)
+    uint32_t               numCandidates); // M for paper §4 RIS at the visible point
 
+// `frameIndex` is the monotonic per-display-frame counter (camera.frameIndex).
+// Mixed into the kernel RNG seed so ReSTIR keeps exploring path space even
+// when sampleIndex is pinned to 0 by continuous camera motion.
 void launchReSTIRPTTemporalReuse(
     const DeviceSceneData& scene,
     PTBuffers              buffers,
     uint32_t               width,
     uint32_t               height,
     uint32_t               sampleIndex,
+    uint32_t               frameIndex,
     uint32_t               temporalMCap);
 
 void launchReSTIRPTSpatialReuse(
@@ -83,6 +88,7 @@ void launchReSTIRPTSpatialReuse(
     uint32_t               width,
     uint32_t               height,
     uint32_t               sampleIndex,
+    uint32_t               frameIndex,
     uint32_t               numNeighbors,
     float                  radiusPixels,
     uint32_t               spatialMCap);
@@ -108,10 +114,13 @@ public:
     // Returns true when d_indirectOut is freshly populated and the path
     // tracer may consume it; false when the pass was skipped (no scene /
     // CUDA BVH for the fall-back path).
+    // `cameraMoved` clamps temporal M to m_motionMCap for this frame —
+    // pass m_camera.hasMoved() from the renderer.
     bool runFrame(const DeviceSceneData& scene, const CameraParams& camera,
                   uint32_t width, uint32_t height, uint32_t sampleIndex,
                   bool enableEnvironment,
-                  RayTracingBackend* backend = nullptr);
+                  RayTracingBackend* backend = nullptr,
+                  bool cameraMoved = false);
 
     // Runtime knobs.
     void setTemporalMCap(uint32_t n) { m_temporalMCap = n; }
@@ -119,6 +128,7 @@ public:
     void setNumNeighbors(uint32_t n) { m_numNeighbors = n; }
     void setSpatialRadius(float r)   { m_spatialRadius = r; }
     void setPathLength(uint32_t n)   { m_pathLength = n; }
+    void setNumCandidates(uint32_t n){ m_numCandidates = n; }
     void setEnabled(bool on)         { m_enabled = on; }
 
     uint32_t temporalMCap()  const { return m_temporalMCap; }
@@ -126,6 +136,7 @@ public:
     uint32_t numNeighbors()  const { return m_numNeighbors; }
     float    spatialRadius() const { return m_spatialRadius; }
     uint32_t pathLength()    const { return m_pathLength; }
+    uint32_t numCandidates() const { return m_numCandidates; }
     bool     enabled()       const { return m_enabled; }
 
 private:
@@ -135,10 +146,18 @@ private:
     // extra pathLength=4 — beyond ~4 bounces from x_r the additional variance
     // dominates anything reservoir reuse can recover). Russian roulette inside
     // the random-walk further bounds path length.
-    uint32_t m_temporalMCap  = 30;
+    // Defaults match the paper's real-time configuration (§8.3) where
+    // possible: M_c = 20 for temporal correlation cap, k=3 spatial neighbors
+    // in a 20-pixel disk. The paper uses M=1 candidate for real-time and
+    // M=32 for offline; we default to M=4 as a compromise (small enough to
+    // stay interactive, large enough that initial RIS gives noticeable
+    // variance reduction over the M=1 ReSTIR-GI-style baseline).
+    uint32_t m_temporalMCap  = 20;
+    uint32_t m_motionMCap    = 5;     // applied while camera is moving
     uint32_t m_spatialMCap   = 500;
     uint32_t m_numNeighbors  = 3;
-    float    m_spatialRadius = 30.0f;
+    float    m_spatialRadius = 20.0f;
     uint32_t m_pathLength    = 4;     // bounces past the reconnection vertex
+    uint32_t m_numCandidates = 4;     // M for initial-candidate RIS (paper §8.3)
     bool     m_enabled       = false; // off by default — opt-in
 };

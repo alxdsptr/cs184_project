@@ -722,7 +722,8 @@ bool OptiXBackend::launchReSTIRGIInitCandidatesOptiX(
     uint32_t               width,
     uint32_t               height,
     uint32_t               sampleIndex,
-    bool                   enableEnvironment)
+    bool                   enableEnvironment,
+    uint32_t               numCandidates)
 {
     if (!m_initialized || !m_gasHandle || !m_dRaygenReSTIRGIRecord) return false;
     if (!d_giReservoirsCurr || !d_giSurfacesCurr) return false;
@@ -731,6 +732,7 @@ bool OptiXBackend::launchReSTIRGIInitCandidatesOptiX(
     // running the pass is wasted work. Skip in that case.
     if ((!scene.d_areaLights || scene.areaLightCount == 0) && !enableEnvironment)
         return false;
+    if (numCandidates < 1) numCandidates = 1;
 
     LaunchParams lp;
     std::memset(&lp, 0, sizeof(lp));
@@ -746,6 +748,7 @@ bool OptiXBackend::launchReSTIRGIInitCandidatesOptiX(
     lp.giReservoirsCurr   = static_cast<GIReservoir*>(d_giReservoirsCurr);
     lp.giSurfacesCurr     = static_cast<ReSTIRSurface*>(d_giSurfacesCurr);
     lp.giEnableEnvironment = enableEnvironment ? 1u : 0u;
+    lp.giNumCandidates    = numCandidates;
 
     m_sbt.raygenRecord = m_dRaygenReSTIRGIRecord;
 
@@ -774,7 +777,8 @@ bool OptiXBackend::launchReSTIRPTInitCandidatesOptiX(
     uint32_t               height,
     uint32_t               sampleIndex,
     bool                   enableEnvironment,
-    uint32_t               pathLength)
+    uint32_t               pathLength,
+    uint32_t               numCandidates)
 {
     if (!m_initialized || !m_gasHandle || !m_dRaygenReSTIRPTRecord) return false;
     if (!d_ptReservoirsCurr || !d_ptSurfacesCurr) return false;
@@ -782,6 +786,7 @@ bool OptiXBackend::launchReSTIRPTInitCandidatesOptiX(
     // scene can contribute.
     if ((!scene.d_areaLights || scene.areaLightCount == 0) && !enableEnvironment)
         return false;
+    if (numCandidates < 1) numCandidates = 1;
 
     LaunchParams lp;
     std::memset(&lp, 0, sizeof(lp));
@@ -797,6 +802,7 @@ bool OptiXBackend::launchReSTIRPTInitCandidatesOptiX(
     lp.ptReservoirsCurr    = static_cast<GIReservoir*>(d_ptReservoirsCurr);
     lp.ptSurfacesCurr      = static_cast<ReSTIRSurface*>(d_ptSurfacesCurr);
     lp.ptPathLength        = pathLength;
+    lp.ptNumCandidates     = numCandidates;
     // The PT raygen reads `giEnableEnvironment` for the env toggle (sharing
     // the same field name keeps OptiXPrograms cleaner — no extra param).
     lp.giEnableEnvironment = enableEnvironment ? 1u : 0u;

@@ -57,7 +57,11 @@ public:
         uint32_t maxBounces,
         uint32_t samplesPerFrame,
         VulkanDisplay* display,
-        uint32_t frameIndex
+        uint32_t frameIndex,
+        // True when the camera moved this frame. Tells the ReSTIR passes to
+        // clamp temporal M-cap aggressively so a 20-frame-old reservoir from
+        // before the motion doesn't outweigh the fresh canonical sample.
+        bool cameraMoved = false
     );
 
     // Mode plumbing (safe to call after init()).

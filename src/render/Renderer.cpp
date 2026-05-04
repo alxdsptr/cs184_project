@@ -101,7 +101,8 @@ void Renderer::renderFrame(
     uint32_t maxBounces,
     uint32_t samplesPerFrame,
     VulkanDisplay* display,
-    uint32_t frameIndex)
+    uint32_t frameIndex,
+    bool cameraMoved)
 {
     uint32_t sampleIndex = m_accumBuffer.getSampleCount();
     if (samplesPerFrame < 1) samplesPerFrame = 1;
@@ -121,7 +122,7 @@ void Renderer::renderFrame(
         if (m_restir.enabled()) {
             restirRan = m_restir.runFrame(sceneWithBVH, camera,
                                           m_width, m_height, sampleIndex,
-                                          backend);
+                                          backend, cameraMoved);
         }
 
         // ── ReSTIR GI prepass ────────────────────────────────────
@@ -134,7 +135,7 @@ void Renderer::renderFrame(
             restirGIRan = m_restirGI.runFrame(sceneWithBVH, camera,
                                               m_width, m_height, sampleIndex,
                                               enableEnvironment,
-                                              backend);
+                                              backend, cameraMoved);
         }
 
         // ── ReSTIR PT prepass (Lin et al. 2022) ──────────────────
@@ -147,7 +148,7 @@ void Renderer::renderFrame(
             restirPTRan = m_restirPT.runFrame(sceneWithBVH, camera,
                                               m_width, m_height, sampleIndex,
                                               enableEnvironment,
-                                              backend);
+                                              backend, cameraMoved);
         }
 
         DeviceSceneData scenePatched = scene;

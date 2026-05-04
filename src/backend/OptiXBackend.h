@@ -135,7 +135,8 @@ public:
         uint32_t               width,
         uint32_t               height,
         uint32_t               sampleIndex,
-        bool                   enableEnvironment);
+        bool                   enableEnvironment,
+        uint32_t               numCandidates);
 
     bool runReSTIRGIInitCandidates(
         const DeviceSceneData& scene,
@@ -145,11 +146,12 @@ public:
         uint32_t               width,
         uint32_t               height,
         uint32_t               sampleIndex,
-        bool                   enableEnvironment) override
+        bool                   enableEnvironment,
+        uint32_t               numCandidates) override
     {
         return launchReSTIRGIInitCandidatesOptiX(
             scene, camera, d_giReservoirsCurr, d_giSurfacesCurr,
-            width, height, sampleIndex, enableEnvironment);
+            width, height, sampleIndex, enableEnvironment, numCandidates);
     }
 
     // ReSTIR PT initial-candidates raygen. Casts the primary ray, the first
@@ -166,7 +168,8 @@ public:
         uint32_t               height,
         uint32_t               sampleIndex,
         bool                   enableEnvironment,
-        uint32_t               pathLength);
+        uint32_t               pathLength,
+        uint32_t               numCandidates);
 
     bool runReSTIRPTInitCandidates(
         const DeviceSceneData& scene,
@@ -177,11 +180,12 @@ public:
         uint32_t               height,
         uint32_t               sampleIndex,
         bool                   enableEnvironment,
-        uint32_t               pathLength) override
+        uint32_t               pathLength,
+        uint32_t               numCandidates) override
     {
         return launchReSTIRPTInitCandidatesOptiX(
             scene, camera, d_ptReservoirsCurr, d_ptSurfacesCurr,
-            width, height, sampleIndex, enableEnvironment, pathLength);
+            width, height, sampleIndex, enableEnvironment, pathLength, numCandidates);
     }
 
 private:

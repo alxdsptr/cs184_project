@@ -179,8 +179,11 @@ extern "C" __global__ void __raygen__restir_gi_init_candidates()
     ReSTIRSurface surf{};
     surf.valid = 0.0f;
 
-    uint32_t rng = pcg32_seed(pixelIdx * 0x517CC1B7u + params.sampleIndex,
-                              params.sampleIndex * 0xCAFEF00Du + 0x67u);
+    // Mix camera.frameIndex into salt so canonical sample changes every
+    // frame even when sampleIndex is pinned to 0 by camera motion.
+    uint32_t seedSalt = params.sampleIndex + camera.frameIndex * 0x9E3779B9u;
+    uint32_t rng = pcg32_seed(pixelIdx * 0x517CC1B7u + seedSalt,
+                              seedSalt * 0xCAFEF00Du + 0x67u);
 
     float jx = camera.jitterOffset.x;
     float jy = camera.jitterOffset.y;
@@ -256,17 +259,31 @@ extern "C" __global__ void __raygen__restir_gi_init_candidates()
         surf.prevPixel  = make_float2((clipPrev.x + 1.0f) * 0.5f * (float)params.width,
                                        (1.0f - clipPrev.y) * 0.5f * (float)params.height);
 
-        float3 wi;
-        float  pdfBsdf = 0.0f;
-        bool sampledDir = gi_optix::giSampleBsdfDir(surf, rng, wi, pdfBsdf);
+        // ── Generate `numCandidates` independent paths and stream into RIS ──
+        // Mirrors the CUDA kernel (render/ReSTIRGI.cu) so OptiX produces
+        // visually equivalent reservoirs. Single-candidate degenerates ReSTIR
+        // to "1-bounce path tracing with reservoir reuse" — visibly noisier
+        // than the CUDA path. The loop here restores parity.
+        uint32_t numCandidates = params.giNumCandidates;
+        if (numCandidates < 1) numCandidates = 1;
+        float wSum = 0.0f;
+        float xrRoughnessKept = 1.0f;
 
-        bool   hasSample   = false;
-        bool   isEnvSample = false;
-        float3 samplePos    = make_float3(0,0,0);
-        float3 sampleNormal = make_float3(0,1,0);
-        float3 Lo           = make_float3(0,0,0);
+        for (uint32_t k = 0; k < numCandidates; k++) {
+            float3 wi;
+            float  pdfBsdf = 0.0f;
+            if (!gi_optix::giSampleBsdfDir(surf, rng, wi, pdfBsdf)) {
+                r.M += 1.0f;   // failed attempt still counts toward |R|
+                continue;
+            }
 
-        if (sampledDir) {
+            bool   isEnvCand    = false;
+            float3 candPos      = make_float3(0,0,0);
+            float3 candNormal   = make_float3(0,1,0);
+            float3 Lo           = make_float3(0,0,0);
+            float  candXrRough  = 0.0f;
+            bool   ok           = false;
+
             float3 sec_origin = hitPos + N * 0.001f;
             RadiancePayload rp2 = traceRadianceRay(
                 handle, sec_origin, wi, 1e-3f, 1e30f);
@@ -276,11 +293,12 @@ extern "C" __global__ void __raygen__restir_gi_init_candidates()
                     float envLum = restirLuminance(envColor);
                     const float clampLum = 100.0f;
                     if (envLum > clampLum) envColor = envColor * (clampLum / envLum);
-                    isEnvSample = true;
-                    samplePos    = wi;
-                    sampleNormal = -wi;
-                    Lo = envColor;
-                    hasSample = (envLum > 0.0f);
+                    isEnvCand   = true;
+                    candPos     = wi;
+                    candNormal  = -wi;
+                    Lo          = envColor;
+                    candXrRough = 0.0f;
+                    ok          = (envLum > 0.0f);
                 }
             } else {
                 uint32_t t2 = rp2.primIdx;
@@ -325,37 +343,42 @@ extern "C" __global__ void __raygen__restir_gi_init_candidates()
                         scene, handle, sp, N2, albedo2,
                         fmaxf(mat2.roughness, 0.04f), mat2.metallic,
                         mat2.pureDiffuse != 0, viewDir2, rng);
-                    Lo = emis + direct;
-                    samplePos    = sp;
-                    sampleNormal = N2;
-                    isEnvSample  = false;
-                    hasSample = (restirLuminance(Lo) > 0.0f);
+                    Lo          = emis + direct;
+                    candPos     = sp;
+                    candNormal  = N2;
+                    isEnvCand   = false;
+                    candXrRough = fmaxf(mat2.roughness, 0.04f);
+                    ok          = (restirLuminance(Lo) > 0.0f);
                 }
             }
+
+            float pHat = 0.0f;
+            if (ok) {
+                GIReservoir candR{};
+                candR.visiblePos     = surf.position;
+                candR.visibleNormal  = surf.normal;
+                candR.samplePos      = candPos;
+                candR.sampleNormal   = candNormal;
+                candR.sampleRadiance = Lo;
+                candR.isEnv          = isEnvCand ? 1u : 0u;
+                candR.valid          = 1u;
+                candR.xrRoughness    = candXrRough;
+                float3 wiOut;
+                pHat = giEvalTargetPdf(surf, candR, wiOut);
+            }
+
+            bool replaced = gris_streamCandidate(
+                r, wSum,
+                surf.position, surf.normal,
+                isEnvCand, candPos, candNormal, Lo,
+                pHat, pdfBsdf, pcg32_float(rng));
+            if (replaced) xrRoughnessKept = candXrRough;
         }
 
-        // Always M += 1 (paper Algorithm 1) — match the CUDA init kernel's
-        // M-counting fix so failed candidates are still counted.
-        float pHat = 0.0f;
-        float wCand = 0.0f;
-        if (hasSample) {
-            GIReservoir cand{};
-            cand.visiblePos     = surf.position;
-            cand.visibleNormal  = surf.normal;
-            cand.samplePos      = samplePos;
-            cand.sampleNormal   = sampleNormal;
-            cand.sampleRadiance = Lo;
-            cand.isEnv          = isEnvSample ? 1u : 0u;
-            cand.valid          = 1u;
-            float3 wiOut;
-            pHat  = giEvalTargetPdf(surf, cand, wiOut);
-            wCand = (pdfBsdf > 0.0f) ? (pHat / pdfBsdf) : 0.0f;
+        if (r.valid) {
+            gris_cHat(r) = r.pHat;
+            r.xrRoughness = xrRoughnessKept;
         }
-        float wSum = 0.0f;
-        giReservoirUpdate(r, wSum,
-                          surf.position, surf.normal,
-                          isEnvSample, samplePos, sampleNormal, Lo,
-                          pHat, wCand, pcg32_float(rng));
         giReservoirFinalize(r, wSum);
     }
 

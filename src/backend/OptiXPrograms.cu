@@ -310,8 +310,21 @@ extern "C" __global__ void __raygen__path_trace()
         uint32_t rng = pcg32_seed(pixelIdx * 0x9E3779B9u + s,
                                   params.sampleIndex * 0x85EBCA6Bu + s);
 
+        // ReSTIR (DI / GI / PT) reservoirs were generated against the surface
+        // hit by the unjittered camera ray (only camera.jitterOffset, no
+        // per-sample random sub-pixel jitter). To consume them at this pixel
+        // the primary ray must hit the SAME surface — otherwise the stored
+        // pHat / W is for a different shading point than the integrand we
+        // evaluate below, producing strong overexposure on glossy/reflective
+        // surfaces. Mirrors PathTraceKernel.cu's `restirActiveBounce0`.
+        bool restirActiveBounce0 =
+            (s == 0) && (
+                (scene.restirEnabled   != 0 && scene.d_restirReservoirs != nullptr) ||
+                (scene.restirGIEnabled != 0 && scene.d_restirGIIndirect != nullptr) ||
+                (scene.restirPTEnabled != 0 && scene.d_restirPTIndirect != nullptr));
+
         float jx, jy;
-        if (dlssPublish) {
+        if (dlssPublish || restirActiveBounce0) {
             jx = camera.jitterOffset.x;
             jy = camera.jitterOffset.y;
         } else {
@@ -632,17 +645,47 @@ extern "C" __global__ void __raygen__path_trace()
             // Direct lighting NEE
             if (scene.d_areaLights && scene.areaLightCount > 0 &&
                 scene.d_areaLightCDF && scene.areaLightTotalWeight > 0.0f) {
-                uint32_t lightIndex = sampleAreaLightIndex(
-                    scene.d_areaLightCDF, scene.areaLightCount,
-                    pcg32_float(rng));
-                GPUAreaLight light = scene.d_areaLights[lightIndex];
+                // ReSTIR DI is applied at the primary hit (bounce 0) only —
+                // the reservoir buffer is populated for camera rays only.
+                bool restirActive = (scene.restirEnabled != 0) &&
+                                    (scene.d_restirReservoirs != nullptr) &&
+                                    (bounce == 0) && (s == 0);
+                bool restirSkip = false;
+                uint32_t lightIndex = 0;
+                float    b0 = 0.0f, b1 = 0.0f, b2 = 0.0f;
+                float    restirW = 0.0f;
+                if (restirActive) {
+                    const ReSTIRReservoir* res =
+                        reinterpret_cast<const ReSTIRReservoir*>(scene.d_restirReservoirs);
+                    ReSTIRReservoir r = res[pixelIdx];
+                    if (r.lightIndex == 0xFFFFFFFFu || r.W <= 0.0f || r.pHat <= 0.0f) {
+                        // Empty reservoir (e.g. surface-culled) → skip NEE at
+                        // this bounce. Indirect via BSDF / GI/PT consumption
+                        // below still works, so the image is unbiased on
+                        // average.
+                        restirSkip = true;
+                    } else {
+                        lightIndex = r.lightIndex;
+                        b1 = r.baryB1;
+                        b2 = r.baryB2;
+                        b0 = 1.0f - b1 - b2;
+                        restirW = r.W;
+                    }
+                } else {
+                    lightIndex = sampleAreaLightIndex(
+                        scene.d_areaLightCDF, scene.areaLightCount,
+                        pcg32_float(rng));
 
-                float r1 = pcg32_float(rng);
-                float r2 = pcg32_float(rng);
-                float su = sqrtf(r1);
-                float b0 = 1.0f - su;
-                float b1 = su * (1.0f - r2);
-                float b2 = su * r2;
+                    float r1 = pcg32_float(rng);
+                    float r2 = pcg32_float(rng);
+                    float su = sqrtf(r1);
+                    b0 = 1.0f - su;
+                    b1 = su * (1.0f - r2);
+                    b2 = su * r2;
+                }
+
+                if (!restirSkip) {
+                GPUAreaLight light = scene.d_areaLights[lightIndex];
 
                 float3 lightV0 = light.v0;
                 float3 lightV1 = light.v0 + light.e1;
@@ -665,22 +708,35 @@ extern "C" __global__ void __raygen__path_trace()
                                       0.7152f * shadowTransmittance.y +
                                       0.0722f * shadowTransmittance.z;
                     if (shadowLum > 1e-6f) {
-                        float pTri = light.weight / scene.areaLightTotalWeight;
-                        float pArea = pTri / fmaxf(light.area, 1e-7f);
-                        float pdfOmega = pArea * dist2 / fmaxf(lightNdot, 1e-7f);
-
                         float3 V = -ray.direction;
                         float3 brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
-                        float neeSpecProb = materialSpecProb(mat, N, V, albedo);
-                        float pdfBsdf = materialMixturePdf(mat, N, V, Ld, neeSpecProb);
-                        float weight = powerHeuristic(pdfOmega, pdfBsdf);
-
                         float3 Le = sampleAreaLightLe(light, b0, b1, b2);
-                        radiance += throughput * shadowTransmittance * brdf *
-                                    Le *
-                                    (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
+
+                        if (restirActive) {
+                            // ReSTIR estimator: f(x) * W where f is the
+                            // unshadowed integrand (BRDF * Le * G * NdotL) and
+                            // W is the reservoir's contribution weight. No MIS
+                            // against BSDF sampling — ReSTIR *is* the
+                            // light-side strategy at the primary hit.
+                            float geom = lightNdot / dist2;
+                            radiance += throughput * shadowTransmittance *
+                                        brdf * Le * (NdotL * geom) * restirW;
+                        } else {
+                            float pTri = light.weight / scene.areaLightTotalWeight;
+                            float pArea = pTri / fmaxf(light.area, 1e-7f);
+                            float pdfOmega = pArea * dist2 / fmaxf(lightNdot, 1e-7f);
+
+                            float neeSpecProb = materialSpecProb(mat, N, V, albedo);
+                            float pdfBsdf = materialMixturePdf(mat, N, V, Ld, neeSpecProb);
+                            float weight = powerHeuristic(pdfOmega, pdfBsdf);
+
+                            radiance += throughput * shadowTransmittance * brdf *
+                                        Le *
+                                        (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
+                        }
                     }
                 }
+                } // end !restirSkip
             }
 
             // Point lights are delta emitters — always sampled, regardless of
@@ -715,6 +771,29 @@ extern "C" __global__ void __raygen__path_trace()
                     direct += brdf * shadowTransmittancePL * Li * NdotL;
                 }
                 radiance += throughput * direct;
+            }
+
+            // ReSTIR PT / GI consumption at the primary hit on sample s==0.
+            // PT takes precedence (its postfix already contains GI's 1-bounce
+            // NEE plus k more bounces' worth of light transport). Either branch
+            // adds the pre-computed indirect estimate and skips continuation
+            // bounces; the direct lighting at the primary hit was already
+            // added above. Restricted to bounce==0 because the PT/GI buffer is
+            // populated for camera rays only — higher bounces fall through to
+            // plain BSDF sampling.
+            if (scene.restirPTEnabled != 0 && scene.d_restirPTIndirect != nullptr &&
+                bounce == 0 && s == 0)
+            {
+                float3 indirect = scene.d_restirPTIndirect[pixelIdx];
+                radiance += throughput * indirect;
+                break;
+            }
+            if (scene.restirGIEnabled != 0 && scene.d_restirGIIndirect != nullptr &&
+                bounce == 0 && s == 0)
+            {
+                float3 indirect = scene.d_restirGIIndirect[pixelIdx];
+                radiance += throughput * indirect;
+                break;
             }
 
             // BRDF sampling
@@ -1554,8 +1633,11 @@ extern "C" __global__ void __raygen__restir_init_candidates()
     surf.valid = 0.0f;
 
     // Dedicated RNG stream (matches the CUDA kernel's seeding salt).
-    uint32_t rng = pcg32_seed(pixelIdx * 0xA1B2C3D4u + params.sampleIndex,
-                              params.sampleIndex * 0xDEADBEEFu + 1u);
+    // Mix camera.frameIndex so the canonical sample changes every frame
+    // even when sampleIndex is reset to 0 by camera motion.
+    uint32_t seedSalt = params.sampleIndex + camera.frameIndex * 0x9E3779B9u;
+    uint32_t rng = pcg32_seed(pixelIdx * 0xA1B2C3D4u + seedSalt,
+                              seedSalt * 0xDEADBEEFu + 1u);
 
     // Primary ray — same jitter as the main kernel so the reservoir lines up
     // with the shading point that will consume it.

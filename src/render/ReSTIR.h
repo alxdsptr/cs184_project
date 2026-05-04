@@ -98,13 +98,16 @@ void launchReSTIRVisibilityReuse(
     uint32_t               height);
 
 // Combine each pixel's reservoir with the one at its reprojected position
-// in the previous frame.
+// in the previous frame. `frameIndex` is the monotonic per-display-frame
+// counter (camera.frameIndex), mixed into the kernel RNG seed so ReSTIR
+// keeps exploring path space when sampleIndex is pinned to 0 by motion.
 void launchReSTIRTemporalReuse(
     const DeviceSceneData& scene,
     ReSTIRBuffers          buffers,
     uint32_t               width,
     uint32_t               height,
     uint32_t               sampleIndex,
+    uint32_t               frameIndex,
     uint32_t               temporalMCap);
 
 // Combine each pixel's reservoir with k neighboring reservoirs within a
@@ -116,6 +119,7 @@ void launchReSTIRSpatialReuse(
     uint32_t               width,
     uint32_t               height,
     uint32_t               sampleIndex,
+    uint32_t               frameIndex,
     uint32_t               numNeighbors,
     float                  radiusPixels);
 
@@ -144,9 +148,15 @@ public:
     // frame (main kernel may consume it); false if the pass was skipped
     // (caller must disable ReSTIR consumption this frame to avoid reading
     // last frame's reservoirs as if they were current).
+    // `cameraMoved` (defaults to false for source compat) tells the
+    // temporal pass to clamp the reused reservoir's M to a low value
+    // (m_motionMCap) for this frame, so a moving camera doesn't keep
+    // shading from a 20-frame-old sample whose geometry/visibility may
+    // have drifted away. Pass m_camera.hasMoved() from the renderer.
     bool runFrame(const DeviceSceneData& scene, const CameraParams& camera,
                   uint32_t width, uint32_t height, uint32_t sampleIndex,
-                  RayTracingBackend* backend = nullptr);
+                  RayTracingBackend* backend = nullptr,
+                  bool cameraMoved = false);
 
     // Runtime tuning knobs.
     void setNumCandidates(uint32_t n) { m_numCandidates = n; }
@@ -165,6 +175,7 @@ private:
     ReSTIRBuffers m_buffers;
     uint32_t m_numCandidates = 8;     // M initial candidates per pixel
     uint32_t m_temporalMCap  = 20;    // Bitterli's cap = 20 * M_initial
+    uint32_t m_motionMCap    = 5;     // applied while camera is moving
     uint32_t m_numNeighbors  = 3;     // neighbors per spatial pass
     float    m_spatialRadius = 15.0f; // pixels
     bool     m_enabled       = true;
