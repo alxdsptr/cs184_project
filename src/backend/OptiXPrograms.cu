@@ -1134,6 +1134,12 @@ extern "C" __global__ void __raygen__path_trace_split()
     float  outPrimaryViewZ     = 0.0f;
     float2 outPrimaryMvPx      = make_float2(0.0f, 0.0f);
     float  outPrimaryNdcZ      = 1.0f;
+    // DLSS-RR fix: see PathTraceKernelSplit.cu — preserve primary hit pos /
+    // view ray dir / metallic for post-loop mirror-ray spec hitT trace and
+    // metallic-aware spec albedo F0.
+    float3 outPrimaryHitPos    = make_float3(0, 0, 0);
+    float3 outPrimaryRayDir    = make_float3(0, 0, -1);
+    float  outPrimaryMetallic  = 0.0f;
 
     for (uint32_t s = 0; s < samplesPerPixel; s++) {
         uint32_t rng = pcg32_seed(pixelIdx * 0x9E3779B9u + s,
@@ -1164,6 +1170,9 @@ extern "C" __global__ void __raygen__path_trace_split()
         int    pickedBucket     = 0;       // 0 = diff, 1 = spec
         float  bucketHitDist    = 0.0f;
         bool   bucketHitDistSet = false;
+        float3 primaryHitPos    = make_float3(0, 0, 0);
+        float3 primaryRayDir    = make_float3(0, 0, -1);
+        float  primaryMetallic  = 0.0f;
 
         bool firstBounce      = true;
         bool lastBounceDelta  = false;
@@ -1328,6 +1337,9 @@ extern "C" __global__ void __raygen__path_trace_split()
                 primaryAlbedo    = albedo;
                 primaryNormal    = N;
                 primaryRoughness = mat.roughness;
+                primaryHitPos    = hit.position;
+                primaryRayDir    = ray.direction;
+                primaryMetallic  = mat.metallic;
                 primaryViewZ     = nrd_helpers::computeViewZ(hit.position, camera.position, camera.forward);
                 primaryMvPx      = nrd_helpers::computeMotionVectorPx(
                     hit.position, camera.viewProjMatrix, camera.prevViewProjMatrix,
@@ -1667,6 +1679,9 @@ extern "C" __global__ void __raygen__path_trace_split()
             outPrimaryViewZ     = primaryViewZ;
             outPrimaryMvPx      = primaryMvPx;
             outPrimaryNdcZ      = primaryNdcZ;
+            outPrimaryHitPos    = primaryHitPos;
+            outPrimaryRayDir    = primaryRayDir;
+            outPrimaryMetallic  = primaryMetallic;
             gbufferWritten = true;
         }
     } // end spp loop
@@ -1681,17 +1696,35 @@ extern "C" __global__ void __raygen__path_trace_split()
     float specHitAvg = specHitCount > 0 ? (specHitSum / (float)specHitCount) : 0.0f;
     float anyHitAvg  = anyHitCount  > 0 ? (anyHitSum  / (float)anyHitCount)  : 0.0f;
 
-    // DLSS-RR specular albedo: F0 = lerp(0.04, primaryAlbedo, 0). We fall back
-    // to dielectric (metallic=0) F0 since the kernel doesn't preserve metallic
-    // past the bucket pick — EnvBRDFApprox2's bias term saturates for high-F0
-    // pixels (sky default 0.5,0.5,0.5 already handled below).
-    float3 specF0_RR = make_float3(0.04f, 0.04f, 0.04f);
-    float NoV_RR = fmaxf(-dot(camera.forward, outPrimaryNormal), 0.0f);
+    // DLSS-RR specular albedo: F0 = lerp(0.04, primaryAlbedo, metallic) per
+    // §3.4.2 + Appendix EnvBRDFApprox2. Metallic is now preserved through
+    // outPrimaryMetallic. NoV uses the actual primary ray direction (rather
+    // than camera.forward) for sub-pixel-stable, jittered-ray-correct values.
+    float3 specF0_RR = lerp(make_float3(0.04f, 0.04f, 0.04f),
+                            outPrimaryAlbedo, outPrimaryMetallic);
+    float NoV_RR = fmaxf(-dot(outPrimaryRayDir, outPrimaryNormal), 0.0f);
     float3 specAlbedoAvg = envBRDFApprox2_split(
         specF0_RR, outPrimaryRoughness * outPrimaryRoughness, NoV_RR);
     if (!gbufferWritten) {
         specAlbedoAvg = make_float3(0.5f, 0.5f, 0.5f);
     }
+
+    // DLSS-RR specular hit distance (§3.4.9): explicit mirror-ray trace from
+    // the primary hit. See PathTraceKernelSplit.cu for the full rationale.
+    // The previous `anyHitAvg` was a per-bucket-roll average that flickers
+    // frame-to-frame, producing the surface shimmer measured at 2.19 (vs
+    // DLSS-SR 1.45). One mirror trace per pixel is deterministic.
+    float rrSpecHitT = 0.0f;
+    if (gbufferWritten) {
+        float3 rd = outPrimaryRayDir;
+        float3 N  = outPrimaryNormal;
+        float3 mirrorDir = normalize(rd - N * (2.0f * dot(rd, N)));
+        float3 mOrigin   = outPrimaryHitPos + N * 0.001f;
+        RadiancePayload mrp = traceRadianceRay(
+            handle, mOrigin, mirrorDir, 0.001f, 1e30f);
+        rrSpecHitT = mrp.hit ? mrp.tHit : 1.0e4f;
+    }
+    if (isnan(rrSpecHitT) || isinf(rrSpecHitT) || rrSpecHitT < 0.0f) rrSpecHitT = 0.0f;
 
     float4 diffTexel = nrd_helpers::packRadianceHitDist(demodDiffAvg, diffHitAvg);
     float4 specTexel = nrd_helpers::packRadianceHitDist(demodSpecAvg, specHitAvg);
@@ -1758,9 +1791,8 @@ extern "C" __global__ void __raygen__path_trace_split()
         surf2Dwrite<ushort4>(p, params.splitSpecAlbedo, x * 8, y);
     }
     if (params.splitSpecHitT) {
-        float h = anyHitAvg;
-        if (isnan(h) || isinf(h) || h < 0.0f) h = 0.0f;
-        surf2Dwrite<float>(h, params.splitSpecHitT, x * 4, y);
+        // §3.4.9: world-space distance, primary surface to spec-reflected hit.
+        surf2Dwrite<float>(rrSpecHitT, params.splitSpecHitT, x * 4, y);
     }
 }
 

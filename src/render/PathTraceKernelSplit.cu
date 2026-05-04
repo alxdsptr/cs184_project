@@ -216,6 +216,13 @@ __global__ void pathTraceKernelSplit(
     float  outPrimaryViewZ     = 0.0f;
     float2 outPrimaryMvPx      = make_float2(0.0f, 0.0f);
     float  outPrimaryNdcZ      = 1.0f;  // DLSS-style NDC depth (1 = far)
+    // DLSS-RR fix: capture primary hit position + metallic for an explicit
+    // mirror-ray spec hitT trace after the spp loop, and for a metallic-aware
+    // F0 in the spec albedo guide buffer. Per-spp lobe-bounce hitT is biased
+    // (diffuse-bucket samples land elsewhere than the spec lobe) → shimmer.
+    float3 outPrimaryHitPos   = make_float3(0, 0, 0);
+    float3 outPrimaryRayDir   = make_float3(0, 0, -1);
+    float  outPrimaryMetallic = 0.0f;
 
     if (samplesPerPixel < 1) samplesPerPixel = 1;
 
@@ -247,6 +254,12 @@ __global__ void pathTraceKernelSplit(
     float primaryViewZ = 0.0f;
     float2 primaryMvPx = make_float2(0.0f, 0.0f);
     float primaryNdcZ  = 1.0f;
+    // DLSS-RR fix: snapshot of primary-hit world-space position, view ray dir
+    // and metallic. Lifted out of the inner loop so the `!gbufferWritten` block
+    // can copy them to the per-pixel `outPrimary*` set without recomputing.
+    float3 primaryHitPos = make_float3(0, 0, 0);
+    float3 primaryRayDir = make_float3(0, 0, -1);
+    float  primaryMetallic = 0.0f;
     int   pickedBucket = 0;       // 0 = diffuse, 1 = specular
     float bucketHitDist = 0.0f;    // world-space distance to first indirect surface
     bool  bucketHitDistSet = false;
@@ -390,6 +403,9 @@ __global__ void pathTraceKernelSplit(
             primaryAlbedo = albedo;
             primaryNormal = N;
             primaryRoughness = mat.roughness;
+            primaryHitPos    = hit.position;
+            primaryRayDir    = ray.direction;
+            primaryMetallic  = mat.metallic;
             primaryViewZ = nrd_helpers::computeViewZ(hit.position, camera.position, camera.forward);
             primaryMvPx = nrd_helpers::computeMotionVectorPx(
                 hit.position, camera.viewProjMatrix, camera.prevViewProjMatrix, width, height);
@@ -801,6 +817,9 @@ __global__ void pathTraceKernelSplit(
             outPrimaryViewZ     = primaryViewZ;
             outPrimaryMvPx      = primaryMvPx;
             outPrimaryNdcZ      = primaryNdcZ;
+            outPrimaryHitPos    = primaryHitPos;
+            outPrimaryRayDir    = primaryRayDir;
+            outPrimaryMetallic  = primaryMetallic;
             gbufferWritten = true;
         }
     } // end spp loop
@@ -818,28 +837,58 @@ __global__ void pathTraceKernelSplit(
     float specHitAvg = specHitCount > 0 ? (specHitSum / (float)specHitCount) : 0.0f;
     float anyHitAvg  = anyHitCount  > 0 ? (anyHitSum  / (float)anyHitCount)  : 0.0f;
 
-    // DLSS-RR specular albedo: F0 = lerp(0.04, primaryAlbedo, metallic). We
-    // didn't preserve `metallic` past the bucket pick, so derive a scalar
-    // approximation from the spec ratio of demodSpec / total radiance. For
-    // pixels that produced a primary hit we recompute F0 from albedo and a
-    // metallic-ish heuristic — a worst-case constant of 0.04 (dielectric) is
-    // safe per the guide; bias for sky pixels is 0.5 (§3.4.2 default).
-    // Cheaper: the kernel kept primaryAlbedo and primaryRoughness; we use a
-    // dielectric F0=0.04 fallback. For glossy metals the bias term in
-    // EnvBRDFApprox2 saturates so the approximation is still close.
-    float3 specF0 = lerp(make_float3(0.04f, 0.04f, 0.04f), outPrimaryAlbedo, 0.0f);
-    // NoV ≈ -dot(rayDir, normal). We don't have the per-sample ray; reuse the
-    // last sample's primary normal and the ray from primary-hit derivation:
-    //   ray dir at primary hit ≈ normalize(hit.position - camera.position).
-    // We don't store it, so approximate NoV via dot(camera.forward, -normal).
-    float NoV = fmaxf(-dot(camera.forward, outPrimaryNormal), 0.0f);
+    // DLSS-RR specular albedo: F0 = lerp(0.04, primaryAlbedo, metallic) per
+    // the integration guide §3.4.2 + Appendix EnvBRDFApprox2. We now preserve
+    // the primary-hit metallic into outPrimaryMetallic so dielectric vs metal
+    // surfaces get the right F0. NoV uses the actual primary ray direction
+    // (not the unjittered camera.forward) so the spec-albedo guide buffer
+    // moves smoothly across frames. Sky / no-hit pixels default to 0.5.
+    float3 specF0 = lerp(make_float3(0.04f, 0.04f, 0.04f),
+                         outPrimaryAlbedo, outPrimaryMetallic);
+    float NoV = fmaxf(-dot(outPrimaryRayDir, outPrimaryNormal), 0.0f);
     float3 specAlbedoAvg = envBRDFApprox2(specF0,
                                           outPrimaryRoughness * outPrimaryRoughness,
                                           NoV);
     if (!gbufferWritten) {
-        // Sky / no-hit pixels — guide §3.4.2 recommends (0.5,0.5,0.5) default.
         specAlbedoAvg = make_float3(0.5f, 0.5f, 0.5f);
     }
+
+    // DLSS-RR specular hit distance (§3.4.9): "World Space distance between
+    // the Specular Ray Origin and Hit Point. Specular Ray Origin must be on
+    // the Primary Surface." The previous implementation fed `anyHitAvg`,
+    // which averages secondary-bounce distances across BOTH lobes — diffuse-
+    // bucket samples land on a cosine-sampled bounce, NOT where the spec
+    // reflection would land. That makes the value flicker frame-to-frame
+    // depending on which lobe the bucket roll picks, producing the surface-
+    // wide motion shimmer we measured (heatmap shows broad surface activity,
+    // not just edges). Trace ONE explicit mirror ray per pixel from the
+    // primary hit along the perfect-reflection direction: deterministic,
+    // sub-pixel-stable, and matches the canonical-reflection semantics RR
+    // expects for deriving specular MV.
+    float rrSpecHitT = 0.0f;
+    if (gbufferWritten) {
+        float3 rd = outPrimaryRayDir;
+        float3 N  = outPrimaryNormal;
+        float3 mirrorDir = normalize(rd - N * (2.0f * dot(rd, N)));
+        Ray   mr;
+        mr.origin    = outPrimaryHitPos + N * 0.001f;
+        mr.direction = mirrorDir;
+        mr.tmin      = 0.001f;
+        mr.tmax      = 1e30f;
+        HitRecord mhit; mhit.t = mr.tmax;
+        bool mDidHit = false;
+        if (scene.d_bvhNodes && scene.totalTriangles > 0) {
+            mDidHit = bvh_closestHit(
+                mr, scene.d_bvhNodes, scene.bvhRootIndex,
+                scene.d_positions, scene.d_indices, scene.d_materialIndices,
+                mhit);
+        }
+        // If we miss (sky / outside scene), report a long but finite distance
+        // — RR uses hitT to derive the speed of the reflected feature; a 0
+        // here would be misread as "no reflection at all".
+        rrSpecHitT = mDidHit ? mhit.t : 1.0e4f;
+    }
+    if (isnan(rrSpecHitT) || isinf(rrSpecHitT) || rrSpecHitT < 0.0f) rrSpecHitT = 0.0f;
 
     float4 diffTexel = nrd_helpers::packRadianceHitDist(demodDiffAvg, diffHitAvg);
     float4 specTexel = nrd_helpers::packRadianceHitDist(demodSpecAvg, specHitAvg);
@@ -944,10 +993,9 @@ __global__ void pathTraceKernelSplit(
         surf2Dwrite<ushort4>(p, surfaces.specAlbedo, x * 8, y);
     }
     if (surfaces.specHitT) {
-        // World-space scalar; no NaN/inf permitted (NGX rejects it).
-        float h = anyHitAvg;
-        if (isnan(h) || isinf(h) || h < 0.0f) h = 0.0f;
-        surf2Dwrite<float>(h, surfaces.specHitT, x * 4, y);
+        // World-space scalar; NGX rejects NaN/inf. `rrSpecHitT` is a single
+        // mirror-ray trace from the primary hit (§3.4.9 semantics).
+        surf2Dwrite<float>(rrSpecHitT, surfaces.specHitT, x * 4, y);
     }
 }
 
