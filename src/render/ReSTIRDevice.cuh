@@ -118,6 +118,34 @@ __device__ inline void restir_reservoirReset(ReSTIRReservoir& r) {
     r.M      = 0.0f;
 }
 
+// ── Defensive resampling-weight clamps (M7 flash-and-decay fix) ──────────
+// With many small emissive triangles, occasional samples land at tiny
+// dist²/cos_light combinations. Their pHat (luminance×|f|×G) blows up by
+// 6+ orders of magnitude. The unbiased estimator absorbs this in
+// expectation, but RIS's selection probability w_i ∝ pHat·W·M makes the
+// bad sample dominate every neighbor it spreads to via spatial reuse and
+// every history pixel it passes through via temporal reuse — that's the
+// "blob lights up then decays over mCap frames" pathology Lin et al.
+// flag in §5.4 (and which Theorem A.4 protects against under proper MIS,
+// but only with bounded resampling weights).
+//
+// We clamp the per-candidate resampling weight wCandidate at init time
+// (RESTIR_DI_MAX_WCAND) and the reservoir's contribution weight W after
+// finalize (RESTIR_DI_MAX_W). The clamp constants are well above any
+// physical luminance the path tracer's NEE will produce in practice
+// (visible-luminance × albedo·invPi ≈ O(10) for the brightest emitters
+// in the bundled scenes; we cap at 1e4 so only fp32 outliers from BVH
+// near-zero pSelect are clipped).
+#ifndef RESTIR_DI_MAX_WCAND
+#define RESTIR_DI_MAX_WCAND 1.0e4f
+#endif
+#ifndef RESTIR_DI_MAX_W
+#define RESTIR_DI_MAX_W     1.0e4f
+#endif
+#ifndef RESTIR_DI_MAX_COMBINE_W
+#define RESTIR_DI_MAX_COMBINE_W 1.0e6f
+#endif
+
 __device__ inline bool restir_reservoirUpdate(
     ReSTIRReservoir& r, float& wSum,
     uint32_t lightIdx, float b1, float b2, float pHat,
@@ -130,6 +158,9 @@ __device__ inline bool restir_reservoirUpdate(
     // temporal+spatial reuse since the inflated W gets blended forward.
     r.M += 1.0f;
     if (!(wCandidate > 0.0f)) return false;
+    // Defensive clamp: a near-zero pSelect from the deep light-BVH
+    // descent can make wCandidate = pHat/pSelect explode in fp32.
+    if (wCandidate > RESTIR_DI_MAX_WCAND) wCandidate = RESTIR_DI_MAX_WCAND;
     wSum += wCandidate;
     if (u01 * wSum < wCandidate) {
         r.lightIndex = lightIdx;
@@ -146,7 +177,15 @@ __device__ inline void restir_reservoirFinalize(ReSTIRReservoir& r, float wSum) 
         r.W = 0.0f;
         return;
     }
-    r.W = wSum / (r.M * r.pHat);
+    float W = wSum / (r.M * r.pHat);
+    // Hard cap on W. Once a high-W reservoir leaves this kernel, the
+    // temporal pass propagates it forward (with M cap=20, so the bad
+    // sample lingers ~20 frames), and the spatial pass spreads it to
+    // every neighbor that passes the geometric gate. Capping W here
+    // bounds the worst-case visible artifact to roughly clampMax × Le.
+    if (W > RESTIR_DI_MAX_W) W = RESTIR_DI_MAX_W;
+    if (!isfinite(W)) W = 0.0f;
+    r.W = W;
 }
 
 __device__ inline bool restir_reservoirCombine(
@@ -158,16 +197,23 @@ __device__ inline bool restir_reservoirCombine(
         return false;
     }
     float w = pHatAtDst * src.W * src.M;
+    // Belt-and-suspenders: even with W capped at finalize, src.W * src.M
+    // can still combine to a large value, and pHatAtDst at a different
+    // surface may amplify it further. Cap the resampling weight so a
+    // single rogue source can't dominate the merged reservoir.
+    if (!(w > 0.0f) || !isfinite(w)) {
+        dst.M += src.M;
+        return false;
+    }
+    if (w > RESTIR_DI_MAX_COMBINE_W) w = RESTIR_DI_MAX_COMBINE_W;
     bool accepted = false;
-    if (w > 0.0f) {
-        wSum += w;
-        if (u01 * wSum < w) {
-            dst.lightIndex = src.lightIndex;
-            dst.baryB1     = src.baryB1;
-            dst.baryB2     = src.baryB2;
-            dst.pHat       = pHatAtDst;
-            accepted = true;
-        }
+    wSum += w;
+    if (u01 * wSum < w) {
+        dst.lightIndex = src.lightIndex;
+        dst.baryB1     = src.baryB1;
+        dst.baryB2     = src.baryB2;
+        dst.pHat       = pHatAtDst;
+        accepted = true;
     }
     dst.M += src.M;
     return accepted;
