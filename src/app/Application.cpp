@@ -330,6 +330,9 @@ bool Application::loadScene(const std::string& path) {
     // reference might no longer exist). Camera motion does NOT — that's
     // why resetAccumulation() no longer drops history on its own.
     m_renderer.invalidateReSTIRHistory();
+    // A scene swap is also a true DLSS/NRD pipeline transition: prior
+    // history references geometry that no longer exists.
+    m_renderer.markPipelineNeedsReset();
 
     std::string ext = lowerString(std::filesystem::path(path).extension().string());
     const SceneCamera& sceneCamera = m_scene.getCamera();
@@ -347,6 +350,10 @@ bool Application::loadScene(const std::string& path) {
     if (!m_cameraFilePath.empty()) {
         if (m_camera.loadFromFile(m_cameraFilePath)) {
             LOG_INFO("Loaded camera from: %s", m_cameraFilePath.c_str());
+            // Camera teleport — DLSS/NRD reprojection has no valid history
+            // for the new viewpoint. Tell them to RESTART on the next
+            // pre-present.
+            m_renderer.markPipelineNeedsReset();
         }
     }
 

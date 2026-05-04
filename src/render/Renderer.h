@@ -45,6 +45,12 @@ public:
     // resize, toggling a pass — NOT for plain camera motion (the temporal
     // pass re-projects + gates that itself).
     void invalidateReSTIRHistory();
+    // Tell DLSS/NRD to drop their temporal history on the NEXT pre-present.
+    // One-shot: cleared after the upscaler/denoiser consumes it. Call this
+    // for genuine pipeline transitions (mode change, scene reload, resize,
+    // camera teleport via file load) — NEVER on continuous camera motion,
+    // which is what motion vectors are designed to handle.
+    void markPipelineNeedsReset();
 
     // Per-frame entry.
     // `d_ldrOutput` is the CUDA interop buffer from VulkanDisplay::mapForCUDA;
@@ -186,5 +192,19 @@ private:
     // Previous-frame jitter, in pixel units. NRD needs `cameraJitterPrev` to
     // correctly align sub-pixel positions when reprojecting history.
     float m_prevJitter[2] = {0.0f, 0.0f};
+
+    // True if NRD/DLSS/DLSS-RR should treat the next pre-present as a fresh
+    // pipeline start (history-reset). Set by mode change, scene reload,
+    // resize and explicit camera teleport (loadFromFile). NEVER set by
+    // continuous WASD/dolly/orbit motion — these are the case temporal
+    // accumulation is *designed* to handle via motion vectors, and resetting
+    // every frame causes severe shimmer because the upscaler/denoiser must
+    // rebuild history from zero each frame.
+    //
+    // Decoupled from `AccumulationBuffer::sampleCount`: that buffer averages
+    // path-traced radiance across frames and *must* reset on any camera
+    // motion (different views can't be averaged without ghosting). DLSS/NRD
+    // history is a different beast that survives motion via reprojection.
+    bool m_pipelineNeedsReset = true;
 #endif
 };

@@ -62,6 +62,8 @@ void Renderer::resize(uint32_t width, uint32_t height) {
         setMode(Mode::Native, m_display);  // tears down the pipeline safely
         setMode(m,              m_display);
     }
+    // Resolution change invalidates DLSS/NRD history — content sizes differ.
+    m_pipelineNeedsReset = true;
 #endif
 }
 
@@ -91,6 +93,12 @@ void Renderer::invalidateReSTIRHistory() {
     m_restir.invalidateHistory();
     m_restirGI.invalidateHistory();
     m_restirPT.invalidateHistory();
+}
+
+void Renderer::markPipelineNeedsReset() {
+#ifdef PATHTRACER_NRD_DLSS_ENABLED
+    m_pipelineNeedsReset = true;
+#endif
 }
 
 void Renderer::renderFrame(
@@ -576,6 +584,10 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
     m_display = display;
     display->setPrePresentRecorder(&Renderer::prePresentTrampoline, this);
     resetAccumulation();
+    // Mode change is a genuine pipeline transition — DLSS/NRD must drop
+    // history. (Continuous camera motion, by contrast, must NOT trigger
+    // reset; that is what motion vectors are for. See m_pipelineNeedsReset.)
+    m_pipelineNeedsReset = true;
     return true;
 #endif
 }
@@ -978,7 +990,16 @@ void Renderer::recordPrePresent(VkCommandBuffer cmd) {
                  s_ppFrame, jitter[0], jitter[1], jitterPrev[0], jitterPrev[1]);
     }
 
-    const bool reset = (m_accumBuffer.getSampleCount() == 1);
+    // History reset signal:
+    //   - NRD's RESTART discards all temporal accumulation.
+    //   - DLSS's `reset` does the same on its side.
+    // Camera motion alone must NOT trigger this; that's what motion vectors
+    // are for. The accumulation buffer's sample count is reset on every
+    // camera-moved frame (path-traced radiance can't be averaged across
+    // viewpoints), but DLSS/NRD history survives motion via reprojection.
+    // Use the explicit pipeline-reset flag instead, set only on actual
+    // pipeline transitions (mode change, scene reload, resize, teleport).
+    const bool reset = m_pipelineNeedsReset;
     m_nrd->setCommonSettings(
         viewToClip, viewToClipPrev, worldToView, worldToViewPrev,
         jitter, jitterPrev, mvScale, rw, rh, m_frameIndex, reset,
@@ -1089,7 +1110,7 @@ void Renderer::recordPrePresent(VkCommandBuffer cmd) {
             m_renderWidth, m_renderHeight,
             m_width, m_height,
             m_lastCamera.jitterOffset.x, m_lastCamera.jitterOffset.y,
-            /*reset=*/m_accumBuffer.getSampleCount() == 1);
+            /*reset=*/reset);
 
         // (3) Tonemap @ output res → sampledImage.
         SharedVulkanImage::transition(cmd, m_hdrOutputImage,
@@ -1114,6 +1135,9 @@ void Renderer::recordPrePresent(VkCommandBuffer cmd) {
     // Stash this frame's jitter for NRD's `cameraJitterPrev` next frame.
     m_prevJitter[0] = m_lastCamera.jitterOffset.x;
     m_prevJitter[1] = m_lastCamera.jitterOffset.y;
+    // Pipeline-reset flag is one-shot: clear after this frame consumed it so
+    // subsequent camera motion doesn't keep firing reset=true.
+    m_pipelineNeedsReset = false;
     if (s_ppFrame < 3) LOG_INFO("recordPrePresent[%u]: done", s_ppFrame);
     ++s_ppFrame;
 }
@@ -1163,6 +1187,10 @@ void Renderer::recordDlssOnlyPrePresent(VkCommandBuffer cmd) {
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, VK_ACCESS_SHADER_WRITE_BIT);
 
+    // Pipeline reset signal — see notes in recordPrePresent. Camera motion
+    // alone must not trigger this; rely on motion vectors. One-shot: cleared
+    // after consume.
+    const bool reset = m_pipelineNeedsReset;
     m_dlss->evaluate(cmd,
         // Inputs: color (render res from path tracer), output (output res, DLSS write).
         m_sharedAux->hdrColor().view(),  m_sharedAux->hdrColor().image(),
@@ -1176,7 +1204,7 @@ void Renderer::recordDlssOnlyPrePresent(VkCommandBuffer cmd) {
         m_renderWidth, m_renderHeight,
         m_width,       m_height,
         m_lastCamera.jitterOffset.x, m_lastCamera.jitterOffset.y,
-        /*reset=*/m_accumBuffer.getSampleCount() == 1);
+        /*reset=*/reset);
 
     // (3) Tonemap @ output res → sampledImage.
     SharedVulkanImage::transition(cmd, m_hdrOutputImage,
@@ -1201,6 +1229,8 @@ void Renderer::recordDlssOnlyPrePresent(VkCommandBuffer cmd) {
     m_lastCameraMoved = false;
     m_prevJitter[0] = m_lastCamera.jitterOffset.x;
     m_prevJitter[1] = m_lastCamera.jitterOffset.y;
+    // Clear pipeline-reset flag (one-shot): subsequent frames continue history.
+    m_pipelineNeedsReset = false;
     if (trace) LOG_INFO("DLSSOnly: pre-present[%u] done", s_dlssOnlyFrame);
     ++s_dlssOnlyFrame;
 }
@@ -1267,6 +1297,9 @@ void Renderer::recordDlssRRPrePresent(VkCommandBuffer cmd) {
             viewToClip[r * 4 + c]  = m_lastCamera.projMatrix.m[r][c];
         }
 
+    // Pipeline reset signal — see notes in recordPrePresent. Camera motion
+    // alone must not trigger this; rely on motion vectors. One-shot.
+    const bool reset = m_pipelineNeedsReset;
     m_dlssd->evaluate(cmd,
         m_sharedAux->hdrColor().view(),       m_sharedAux->hdrColor().image(),
         m_hdrOutputView,                      m_hdrOutputImage,
@@ -1285,7 +1318,7 @@ void Renderer::recordDlssRRPrePresent(VkCommandBuffer cmd) {
         m_width,       m_height,
         m_lastCamera.jitterOffset.x, m_lastCamera.jitterOffset.y,
         worldToView, viewToClip,
-        /*reset=*/m_accumBuffer.getSampleCount() == 1);
+        /*reset=*/reset);
 
     // (3) Tonemap @ output res → sampledImage.
     SharedVulkanImage::transition(cmd, m_hdrOutputImage,
@@ -1310,6 +1343,8 @@ void Renderer::recordDlssRRPrePresent(VkCommandBuffer cmd) {
     m_lastCameraMoved = false;
     m_prevJitter[0] = m_lastCamera.jitterOffset.x;
     m_prevJitter[1] = m_lastCamera.jitterOffset.y;
+    // Clear pipeline-reset flag (one-shot): subsequent frames continue history.
+    m_pipelineNeedsReset = false;
     if (trace) LOG_INFO("DLSSRR: pre-present[%u] done", s_dlssRRFrame);
     ++s_dlssRRFrame;
 }
