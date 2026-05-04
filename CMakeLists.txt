@@ -252,6 +252,7 @@ if(PATHTRACER_ENABLE_OPTIX)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/Sampling.h
         ${CMAKE_CURRENT_SOURCE_DIR}/src/core/Camera.h
         ${CMAKE_CURRENT_SOURCE_DIR}/src/core/VolumeMedium.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/core/VolumeDevice.cuh
         ${CMAKE_CURRENT_SOURCE_DIR}/src/render/AuxBuffers.h
     )
     add_custom_command(

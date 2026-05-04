@@ -26,8 +26,9 @@ int main(int argc, char** argv) {
     float3 mediumSigmaS = make_float3(0.0f, 0.0f, 0.0f);
     float mediumDensity = 1.0f;
     float mediumAnisotropy = 0.0f;
-    float mediumMaxDistance = 1e6f;
+    uint32_t mediumDensityKind = 0;  // 0=Constant, 1=HeightFalloff, 2=FBM, 3=HeightFBM
     bool mediumAnyOverride = false;
+    bool mediumKindOverride = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -109,14 +110,15 @@ int main(int argc, char** argv) {
             } else {
                 LOG_WARN("Invalid --medium-g value: %s (range -0.99..0.99)", argv[i]);
             }
-        } else if (arg == "--medium-max-distance" && i + 1 < argc) {
-            float v = (float)std::atof(argv[++i]);
-            if (v > 0.0f) {
-                mediumMaxDistance = v;
-                mediumAnyOverride = true;
-            } else {
-                LOG_WARN("Invalid --medium-max-distance value: %s", argv[i]);
-            }
+        } else if (arg == "--medium-kind" && i + 1 < argc) {
+            std::string v = argv[++i];
+            if      (v == "constant" || v == "homogeneous") mediumDensityKind = 0;
+            else if (v == "height" || v == "height-falloff") mediumDensityKind = 1;
+            else if (v == "fbm" || v == "noise")             mediumDensityKind = 2;
+            else if (v == "height-fbm" || v == "smoke")      mediumDensityKind = 3;
+            else { LOG_WARN("Invalid --medium-kind value: %s (constant|height|fbm|height-fbm)", v.c_str()); continue; }
+            mediumKindOverride = true;
+            mediumAnyOverride = true;
         } else if ((arg == "--spp" || arg == "-p") && i + 1 < argc) {
             int value = std::atoi(argv[++i]);
             if (value > 0) {
@@ -166,7 +168,7 @@ int main(int argc, char** argv) {
         app.setMediumSigmaS(mediumSigmaS);
         app.setMediumDensity(mediumDensity);
         app.setMediumAnisotropy(mediumAnisotropy);
-        app.setMediumMaxDistance(mediumMaxDistance);
+        if (mediumKindOverride) app.setMediumDensityKind(mediumDensityKind);
     }
     if (!outputPath.empty()) {
         app.setHeadlessOutput(outputPath, samples);

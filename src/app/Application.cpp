@@ -247,6 +247,29 @@ bool Application::loadScene(const std::string& path) {
     } else {
         m_medium = m_scene.getMedium();
     }
+    // Default the medium's bounding box to the scene AABB (slightly padded
+    // so geometry on the boundary stays inside the medium). Skipped if the
+    // user already configured bounds via override or scene file. Without
+    // this, a global "constant" medium has no extent and delta tracking
+    // would loop on miss rays.
+    if (!m_medium.bounded) {
+        const AABB& sceneBounds = m_scene.getBounds();
+        if (!sceneBounds.empty()) {
+            float3 size = sceneBounds.bmax - sceneBounds.bmin;
+            float3 pad = size * 0.05f;
+            m_medium.bmin = sceneBounds.bmin - pad;
+            m_medium.bmax = sceneBounds.bmax + pad;
+            m_medium.bounded = true;
+            // Sensible defaults for the height-falloff modes — yBase at the
+            // scene floor, falloff height ~ 30% of scene height. These only
+            // matter when the user picks a heterogeneous density kind.
+            m_medium.yBase = sceneBounds.bmin.y;
+            m_medium.falloffHeight = fmaxf(size.y * 0.3f, 1.0f);
+            m_medium.fbmFrequency = 1.0f / fmaxf(fmaxf(size.x, size.z), 1.0f) * 4.0f;
+        }
+    }
+    m_medium.recomputeMajorant();
+    m_scene.getMedium() = m_medium;
 
     // Load textures and bind CUDA texture objects per material.
     // Cache key = (path, sRGB) since the same file may appear as both a
@@ -647,12 +670,7 @@ void Application::runGui() {
                 m_envMapPathBuf,
                 sizeof(m_envMapPathBuf),
                 envMapLoadRequested,
-                &m_medium.enabled,
-                &m_medium.sigmaA.x,
-                &m_medium.sigmaS.x,
-                &m_medium.density,
-                &m_medium.anisotropy,
-                &m_medium.maxDistance,
+                &m_medium,
                 modePtr, qualityPtr, rrW, rrH,
                 &m_debugNormalViz,
                 &m_enableNormalMap,
@@ -684,8 +702,12 @@ void Application::runGui() {
 
         m_camera.setMoveSpeed(moveSpeed);
         m_medium.density = fmaxf(m_medium.density, 0.0f);
-        m_medium.maxDistance = fmaxf(m_medium.maxDistance, 1.0f);
         m_medium.anisotropy = fminf(fmaxf(m_medium.anisotropy, -0.99f), 0.99f);
+        m_medium.falloffHeight = fmaxf(m_medium.falloffHeight, 0.001f);
+        m_medium.fbmFrequency = fmaxf(m_medium.fbmFrequency, 1e-5f);
+        m_medium.fbmOctaves = m_medium.fbmOctaves < 1 ? 1 : (m_medium.fbmOctaves > 8 ? 8 : m_medium.fbmOctaves);
+        m_medium.heightFBMMix = fminf(fmaxf(m_medium.heightFBMMix, 0.0f), 1.0f);
+        m_medium.recomputeMajorant();
         m_scene.getMedium() = m_medium;
         m_renderer.setExposure(exposure);
         if (toneMappingMode < (int)ToneMappingMode::None) {

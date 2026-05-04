@@ -40,7 +40,7 @@ public:
     void setMediumSigmaS(const float3& sigmaS) { m_medium.sigmaS = sigmaS; m_hasMediumOverride = true; }
     void setMediumDensity(float density) { m_medium.density = density; m_hasMediumOverride = true; }
     void setMediumAnisotropy(float g) { m_medium.anisotropy = g; m_hasMediumOverride = true; }
-    void setMediumMaxDistance(float d) { m_medium.maxDistance = d; m_hasMediumOverride = true; }
+    void setMediumDensityKind(uint32_t k) { m_medium.densityKind = k; m_hasMediumOverride = true; }
     void setHeadlessOutput(const std::string& outputPath, uint32_t sampleCount);
     void setEnvMap(const std::string& path);
     void loadCameraFile(const std::string& path) { m_cameraFilePath = path; }

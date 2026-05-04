@@ -6,6 +6,7 @@
 struct GLFWwindow;
 class VulkanDisplay;
 struct CameraParams;
+struct VolumeMedium;
 
 class GUI {
 public:
@@ -25,12 +26,7 @@ public:
                 float& exposure, int& toneMappingMode,
                 float& moveSpeed,
                 char* envMapPathBuf, size_t envMapPathBufSize, bool& loadEnvMapRequested,
-                bool* mediumEnabled = nullptr,
-                float* mediumSigmaA = nullptr,
-                float* mediumSigmaS = nullptr,
-                float* mediumDensity = nullptr,
-                float* mediumAnisotropy = nullptr,
-                float* mediumMaxDistance = nullptr,
+                VolumeMedium* medium = nullptr,
                 int* renderMode = nullptr,
                 int* dlssQuality = nullptr,
                 uint32_t renderResW = 0,

@@ -4,6 +4,7 @@
 
 #include "render/PathTraceHelpers.cuh"
 #include "core/VolumeMedium.h"
+#include "core/VolumeDevice.cuh"
 #include "gpu/NRDHelpers.cuh"
 #include "accel/BVH.h"
 #include "gpu/Random.h"
@@ -132,70 +133,8 @@ __device__ inline float3 clampFirefly(float3 c, float maxLum) {
     return c;
 }
 
-// ── Volumetric transmittance (Beer-Lambert) ──────────────────
-// Compute transmittance over a ray segment in a homogeneous medium.
-// T(d) = exp(-(sigma_a + sigma_s) * density * d)
-__device__ inline float3 computeVolumetricTransmittance(
-    float distance,
-    const HomogeneousMedium& medium)
-{
-    if (!medium.enabled || distance <= 0.0f) {
-        return make_float3(1.0f, 1.0f, 1.0f);
-    }
-
-    // Clamp distance to avoid numerical issues
-    distance = fminf(distance, medium.maxDistance);
-
-    // Compute extinction coefficient: sigma_t = sigma_a + sigma_s
-    float3 sigmaT = medium.sigmaA + medium.sigmaS;
-
-    // Apply density multiplier
-    sigmaT = sigmaT * medium.density;
-
-    // Beer-Lambert: T = exp(-sigma_t * d)
-    float3 exponent = sigmaT * (-distance);
-    return make_float3(expf(exponent.x), expf(exponent.y), expf(exponent.z));
-}
-
-__device__ inline float3 mediumSigmaT(const HomogeneousMedium& medium) {
-    return (medium.sigmaA + medium.sigmaS) * medium.density;
-}
-
-__device__ inline float3 mediumSigmaS(const HomogeneousMedium& medium) {
-    return medium.sigmaS * medium.density;
-}
-
-__device__ inline float mediumSigmaTScalar(const float3& sigmaT) {
-    float m = fmaxf(sigmaT.x, sigmaT.y);
-    return fmaxf(m, sigmaT.z);
-}
-
-__device__ inline float phaseHG(float cosTheta, float g) {
-    float g2 = g * g;
-    float denom = 1.0f + g2 - 2.0f * g * cosTheta;
-    float inv = rsqrtf(fmaxf(denom, 1e-6f));
-    float inv3 = inv * inv * inv;
-    return (1.0f - g2) * (0.25f / M_PI_F) * inv3;
-}
-
-__device__ inline float3 samplePhaseHG(float3 wo, float g, uint32_t& rng) {
-    float u1 = pcg32_float(rng);
-    float u2 = pcg32_float(rng);
-    float cosTheta;
-    if (fabsf(g) < 1e-3f) {
-        cosTheta = 1.0f - 2.0f * u1;
-    } else {
-        float sqr = (1.0f - g * g) / (1.0f - g + 2.0f * g * u1);
-        cosTheta = (1.0f + g * g - sqr * sqr) / (2.0f * g);
-        cosTheta = fminf(fmaxf(cosTheta, -1.0f), 1.0f);
-    }
-    float sinTheta = sqrtf(fmaxf(0.0f, 1.0f - cosTheta * cosTheta));
-    float phi = 2.0f * M_PI_F * u2;
-    float3 localDir = make_float3(sinTheta * cosf(phi), cosTheta, sinTheta * sinf(phi));
-    float3 T, B;
-    buildONB(wo, T, B);
-    return normalize(localToWorld(localDir, T, wo, B));
-}
+// Volume helpers (transmittance, density, phase, delta/ratio tracking) live
+// in core/VolumeDevice.cuh.
 
 __global__ void pathTraceKernelSplit(
     DeviceSceneData       scene,
@@ -294,22 +233,19 @@ __global__ void pathTraceKernelSplit(
         }
 
         float tMaxSegment = didHit ? hit.t : ray.tmax;
-        if (scene.medium.enabled) {
-            float3 sigmaT = mediumSigmaT(scene.medium);
-            float3 sigmaS = mediumSigmaS(scene.medium);
-            float sigmaTScalar = mediumSigmaTScalar(sigmaT);
-            float sigmaSMax = fmaxf(fmaxf(sigmaS.x, sigmaS.y), sigmaS.z);
-            if (sigmaTScalar > 0.0f && sigmaSMax > 0.0f) {
-                float maxDist = fminf(tMaxSegment, scene.medium.maxDistance);
-                float u = fmaxf(pcg32_float(rng), 1e-6f);
-                float t = -logf(u) / sigmaTScalar;
-                if (t < maxDist) {
-                    float3 transmittance = computeVolumetricTransmittance(t, scene.medium);
-                    throughput = throughput * transmittance;
-                    throughput = throughput * (sigmaS * (1.0f / sigmaTScalar));
-
-                    float3 mediumPos = ray.origin + ray.direction * t;
+        if (scene.medium.enabled && scene.medium.majorantSigmaT > 0.0f) {
+            float tEnter, tExit;
+            if (volumeIntersect(ray.origin, ray.direction, ray.tmin, tMaxSegment,
+                                scene.medium, tEnter, tExit))
+            {
+                float tHit;
+                bool scattered = volumeDeltaTrack(
+                    ray.origin, ray.direction, tEnter, tExit,
+                    scene.medium, rng, tHit);
+                if (scattered) {
+                    float3 mediumPos = ray.origin + ray.direction * tHit;
                     float3 wo = -ray.direction;
+                    throughput = throughput * mediumSingleScatterAlbedo(scene.medium);
 
                     // Single-scatter NEE: area lights.
                     if (scene.d_areaLights && scene.areaLightCount > 0 &&
@@ -352,14 +288,15 @@ __global__ void pathTraceKernelSplit(
                                     } else { occluded = true; break; }
                                 }
                             }
-                            float3 volumetricST = computeVolumetricTransmittance(d, scene.medium);
+                            float3 volumetricST = volumeShadowTransmittance(
+                                mediumPos, Ld, d, scene.medium, rng);
                             st = st * volumetricST;
                             float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
                             if (!occluded && slum > 1e-6f) {
                                 float pTri = light.weight / scene.areaLightTotalWeight;
                                 float pArea = pTri / fmaxf(light.area, 1e-7f);
                                 float pdfOmega = pArea * d2 / fmaxf(lNdot, 1e-7f);
-                                float phase = phaseHG(dot(wo, Ld), scene.medium.anisotropy);
+                                float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
                                 float w = powerHeuristic(pdfOmega, phase);
                                 float3 Le = sampleAreaLightLe(light, b0, b1, b2);
                                 float3 contrib = throughput * st * Le * (phase / fmaxf(pdfOmega, 1e-7f)) * w;
@@ -397,14 +334,15 @@ __global__ void pathTraceKernelSplit(
                                     } else { occluded = true; break; }
                                 }
                             }
-                            float3 volumetricST = computeVolumetricTransmittance(d, scene.medium);
+                            float3 volumetricST = volumeShadowTransmittance(
+                                mediumPos, Ld, d, scene.medium, rng);
                             st = st * volumetricST;
                             float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
                             if (occluded || slum < 1e-6f) continue;
                             float attenDen = light.constantAttenuation + light.linearAttenuation * d + light.quadraticAttenuation * d2;
                             float atten = 1.0f / fmaxf(attenDen, 1e-4f);
                             float3 Li = light.color * (light.intensity * atten);
-                            float phase = phaseHG(dot(wo, Ld), scene.medium.anisotropy);
+                            float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
                             float3 contrib = throughput * st * Li * phase;
                             pathRadiance += clampFirefly(contrib, 10.0f);
                         }
@@ -436,18 +374,18 @@ __global__ void pathTraceKernelSplit(
                                     } else { occluded = true; break; }
                                 }
                             }
-                            float dist = scene.medium.maxDistance;
-                            float3 volumetricST = computeVolumetricTransmittance(dist, scene.medium);
+                            float3 volumetricST = volumeShadowTransmittance(
+                                mediumPos, Ld, 1e30f, scene.medium, rng);
                             st = st * volumetricST;
                             float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
                             if (occluded || slum < 1e-6f) continue;
-                            float phase = phaseHG(dot(wo, Ld), scene.medium.anisotropy);
+                            float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
                             float3 contrib = throughput * st * light.color * phase;
                             pathRadiance += clampFirefly(contrib, 10.0f);
                         }
                     }
 
-                    float3 newDir = samplePhaseHG(wo, scene.medium.anisotropy, rng);
+                    float3 newDir = phaseHGSample(wo, scene.medium.anisotropy, rng);
                     ray.origin = mediumPos;
                     ray.direction = newDir;
                     ray.tmin = 0.001f;
@@ -455,17 +393,11 @@ __global__ void pathTraceKernelSplit(
                     lastBounceDelta = false;
                     continue;
                 }
-                if (maxDist > 0.0f) {
-                    float3 transmittance = computeVolumetricTransmittance(maxDist, scene.medium);
-                    throughput = throughput * transmittance;
-                }
-            } else if (tMaxSegment > 0.0f) {
-                float3 transmittance = computeVolumetricTransmittance(tMaxSegment, scene.medium);
-                throughput = throughput * transmittance;
+                float3 T = volumeRatioTrack(
+                    ray.origin, ray.direction, tEnter, tExit,
+                    scene.medium, rng);
+                throughput = throughput * T;
             }
-        } else if (tMaxSegment > 0.0f) {
-            float3 transmittance = computeVolumetricTransmittance(tMaxSegment, scene.medium);
-            throughput = throughput * transmittance;
         }
 
         if (!didHit) {
@@ -719,8 +651,9 @@ __global__ void pathTraceKernelSplit(
                         } else { occluded = true; break; }
                     }
                 }
-                // Apply volumetric transmittance over the shadow ray distance
-                float3 volumetricST = computeVolumetricTransmittance(d, scene.medium);
+                float3 shadowOriginA = hit.position + N * 0.001f;
+                float3 volumetricST = volumeShadowTransmittance(
+                    shadowOriginA, Ld, d, scene.medium, rng);
                 st = st * volumetricST;
 
                 float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
@@ -786,8 +719,9 @@ __global__ void pathTraceKernelSplit(
                         } else { occ = true; break; }
                     }
                 }
-                // Apply volumetric transmittance over the shadow ray distance (point light)
-                float3 volumetricSTPL = computeVolumetricTransmittance(d, scene.medium);
+                float3 shadowOriginP = hit.position + N * 0.001f;
+                float3 volumetricSTPL = volumeShadowTransmittance(
+                    shadowOriginP, Ld, d, scene.medium, rng);
                 st = st * volumetricSTPL;
 
                 float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
