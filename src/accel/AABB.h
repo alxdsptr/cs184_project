@@ -42,6 +42,23 @@ struct AABB {
         float tF = fminf(fminf(tFar.x, tFar.y), fminf(tFar.z, tmax));
         return tN <= tF;
     }
+
+    // Same slab test, returns the clipped [tNearOut, tFarOut] interval. Used
+    // by the volume integrator to clip ray segments to the participating
+    // medium's bounding box. `tNearOut` is clamped to `tmin` so a ray
+    // originating *inside* the box returns `tNearOut == tmin`.
+    HD bool intersectT(float3 origin, float3 invDir, float tmin, float tmax,
+                       float& tNearOut, float& tFarOut) const {
+        float3 t0 = (bmin - origin) * invDir;
+        float3 t1 = (bmax - origin) * invDir;
+        float3 tNear = make_float3(fminf(t0.x,t1.x), fminf(t0.y,t1.y), fminf(t0.z,t1.z));
+        float3 tFar  = make_float3(fmaxf(t0.x,t1.x), fmaxf(t0.y,t1.y), fmaxf(t0.z,t1.z));
+        float tN = fmaxf(fmaxf(tNear.x, tNear.y), fmaxf(tNear.z, tmin));
+        float tF = fminf(fminf(tFar.x, tFar.y), fminf(tFar.z, tmax));
+        tNearOut = tN;
+        tFarOut = tF;
+        return tN <= tF;
+    }
 };
 
 // Multiply float3 componentwise (for invDir)

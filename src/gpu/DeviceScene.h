@@ -2,6 +2,7 @@
 #include "gpu/AreaLightGPU.h"
 #include "gpu/MaterialGPU.h"
 #include "gpu/LightGPU.h"
+#include "core/VolumeMedium.h"
 #include "accel/BVHNode.h"
 #include "accel/LightBVHNode.h"
 #include <cuda_runtime.h>
@@ -26,6 +27,10 @@ struct DeviceSceneData {
     int*         d_triangleAreaLightIndex = nullptr;
     BVHNode*     d_bvhNodes        = nullptr;
     uint32_t     bvhRootIndex      = 0;
+
+    // Scene-global participating-medium parameters. Small POD copied by value
+    // into launch params each frame.
+    VolumeMedium medium;
 
     // Spatial acceleration structure over area lights used for importance
     // sampling many lights from a shading point. When d_lightBVHNodes is
