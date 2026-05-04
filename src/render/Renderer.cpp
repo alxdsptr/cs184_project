@@ -9,6 +9,7 @@
 #include "render/VulkanSharedAuxBuffers.h"
 #include "postfx/NRDContext.h"
 #include "postfx/DLSSContext.h"
+#include "postfx/DLSSDContext.h"
 #include "postfx/CompositePass.h"
 #include "interop/VulkanImageInterop.h"
 #include "core/Math.h"   // mat4_inverse
@@ -56,7 +57,7 @@ void Renderer::resize(uint32_t width, uint32_t height) {
         (void)rw; (void)rh;
         // Keep the current render resolution policy on display-size change:
         //   - NRDOnly: render res == display res, follows `width/height`.
-        //   - NRDDLSS: ask DLSS for optimal render res at the new output res.
+        //   - NRDDLSS / DLSSOnly / DLSSRR: ask DLSS for optimal render res at the new output res.
         Mode m = m_mode;
         setMode(Mode::Native, m_display);  // tears down the pipeline safely
         setMode(m,              m_display);
@@ -228,7 +229,7 @@ void Renderer::renderFrame(
         return;
     }
 
-    // ── NRDOnly / NRDDLSS: split-output path-trace into Vulkan-shared aux images.
+    // ── NRDOnly / NRDDLSS / DLSSRR: split-output path-trace into Vulkan-shared aux images.
     // Goes through the backend (CUDA SAH-BVH / OptiX GAS) so OptiX-only scenes
     // (no CUDA BVH built) still work.
     SplitSurfaceOutputs surf{};
@@ -242,13 +243,23 @@ void Renderer::renderFrame(
         surf.albedo                  = s.albedo;
         surf.emissive                = s.emissive;
         surf.ndcDepth                = s.ndcDepth;
+        // DLSS-RR also wants noisyColor + worldNormalRoughness + specAlbedo + specHitT.
+        // Feeding zeroes when not in DLSSRR mode is fine: the split kernel
+        // writes them inside an `if (surfaces.X)` guard, so NRD modes don't
+        // pay the write cost.
+        if (m_mode == Mode::DLSSRR) {
+            surf.hdrColor             = s.hdrColor;
+            surf.worldNormalRoughness = s.worldNormalRoughness;
+            surf.specAlbedo           = s.specAlbedo;
+            surf.specHitT             = s.specHitT;
+        }
     }
     // NRDOnly has no AA resolver behind it (no DLSS, no TAA) — see NRD README:
     // "NRD tries to preserve jittering at least on geometrical edges ... moves
     // the problem of anti-aliasing to the application side." Feeding Halton
     // sub-pixel jitter with no final resolver produces a persistent shimmer on
     // edges even when the camera is static. Zero the jitter in this mode.
-    // NRDDLSS keeps Halton — DLSS consumes it for super-sampling AA.
+    // NRDDLSS / DLSSRR keep Halton — DLSS consumes it for super-sampling AA.
     CameraParams cameraForSplit = camera;
     if (m_mode == Mode::NRDOnly) {
         cameraForSplit.jitterOffset = make_float2(0.0f, 0.0f);
@@ -385,10 +396,13 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
         return false;
     }
 
-    // For NRDDLSS / DLSSOnly, ask DLSS for optimal render resolution first.
+    // For NRDDLSS / DLSSOnly / DLSSRR, ask DLSS (or DLSS-RR) for optimal render
+    // resolution first. DLSS-RR uses a sibling NGX feature with its own
+    // optimal-settings query, so route through DLSSDContext when applicable.
     uint32_t renderW = m_width, renderH = m_height;
-    const bool wantsDlss = (newMode == Mode::NRDDLSS || newMode == Mode::DLSSOnly);
-    if (wantsDlss) {
+    const bool wantsDlssSR = (newMode == Mode::NRDDLSS || newMode == Mode::DLSSOnly);
+    const bool wantsDlssRR = (newMode == Mode::DLSSRR);
+    if (wantsDlssSR) {
         if (!initDlssPath(display, m_width, m_height)) {
             LOG_WARN("DLSS init failed — demoting %s → %s",
                      newMode == Mode::NRDDLSS ? "NRDDLSS" : "DLSSOnly",
@@ -417,6 +431,28 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
                 renderW = rw; renderH = rh;
             }
         }
+    } else if (wantsDlssRR) {
+        m_dlssd = std::make_unique<DLSSDContext>();
+        if (!m_dlssd->init(display->instance(), display->physicalDevice(), display->device())) {
+            LOG_WARN("DLSS-RR init failed — demoting to Native");
+            m_dlssd.reset();
+            m_mode = Mode::Native;
+            m_display = display;
+            m_renderWidth = m_width;
+            m_renderHeight = m_height;
+            return false;
+        }
+        uint32_t rw = 0, rh = 0;
+        DLSSDContext::QualityMode dq = DLSSDContext::BALANCED;
+        switch (m_dlssQuality) {
+            case DLSSQuality::Performance: dq = DLSSDContext::PERFORMANCE; break;
+            case DLSSQuality::Balanced:    dq = DLSSDContext::BALANCED; break;
+            case DLSSQuality::Quality:     dq = DLSSDContext::QUALITY; break;
+            case DLSSQuality::DLAA:        dq = DLSSDContext::DLAA; break;
+        }
+        if (m_dlssd->getOptimalRenderResolution(m_width, m_height, dq, rw, rh)) {
+            renderW = rw; renderH = rh;
+        }
     }
 
     const bool needsNrd = (newMode == Mode::NRDOnly || newMode == Mode::NRDDLSS);
@@ -424,6 +460,7 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
         LOG_WARN("NRD init failed — demoting to Native");
         shutdownDlssPath();
         shutdownNrdPath();
+        m_dlssd.reset();
         m_mode = Mode::Native;
         m_display = display;
         return false;
@@ -481,12 +518,19 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
         }
     }
 
-    // DLSSOnly: the path-trace kernel accumulates into m_accumBuffer at the
-    // (sub-output) render resolution; we must resize it before the first
-    // frame, otherwise the kernel walks past the buffer end.
-    if (newMode == Mode::DLSSOnly && (renderW != m_width || renderH != m_height)) {
+    // DLSSOnly / DLSSRR: the path-trace kernel runs at the (sub-output) render
+    // resolution; we must resize accum + aux before the first frame, otherwise
+    // the kernel walks past the buffer end.
+    if ((newMode == Mode::DLSSOnly || newMode == Mode::DLSSRR) &&
+        (renderW != m_width || renderH != m_height)) {
         m_accumBuffer.resize(renderW, renderH);
         m_auxBuffers.resize(renderW, renderH);
+        m_restir.resize(renderW, renderH);
+        m_restir.invalidateHistory();
+        m_restirGI.resize(renderW, renderH);
+        m_restirGI.invalidateHistory();
+        m_restirPT.resize(renderW, renderH);
+        m_restirPT.invalidateHistory();
     }
 
     // DLSSOnly mode: path tracer writes HDR directly into m_sharedAux->hdrColor()
@@ -494,7 +538,7 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
     // m_tonemap maps to LDR sRGB on the swapchain-sized sampled image. No
     // composite-render pass (no diff/spec to combine), no NRD render-res HDR
     // intermediate (we use the shared interop image as DLSS input).
-    if (newMode == Mode::DLSSOnly) {
+    if (newMode == Mode::DLSSOnly || newMode == Mode::DLSSRR) {
         VkDevice dev = display->device();
         VkPhysicalDevice phys = display->physicalDevice();
         // Output-res HDR image only (DLSS write target). The shared
@@ -502,9 +546,11 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
         if (!createHdrTarget(dev, phys, m_width, m_height,
                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                 m_hdrOutputImage, m_hdrOutputMem, m_hdrOutputView)) {
-            LOG_ERROR("DLSSOnly: HDR output image alloc failed — demoting to Native");
+            LOG_ERROR("DLSS%s: HDR output image alloc failed — demoting to Native",
+                      newMode == Mode::DLSSRR ? "RR" : "Only");
             shutdownDlssPath();
             shutdownNrdPath();
+            m_dlssd.reset();
             m_mode = Mode::Native;
             m_display = display;
             return false;
@@ -513,9 +559,11 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
         if (!m_tonemap->init(dev, m_ldrRenderPass,
                              CompositePass::TONEMAP_ONLY,
                              display->sampledImageFormat(), "shaders")) {
-            LOG_ERROR("DLSSOnly: Tonemap pass init failed — demoting to Native");
+            LOG_ERROR("DLSS%s: Tonemap pass init failed — demoting to Native",
+                      newMode == Mode::DLSSRR ? "RR" : "Only");
             shutdownDlssPath();
             shutdownNrdPath();
+            m_dlssd.reset();
             m_mode = Mode::Native;
             m_display = display;
             return false;
@@ -556,7 +604,8 @@ void Renderer::setDLSSQuality(DLSSQuality q) {
     // Re-init the active DLSS-using mode so DLSS picks the new quality's
     // render resolution. setMode() short-circuits on (mode==current); bounce
     // through Native to force a full teardown + rebuild. Cheap (few ms).
-    if ((m_mode == Mode::NRDDLSS || m_mode == Mode::DLSSOnly) && m_display) {
+    if ((m_mode == Mode::NRDDLSS || m_mode == Mode::DLSSOnly ||
+         m_mode == Mode::DLSSRR) && m_display) {
         Mode prev = m_mode;
         setMode(Mode::Native, m_display);
         setMode(prev,         m_display);
@@ -827,6 +876,7 @@ static bool initHdrIntermediates(
 
 void Renderer::shutdownDlssPath() {
     m_dlss.reset();
+    m_dlssd.reset();
 }
 
 void Renderer::prePresentTrampoline(VkCommandBuffer cmd, void* user) {
@@ -846,6 +896,13 @@ void Renderer::recordPrePresent(VkCommandBuffer cmd) {
     // straight into m_sharedAux->hdrColor(); we just need DLSS upscale + tonemap.
     if (m_mode == Mode::DLSSOnly) {
         recordDlssOnlyPrePresent(cmd);
+        return;
+    }
+    // ── DLSSRR fast path: skip NRD entirely. The split path tracer wrote noisy
+    // color + RR guides into shared aux images; DLSS-RR upscales+denoises in
+    // one pass.
+    if (m_mode == Mode::DLSSRR) {
+        recordDlssRRPrePresent(cmd);
         return;
     }
 
@@ -1146,6 +1203,115 @@ void Renderer::recordDlssOnlyPrePresent(VkCommandBuffer cmd) {
     m_prevJitter[1] = m_lastCamera.jitterOffset.y;
     if (trace) LOG_INFO("DLSSOnly: pre-present[%u] done", s_dlssOnlyFrame);
     ++s_dlssOnlyFrame;
+}
+
+// ────────────────────────────────────────────────────────────────
+// DLSSRR pre-present: skip NRD entirely. The split path tracer wrote
+// noisy color + worldNormalRoughness + specAlbedo + diffAlbedo + viewZ +
+// motionVectors + ndcDepth + specHitT into shared aux images; DLSS-RR
+// consumes them and produces the final upscaled denoised HDR image.
+// ────────────────────────────────────────────────────────────────
+void Renderer::recordDlssRRPrePresent(VkCommandBuffer cmd) {
+    if (!m_display || !m_dlssd || !m_tonemap || !m_sharedAux || !m_lastCameraValid) return;
+
+    static uint32_t s_dlssRRFrame = 0;
+    const bool trace = s_dlssRRFrame < 3;
+
+    // Lazy create the DLSS-RR feature on the first frame after mode change.
+    if (!m_dlssd->isValid()) {
+        DLSSDContext::QualityMode dq = DLSSDContext::BALANCED;
+        switch (m_dlssQuality) {
+            case DLSSQuality::Performance: dq = DLSSDContext::PERFORMANCE; break;
+            case DLSSQuality::Balanced:    dq = DLSSDContext::BALANCED; break;
+            case DLSSQuality::Quality:     dq = DLSSDContext::QUALITY; break;
+            case DLSSQuality::DLAA:        dq = DLSSDContext::DLAA; break;
+        }
+        if (!m_dlssd->createFeature(cmd, m_renderWidth, m_renderHeight,
+                                    m_width, m_height, dq)) {
+            LOG_ERROR("DLSSRR: feature creation failed");
+            return;
+        }
+        if (trace) LOG_INFO("DLSSRR: feature ready (%ux%u → %ux%u)",
+                            m_renderWidth, m_renderHeight, m_width, m_height);
+    }
+
+    // (1) Bring all DLSS-RR input images to SHADER_READ_ONLY.
+    auto toRead = [&](VkImage img) {
+        SharedVulkanImage::transition(cmd, img,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, VK_ACCESS_SHADER_READ_BIT);
+    };
+    toRead(m_sharedAux->hdrColor().image());
+    toRead(m_sharedAux->motionVectors().image());
+    toRead(m_sharedAux->ndcDepth().image());
+    toRead(m_sharedAux->albedo().image());
+    toRead(m_sharedAux->specAlbedo().image());
+    toRead(m_sharedAux->worldNormalRoughness().image());
+    toRead(m_sharedAux->specHitT().image());
+
+    // (2) DLSS-RR write target → GENERAL.
+    SharedVulkanImage::transition(cmd, m_hdrOutputImage,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, VK_ACCESS_SHADER_WRITE_BIT);
+
+    // Convert our row-major float4x4 (m[row][col]) into a flat float[16]. RR
+    // expects row-major, left-multiplication — same layout we already store.
+    // No transpose needed; just memcpy 64 bytes.
+    float worldToView[16];
+    float viewToClip[16];
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) {
+            worldToView[r * 4 + c] = m_lastCamera.viewMatrix.m[r][c];
+            viewToClip[r * 4 + c]  = m_lastCamera.projMatrix.m[r][c];
+        }
+
+    m_dlssd->evaluate(cmd,
+        m_sharedAux->hdrColor().view(),       m_sharedAux->hdrColor().image(),
+        m_hdrOutputView,                      m_hdrOutputImage,
+        m_sharedAux->motionVectors().view(),  m_sharedAux->motionVectors().image(),
+        m_sharedAux->ndcDepth().view(),       m_sharedAux->ndcDepth().image(),
+        m_sharedAux->albedo().view(),         m_sharedAux->albedo().image(),
+        VK_FORMAT_R8G8B8A8_UNORM,
+        m_sharedAux->specAlbedo().view(),     m_sharedAux->specAlbedo().image(),
+        m_sharedAux->worldNormalRoughness().view(),
+        m_sharedAux->worldNormalRoughness().image(),
+        m_sharedAux->specHitT().view(),       m_sharedAux->specHitT().image(),
+        VK_FORMAT_R16G16B16A16_SFLOAT,        // color
+        VK_FORMAT_R16G16_SFLOAT,              // motion
+        VK_FORMAT_R32_SFLOAT,                 // depth (NDC z)
+        m_renderWidth, m_renderHeight,
+        m_width,       m_height,
+        m_lastCamera.jitterOffset.x, m_lastCamera.jitterOffset.y,
+        worldToView, viewToClip,
+        /*reset=*/m_accumBuffer.getSampleCount() == 1);
+
+    // (3) Tonemap @ output res → sampledImage.
+    SharedVulkanImage::transition(cmd, m_hdrOutputImage,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+    const int tmMode = (m_toneMappingMode == ToneMappingMode::Reinhard) ? 1
+                     : (m_toneMappingMode == ToneMappingMode::ACES)     ? 2 : 0;
+    m_tonemap->setInputs(m_hdrOutputView);
+    VkExtent2D sext{ m_width, m_height };
+    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rbi.renderPass  = m_ldrRenderPass;
+    rbi.framebuffer = m_ldrFramebuffer;
+    rbi.renderArea.offset = {0, 0};
+    rbi.renderArea.extent = sext;
+    rbi.clearValueCount = 0;
+    vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    m_tonemap->record(cmd, sext, m_exposure, tmMode);
+    vkCmdEndRenderPass(cmd);
+
+    m_lastCameraMoved = false;
+    m_prevJitter[0] = m_lastCamera.jitterOffset.x;
+    m_prevJitter[1] = m_lastCamera.jitterOffset.y;
+    if (trace) LOG_INFO("DLSSRR: pre-present[%u] done", s_dlssRRFrame);
+    ++s_dlssRRFrame;
 }
 
 #endif // PATHTRACER_NRD_DLSS_ENABLED

@@ -50,6 +50,14 @@ bool VulkanSharedAuxBuffers::create(VkDevice device, VkPhysicalDevice phys,
      && m_hdrColor.create(device, phys, width, height,
                           VK_FORMAT_R16G16B16A16_SFLOAT, kDefaultUsage, chanRGBA16F())
      && m_ndcDepth.create(device, phys, width, height,
+                          VK_FORMAT_R32_SFLOAT, kDefaultUsage, chanR32F())
+     // DLSS-RR specific guides. fp16 normals (RGBA8 forbidden by RR §3.4.3),
+     // fp16 specular albedo, scalar specular hit distance.
+     && m_worldNormalRoughness.create(device, phys, width, height,
+                                      VK_FORMAT_R16G16B16A16_SFLOAT, kDefaultUsage, chanRGBA16F())
+     && m_specAlbedo.create(device, phys, width, height,
+                            VK_FORMAT_R16G16B16A16_SFLOAT, kDefaultUsage, chanRGBA16F())
+     && m_specHitT.create(device, phys, width, height,
                           VK_FORMAT_R32_SFLOAT, kDefaultUsage, chanR32F());
 
     if (!ok) {
@@ -69,6 +77,9 @@ void VulkanSharedAuxBuffers::destroy() {
     m_emissive.destroy();
     m_hdrColor.destroy();
     m_ndcDepth.destroy();
+    m_worldNormalRoughness.destroy();
+    m_specAlbedo.destroy();
+    m_specHitT.destroy();
     m_width = m_height = 0;
 }
 
@@ -91,5 +102,8 @@ SharedAuxSurfaces VulkanSharedAuxBuffers::surfaces() const {
     s.emissive                = m_emissive.surface();
     s.hdrColor                = m_hdrColor.surface();
     s.ndcDepth                = m_ndcDepth.surface();
+    s.worldNormalRoughness    = m_worldNormalRoughness.surface();
+    s.specAlbedo              = m_specAlbedo.surface();
+    s.specHitT                = m_specHitT.surface();
     return s;
 }

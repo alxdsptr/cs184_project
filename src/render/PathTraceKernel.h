@@ -38,6 +38,12 @@ struct SplitSurfaceOutputs {
     cudaSurfaceObject_t albedo                  = 0;
     cudaSurfaceObject_t emissive                = 0;
     cudaSurfaceObject_t ndcDepth                = 0; // clip.z / clip.w (for DLSS)
+    // ── DLSS-RR-specific guides (zero in NRD modes; populated in Mode::DLSSRR)
+    // hdrColor: un-demodulated noisy combined color (diff*albedo + spec + emissive)
+    cudaSurfaceObject_t hdrColor                = 0; // RGBA16F linear HDR
+    cudaSurfaceObject_t worldNormalRoughness    = 0; // RGBA16F: world-space normal.xyz, roughness in .w
+    cudaSurfaceObject_t specAlbedo              = 0; // RGBA16F: EnvBRDFApprox2 (DLSS-RR §3.4.2)
+    cudaSurfaceObject_t specHitT                = 0; // R32F:    world-space distance from primary surface to first reflected hit
 };
 
 // Split-output variant of the path tracer. Writes demodulated diffuse / specular

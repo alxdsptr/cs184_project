@@ -122,13 +122,20 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
     if (renderMode) {
         ImGui::Separator();
         ImGui::Text("Render Mode");
-        // Order MUST match Renderer::Mode enum: Native, NRDOnly, NRDDLSS, DLSSOnly.
-        const char* modes[] = {"Native", "NRD (denoise)", "NRD + DLSS", "DLSS only (no NRD)"};
+        // Order MUST match Renderer::Mode enum: Native, NRDOnly, NRDDLSS, DLSSOnly, DLSSRR.
+        const char* modes[] = {
+            "Native",
+            "NRD (denoise)",
+            "NRD + DLSS",
+            "DLSS only (no NRD)",
+            "DLSS-RR (Ray Reconstruction)"
+        };
         if (ImGui::Combo("Pipeline", renderMode, modes, IM_ARRAYSIZE(modes))) {
             changed = true;
         }
-        // Both DLSS-using modes show the quality dropdown.
-        if ((*renderMode == 2 || *renderMode == 3) && dlssQuality) {
+        // All DLSS-using modes show the quality dropdown (DLSSRR uses the same
+        // PerfQuality enum as DLSS-SR per RR §3.2).
+        if ((*renderMode == 2 || *renderMode == 3 || *renderMode == 4) && dlssQuality) {
             const char* q[] = {"Performance", "Balanced", "Quality", "DLAA"};
             if (ImGui::Combo("DLSS Quality", dlssQuality, q, IM_ARRAYSIZE(q))) {
                 changed = true;

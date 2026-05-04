@@ -1058,6 +1058,38 @@ static __forceinline__ __device__ uint32_t packRGBA8(float r, float g, float b, 
     return (ba << 24) | (bb << 16) | (bg << 8) | br;
 }
 
+// DLSS-RR §3.4.2 / Appendix: per-pixel specular albedo from F0, alpha, NoV.
+static __forceinline__ __device__ float3 envBRDFApprox2_split(
+    float3 F0, float alpha, float NoV)
+{
+    NoV = fabsf(NoV);
+    float NoV2 = NoV * NoV;
+    float NoV3 = NoV2 * NoV;
+    float a3   = alpha * alpha * alpha;
+    float M1xy_top = 0.99044f - 1.28514f * NoV;
+    float M1xy_bot = 1.29678f - 0.755907f * NoV;
+    float biasNum = M1xy_top + M1xy_bot * alpha;
+    float M2_0 = 1.0f + 2.92338f * NoV + 59.4188f * NoV3;
+    float M2_1 = 20.3225f - 27.0302f * NoV + 222.592f * NoV3;
+    float M2_2 = 121.563f + 626.13f * NoV + 316.627f * NoV3;
+    float biasDen = M2_0 + M2_1 * alpha + M2_2 * a3;
+    float bias = biasNum / fmaxf(biasDen, 1e-7f);
+    float M3xy_top = 0.0365463f + 3.32707f * NoV;
+    float M3xy_bot = 9.0632f    - 9.04756f * NoV;
+    float scaleNum = M3xy_top + M3xy_bot * alpha;
+    float M4_0 = 1.0f + 3.59685f * NoV2 - 1.36772f * NoV3;
+    float M4_1 = 9.04401f - 16.3174f * NoV2 + 9.22949f * NoV3;
+    float M4_2 = 5.56589f + 19.7886f * NoV2 - 20.2123f * NoV3;
+    float scaleDen = M4_0 + M4_1 * alpha + M4_2 * a3;
+    float scale = scaleNum / fmaxf(scaleDen, 1e-7f);
+    bias  *= fminf(fmaxf(F0.y * 50.0f, 0.0f), 1.0f);
+    scale = fmaxf(scale, 0.0f);
+    bias  = fmaxf(bias, 0.0f);
+    return make_float3(F0.x * scale + bias,
+                       F0.y * scale + bias,
+                       F0.z * scale + bias);
+}
+
 extern "C" __global__ void __raygen__path_trace_split()
 {
     uint3 idx = optixGetLaunchIndex();
@@ -1079,6 +1111,9 @@ extern "C" __global__ void __raygen__path_trace_split()
     float3 emissiveSum  = make_float3(0, 0, 0);
     float  diffHitSum = 0.0f; uint32_t diffHitCount = 0;
     float  specHitSum = 0.0f; uint32_t specHitCount = 0;
+    // DLSS-RR additional accumulators.
+    float3 noisyColorSum = make_float3(0, 0, 0);
+    float  anyHitSum = 0.0f; uint32_t anyHitCount = 0;
 
     bool   gbufferWritten = false;
     float3 outPrimaryAlbedo    = make_float3(0, 0, 0);
@@ -1604,7 +1639,12 @@ extern "C" __global__ void __raygen__path_trace_split()
         if (haveGbuffer && bucketHitDistSet) {
             if (pickedBucket == 0) { diffHitSum += bucketHitDist; diffHitCount++; }
             else                    { specHitSum += bucketHitDist; specHitCount++; }
+            anyHitSum += bucketHitDist; anyHitCount++;
         }
+        // DLSS-RR noisy combined color: pathRadiance already incorporates
+        // 1/pickedP, so its expected value over both buckets is the un-modulated
+        // primary-hit radiance.
+        noisyColorSum = noisyColorSum + pathRadiance + emissiveContrib;
         if (!gbufferWritten && haveGbuffer) {
             outPrimaryAlbedo    = primaryAlbedo;
             outPrimaryNormal    = primaryNormal;
@@ -1621,8 +1661,22 @@ extern "C" __global__ void __raygen__path_trace_split()
     float3 demodDiffAvg = demodDiffSum * invSpp;
     float3 demodSpecAvg = demodSpecSum * invSpp;
     float3 emissiveAvg  = emissiveSum  * invSpp;
+    float3 noisyColorAvg = noisyColorSum * invSpp;
     float diffHitAvg = diffHitCount > 0 ? (diffHitSum / (float)diffHitCount) : 0.0f;
     float specHitAvg = specHitCount > 0 ? (specHitSum / (float)specHitCount) : 0.0f;
+    float anyHitAvg  = anyHitCount  > 0 ? (anyHitSum  / (float)anyHitCount)  : 0.0f;
+
+    // DLSS-RR specular albedo: F0 = lerp(0.04, primaryAlbedo, 0). We fall back
+    // to dielectric (metallic=0) F0 since the kernel doesn't preserve metallic
+    // past the bucket pick — EnvBRDFApprox2's bias term saturates for high-F0
+    // pixels (sky default 0.5,0.5,0.5 already handled below).
+    float3 specF0_RR = make_float3(0.04f, 0.04f, 0.04f);
+    float NoV_RR = fmaxf(-dot(camera.forward, outPrimaryNormal), 0.0f);
+    float3 specAlbedoAvg = envBRDFApprox2_split(
+        specF0_RR, outPrimaryRoughness * outPrimaryRoughness, NoV_RR);
+    if (!gbufferWritten) {
+        specAlbedoAvg = make_float3(0.5f, 0.5f, 0.5f);
+    }
 
     float4 diffTexel = nrd_helpers::packRadianceHitDist(demodDiffAvg, diffHitAvg);
     float4 specTexel = nrd_helpers::packRadianceHitDist(demodSpecAvg, specHitAvg);
@@ -1661,6 +1715,37 @@ extern "C" __global__ void __raygen__path_trace_split()
     if (params.splitEmissive) {
         ushort4 p = packHalf4_split(emTexel);
         surf2Dwrite<ushort4>(p, params.splitEmissive, x * 8, y);
+    }
+
+    // ── DLSS-RR specific surfaces (only written in Mode::DLSSRR) ──
+    if (params.splitHdrColor) {
+        float3 c = noisyColorAvg;
+        if (isnan(c.x) || isnan(c.y) || isnan(c.z) ||
+            isinf(c.x) || isinf(c.y) || isinf(c.z)) c = make_float3(0,0,0);
+        c.x = fminf(fmaxf(c.x, 0.0f), 30.0f);
+        c.y = fminf(fmaxf(c.y, 0.0f), 30.0f);
+        c.z = fminf(fmaxf(c.z, 0.0f), 30.0f);
+        ushort4 p = packHalf4_split(make_float4(c.x, c.y, c.z, 1.0f));
+        surf2Dwrite<ushort4>(p, params.splitHdrColor, x * 8, y);
+    }
+    if (params.splitWorldNormalRoughness) {
+        ushort4 p = packHalf4_split(make_float4(
+            outPrimaryNormal.x, outPrimaryNormal.y, outPrimaryNormal.z,
+            outPrimaryRoughness));
+        surf2Dwrite<ushort4>(p, params.splitWorldNormalRoughness, x * 8, y);
+    }
+    if (params.splitSpecAlbedo) {
+        ushort4 p = packHalf4_split(make_float4(
+            fminf(fmaxf(specAlbedoAvg.x, 0.0f), 4.0f),
+            fminf(fmaxf(specAlbedoAvg.y, 0.0f), 4.0f),
+            fminf(fmaxf(specAlbedoAvg.z, 0.0f), 4.0f),
+            1.0f));
+        surf2Dwrite<ushort4>(p, params.splitSpecAlbedo, x * 8, y);
+    }
+    if (params.splitSpecHitT) {
+        float h = anyHitAvg;
+        if (isnan(h) || isinf(h) || h < 0.0f) h = 0.0f;
+        surf2Dwrite<float>(h, params.splitSpecHitT, x * 4, y);
     }
 }
 

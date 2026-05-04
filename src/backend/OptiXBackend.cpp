@@ -594,6 +594,10 @@ void OptiXBackend::launchPathTraceSplit(
     lp.splitAlbedo                  = surfaces.albedo;
     lp.splitEmissive                = surfaces.emissive;
     lp.splitNdcDepth                = surfaces.ndcDepth;
+    lp.splitHdrColor                = surfaces.hdrColor;
+    lp.splitWorldNormalRoughness    = surfaces.worldNormalRoughness;
+    lp.splitSpecAlbedo              = surfaces.specAlbedo;
+    lp.splitSpecHitT                = surfaces.specHitT;
     lp.width       = width;
     lp.height      = height;
     lp.sampleIndex = sampleIndex;

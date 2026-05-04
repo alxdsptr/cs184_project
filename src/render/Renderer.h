@@ -19,6 +19,7 @@ class VulkanDisplay;
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
 class NRDContext;
 class DLSSContext;
+class DLSSDContext;
 class CompositePass;
 class VulkanSharedAuxBuffers;
 #endif
@@ -30,6 +31,7 @@ public:
         NRDOnly,    // denoise with NRD, composite+tonemap in Vulkan
         NRDDLSS,    // NRD → composite linear HDR → DLSS upscale → tonemap
         DLSSOnly,   // path tracer → HDR interop → DLSS upscale → tonemap (no NRD)
+        DLSSRR,     // DLSS Ray Reconstruction: noisy color + guides → DLSS-RR (denoise + upscale) → tonemap
     };
 
     Renderer();
@@ -124,6 +126,8 @@ private:
     void        recordPrePresent(VkCommandBuffer cmd);
     // DLSSOnly fast path: HDR interop image → DLSS upscale → tonemap.
     void        recordDlssOnlyPrePresent(VkCommandBuffer cmd);
+    // DLSSRR fast path: noisy color + RR guides → DLSS-RR upscale+denoise → tonemap.
+    void        recordDlssRRPrePresent(VkCommandBuffer cmd);
 #endif
 
     AccumulationBuffer m_accumBuffer;
@@ -149,6 +153,7 @@ private:
     std::unique_ptr<VulkanSharedAuxBuffers> m_sharedAux;
     std::unique_ptr<NRDContext>     m_nrd;
     std::unique_ptr<DLSSContext>    m_dlss;
+    std::unique_ptr<DLSSDContext>   m_dlssd;   // DLSS-RR (Mode::DLSSRR)
     std::unique_ptr<CompositePass>  m_compositeRender;  // writes to sampledImage (NRDOnly) or linear HDR (NRDDLSS)
     std::unique_ptr<CompositePass>  m_tonemap;          // NRDDLSS mode only (post-DLSS)
 

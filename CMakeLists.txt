@@ -125,11 +125,25 @@ if(PATHTRACER_ENABLE_NRD_DLSS)
     endif()
     set(DLSS_RUNTIME_DLL "$<IF:$<CONFIG:Debug>,${DLSS_RUNTIME_DLL_DEBUG},${DLSS_RUNTIME_DLL_RELEASE}>")
 
+    # DLSS-RR (Ray Reconstruction) runtime DLL. Loaded by NGX at feature-init
+    # time when NVSDK_NGX_Feature_RayReconstruction is requested.
+    set(DLSSD_RUNTIME_DLL_RELEASE "${PATHTRACER_DLSS_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlssd.dll")
+    set(DLSSD_RUNTIME_DLL_DEBUG   "${PATHTRACER_DLSS_SDK_DIR}/lib/Windows_x86_64/dev/nvngx_dlssd.dll")
+    if(NOT EXISTS "${DLSSD_RUNTIME_DLL_RELEASE}")
+        message(WARNING "DLSS-RR runtime DLL missing at ${DLSSD_RUNTIME_DLL_RELEASE} — Mode::DLSSRR will fail at runtime")
+    endif()
+    if(NOT EXISTS "${DLSSD_RUNTIME_DLL_DEBUG}")
+        set(DLSSD_RUNTIME_DLL_DEBUG "${DLSSD_RUNTIME_DLL_RELEASE}")
+    endif()
+    set(DLSSD_RUNTIME_DLL "$<IF:$<CONFIG:Debug>,${DLSSD_RUNTIME_DLL_DEBUG},${DLSSD_RUNTIME_DLL_RELEASE}>")
+
     message(STATUS "DLSS include:   ${DLSS_INCLUDE_DIR}")
     message(STATUS "DLSS lib (rel): ${DLSS_LIBRARY_RELEASE}")
     message(STATUS "DLSS lib (dbg): ${DLSS_LIBRARY_DEBUG}")
     message(STATUS "DLSS dll (rel): ${DLSS_RUNTIME_DLL_RELEASE}")
     message(STATUS "DLSS dll (dbg): ${DLSS_RUNTIME_DLL_DEBUG}")
+    message(STATUS "DLSSD dll (rel): ${DLSSD_RUNTIME_DLL_RELEASE}")
+    message(STATUS "DLSSD dll (dbg): ${DLSSD_RUNTIME_DLL_DEBUG}")
 endif()
 
 # ── SPIR-V shader compilation ────────────────────────────────
@@ -303,6 +317,7 @@ if(PATHTRACER_ENABLE_NRD_DLSS)
         src/postfx/NRDContext.cpp
         src/postfx/CompositePass.cpp
         src/postfx/DLSSContext.cpp
+        src/postfx/DLSSDContext.cpp
     )
     target_compile_definitions(pathtracer PRIVATE PATHTRACER_NRD_DLSS_ENABLED=1)
     target_include_directories(pathtracer PRIVATE
@@ -345,6 +360,14 @@ if(PATHTRACER_ENABLE_NRD_DLSS)
     add_custom_command(TARGET pathtracer POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${DLSS_RUNTIME_DLL}"
+            $<TARGET_FILE_DIR:pathtracer>/
+        VERBATIM)
+
+    # DLSS-RR runtime DLL — NGX loads it lazily when the RayReconstruction
+    # feature is created. Must be alongside the executable.
+    add_custom_command(TARGET pathtracer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${DLSSD_RUNTIME_DLL}"
             $<TARGET_FILE_DIR:pathtracer>/
         VERBATIM)
 

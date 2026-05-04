@@ -252,6 +252,7 @@ bool Application::init(uint32_t width, uint32_t height, const std::string& title
         if (m_initialMode == 1) rm = Renderer::Mode::NRDOnly;
         else if (m_initialMode == 2) rm = Renderer::Mode::NRDDLSS;
         else if (m_initialMode == 3) rm = Renderer::Mode::DLSSOnly;
+        else if (m_initialMode == 4) rm = Renderer::Mode::DLSSRR;
         LOG_INFO("Applying initial renderer mode: %d", m_initialMode);
         m_renderer.setMode(rm, &m_display);
     }
