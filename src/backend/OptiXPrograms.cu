@@ -1364,18 +1364,45 @@ extern "C" __global__ void __raygen__path_trace_split()
                 if (mat.emissiveTex == 0) break;
             }
 
-            // NEE area lights.
+            // NEE area lights.  ReSTIR DI replaces the per-frame CDF pick at
+            // the primary hit (s==0, bounce==0) with the resampled
+            // reservoir's selected sample. The lobe-override still applies
+            // — ReSTIR DI feeds the chosen bucket only, multiplied by
+            // 1/pickedP via `throughput`. Estimator: f * W (no MIS).
+            bool restirActive = primaryLobeOverride && (s == 0) &&
+                                (scene.restirEnabled != 0) &&
+                                (scene.d_restirReservoirs != nullptr);
             if (scene.d_areaLights && scene.areaLightCount > 0 &&
                 scene.d_areaLightCDF && scene.areaLightTotalWeight > 0.0f)
             {
-                uint32_t li = sampleAreaLightIndex(scene.d_areaLightCDF, scene.areaLightCount,
-                                                   pcg32_float(rng));
+                uint32_t li;
+                float b0, b1, b2;
+                float restirW = 0.0f;
+                bool restirSkip = false;
+                if (restirActive) {
+                    const ReSTIRReservoir* res =
+                        reinterpret_cast<const ReSTIRReservoir*>(scene.d_restirReservoirs);
+                    ReSTIRReservoir r = res[pixelIdx];
+                    if (r.lightIndex == 0xFFFFFFFFu || r.W <= 0.0f || r.pHat <= 0.0f) {
+                        restirSkip = true;
+                    } else {
+                        li = r.lightIndex;
+                        b1 = r.baryB1;
+                        b2 = r.baryB2;
+                        b0 = 1.0f - b1 - b2;
+                        restirW = r.W;
+                    }
+                } else {
+                    li = sampleAreaLightIndex(scene.d_areaLightCDF, scene.areaLightCount,
+                                              pcg32_float(rng));
+                    float r1 = pcg32_float(rng), r2 = pcg32_float(rng);
+                    float su = sqrtf(r1);
+                    b0 = 1.0f - su;
+                    b1 = su * (1.0f - r2);
+                    b2 = su * r2;
+                }
+                if (!restirSkip) {
                 GPUAreaLight light = scene.d_areaLights[li];
-                float r1 = pcg32_float(rng), r2 = pcg32_float(rng);
-                float su = sqrtf(r1);
-                float b0 = 1.0f - su;
-                float b1 = su * (1.0f - r2);
-                float b2 = su * r2;
                 float3 lp = light.v0 * b0
                           + (light.v0 + light.e1) * b1
                           + (light.v0 + light.e2) * b2;
@@ -1391,32 +1418,43 @@ extern "C" __global__ void __raygen__path_trace_split()
                     float3 st = traceShadowRay(handle, shadowOrigin, Ld, 0.001f, shadowTmax);
                     float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
                     if (slum > 1e-6f) {
-                        float pTri = light.weight / scene.areaLightTotalWeight;
-                        float pArea = pTri / fmaxf(light.area, 1e-7f);
-                        float pdfOmega = pArea * d2 / fmaxf(lNdot, 1e-7f);
                         float3 V = -ray.direction;
                         float3 brdf;
-                        float pdfBs;
                         if (primaryLobeOverride) {
-                            if (pickedBucket == 0) {
-                                brdf  = materialDiffuseLobe_split(mat, N, V, Ld, albedo);
-                                pdfBs = bsdfDiffusePdf(NdotL);
-                            } else {
-                                brdf  = materialSpecularLobe_split(mat, N, V, Ld, albedo);
-                                pdfBs = bsdfSpecularPdf(N, V, Ld, mat.roughness);
-                            }
+                            brdf = (pickedBucket == 0)
+                                ? materialDiffuseLobe_split(mat, N, V, Ld, albedo)
+                                : materialSpecularLobe_split(mat, N, V, Ld, albedo);
                         } else {
                             brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
-                            float spP = materialSpecProb(mat, N, V, albedo);
-                            pdfBs = materialMixturePdf(mat, N, V, Ld, spP);
                         }
-                        float w = powerHeuristic(pdfOmega, pdfBs);
                         float3 Le = sampleAreaLightLe(light, b0, b1, b2);
-                        float3 neeContrib = throughput * st * brdf * Le *
-                                            (NdotL / fmaxf(pdfOmega, 1e-7f)) * w;
-                        pathRadiance += clampFirefly_split(neeContrib, 10.0f);
+
+                        if (restirActive) {
+                            float geom = lNdot / d2;
+                            float3 neeContrib = throughput * st * brdf * Le *
+                                                (NdotL * geom) * restirW;
+                            pathRadiance += clampFirefly_split(neeContrib, 10.0f);
+                        } else {
+                            float pTri = light.weight / scene.areaLightTotalWeight;
+                            float pArea = pTri / fmaxf(light.area, 1e-7f);
+                            float pdfOmega = pArea * d2 / fmaxf(lNdot, 1e-7f);
+                            float pdfBs;
+                            if (primaryLobeOverride) {
+                                pdfBs = (pickedBucket == 0)
+                                    ? bsdfDiffusePdf(NdotL)
+                                    : bsdfSpecularPdf(N, V, Ld, mat.roughness);
+                            } else {
+                                float spP = materialSpecProb(mat, N, V, albedo);
+                                pdfBs = materialMixturePdf(mat, N, V, Ld, spP);
+                            }
+                            float w = powerHeuristic(pdfOmega, pdfBs);
+                            float3 neeContrib = throughput * st * brdf * Le *
+                                                (NdotL / fmaxf(pdfOmega, 1e-7f)) * w;
+                            pathRadiance += clampFirefly_split(neeContrib, 10.0f);
+                        }
                     }
                 }
+                } // end !restirSkip
             }
 
             // Point lights (delta emitters; sampled in addition to area lights).
@@ -1452,6 +1490,28 @@ extern "C" __global__ void __raygen__path_trace_split()
                     direct += clampFirefly_split(brdf * st * Li * NdotL, 10.0f);
                 }
                 pathRadiance += throughput * direct;
+            }
+
+            // ReSTIR PT / GI consumption at the primary hit on sample s==0.
+            // PT takes precedence; both branches add the pre-computed indirect
+            // estimate and skip continuation bounces.
+            //
+            // CRITICAL: do NOT multiply by `throughput`. throughput == 1/pickedP
+            // from the bucket override; the bucket routing redistributes
+            // pathRadiance to the picked demod bucket already. Multiplying
+            // by throughput would scale indirect by 1/pickedP, and the
+            // demod-composite recovery becomes 2*indirect (double-counted).
+            if (primaryLobeOverride && s == 0) {
+                if (scene.restirPTEnabled != 0 && scene.d_restirPTIndirect != nullptr) {
+                    float3 indirect = scene.d_restirPTIndirect[pixelIdx];
+                    pathRadiance += indirect;
+                    break;
+                }
+                if (scene.restirGIEnabled != 0 && scene.d_restirGIIndirect != nullptr) {
+                    float3 indirect = scene.d_restirGIIndirect[pixelIdx];
+                    pathRadiance += indirect;
+                    break;
+                }
             }
 
             // BSDF sampling for next bounce. Forced lobe at primary hit.
