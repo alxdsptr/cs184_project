@@ -387,7 +387,10 @@ extern "C" __global__ void __raygen__path_trace()
                             float d = sqrtf(d2);
                             float3 Ld = toL * (1.0f / d);
                             float lNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
-                            if (lNdot > 0.0f) {
+                            float spotAtten = spotlightAttenuation(
+                                scene.spotlightEnabled, scene.spotlightCosHalfAngle,
+                                scene.spotlightSoftness, lNdot);
+                            if (lNdot > 0.0f && spotAtten > 0.0f) {
                                 float3 shadowTransmittance = traceShadowRay(
                                     handle, mediumPos, Ld, 0.001f, fmaxf(d - 0.002f, 0.001f));
                                 float3 volumetricST = volumeShadowTransmittance(
@@ -401,7 +404,7 @@ extern "C" __global__ void __raygen__path_trace()
                                     float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
                                     float w = powerHeuristic(pdfOmega, phase);
                                     float3 Le = sampleAreaLightLe(light, b0, b1, b2);
-                                    radiance += throughput * shadowTransmittance * Le * (phase / fmaxf(pdfOmega, 1e-7f)) * w;
+                                    radiance += throughput * shadowTransmittance * Le * (phase / fmaxf(pdfOmega, 1e-7f)) * w * spotAtten;
                                 }
                             }
                         }
@@ -729,6 +732,8 @@ extern "C" __global__ void __raygen__path_trace()
             if (isEmissive) {
                 float3 Le = emissiveColor * mat.emissionStrength;
                 float weight = 1.0f;
+                // Spotlight override does NOT gate BSDF/camera-visible Le here —
+                // see the comment in PathTraceKernel.cu's matching branch.
                 bool isAreaLight = false;
                 if (bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
                     int areaLightIndex = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
@@ -783,16 +788,19 @@ extern "C" __global__ void __raygen__path_trace()
 
                 float NdotL = fmaxf(dot(N, Ld), 0.0f);
                 float lightNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
-                if (NdotL > 0.0f && lightNdot > 0.0f) {
+                float spotAtten = spotlightAttenuation(
+                    scene.spotlightEnabled, scene.spotlightCosHalfAngle,
+                    scene.spotlightSoftness, lightNdot);
+                if (NdotL > 0.0f && lightNdot > 0.0f && spotAtten > 0.0f) {
                     float3 shadowOrigin = hit.position + N * 0.001f;
                     float shadowTmax = fmaxf(dist - 0.002f, 0.001f);
                     float3 shadowTransmittance = traceShadowRay(
                         handle, shadowOrigin, Ld, 0.001f, shadowTmax);
-                    
+
                     float3 volumetricShadowT = volumeShadowTransmittance(
                         shadowOrigin, Ld, dist, scene.medium, rng);
                     shadowTransmittance = shadowTransmittance * volumetricShadowT;
-                    
+
                     float shadowLum = 0.2126f * shadowTransmittance.x +
                                       0.7152f * shadowTransmittance.y +
                                       0.0722f * shadowTransmittance.z;
@@ -810,7 +818,7 @@ extern "C" __global__ void __raygen__path_trace()
                         float3 Le = sampleAreaLightLe(light, b0, b1, b2);
                         radiance += throughput * shadowTransmittance * brdf *
                                     Le *
-                                    (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
+                                    (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight * spotAtten;
                     }
                 }
             }
@@ -1446,6 +1454,8 @@ extern "C" __global__ void __raygen__path_trace_split()
             if (isEmissive) {
                 float3 Le = emissiveColor * mat.emissionStrength;
                 float weight = 1.0f;
+                // Spotlight override does NOT gate BSDF/camera-visible Le here —
+                // see the comment in PathTraceKernel.cu's matching branch.
                 if (bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
                     int ali = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
                     if (ali >= 0 && scene.d_areaLights && scene.areaLightCount > 0) {
@@ -1491,7 +1501,10 @@ extern "C" __global__ void __raygen__path_trace_split()
                 float3 Ld = toL * (1.0f / d);
                 float NdotL = fmaxf(dot(N, Ld), 0.0f);
                 float lNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
-                if (NdotL > 0.0f && lNdot > 0.0f) {
+                float spotAtten = spotlightAttenuation(
+                    scene.spotlightEnabled, scene.spotlightCosHalfAngle,
+                    scene.spotlightSoftness, lNdot);
+                if (NdotL > 0.0f && lNdot > 0.0f && spotAtten > 0.0f) {
                     float3 shadowOrigin = hit.position + N * 0.001f;
                     float shadowTmax = fmaxf(d - 0.002f, 0.001f);
                     float3 st = traceShadowRay(handle, shadowOrigin, Ld, 0.001f, shadowTmax);
@@ -1522,7 +1535,7 @@ extern "C" __global__ void __raygen__path_trace_split()
                         float w = powerHeuristic(pdfOmega, pdfBs);
                         float3 Le = sampleAreaLightLe(light, b0, b1, b2);
                         float3 neeContrib = throughput * st * brdf * Le *
-                                            (NdotL / fmaxf(pdfOmega, 1e-7f)) * w;
+                                            (NdotL / fmaxf(pdfOmega, 1e-7f)) * w * spotAtten;
                         pathRadiance += clampFirefly_split(neeContrib, 10.0f);
                     }
                 }

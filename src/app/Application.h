@@ -69,6 +69,7 @@ private:
     float m_emissiveTargetLum = 20.0f;
     HomogeneousMedium m_medium;
     bool m_hasMediumOverride = false;
+    SpotlightOverride m_spotlight;
 
     bool       m_sceneLoaded = false;
     InputState m_input;

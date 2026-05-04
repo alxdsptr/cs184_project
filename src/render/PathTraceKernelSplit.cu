@@ -264,7 +264,10 @@ __global__ void pathTraceKernelSplit(
                         float d = sqrtf(d2);
                         float3 Ld = toL * (1.0f / d);
                         float lNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
-                        if (lNdot > 0.0f) {
+                        float spotAtten = spotlightAttenuation(
+                            scene.spotlightEnabled, scene.spotlightCosHalfAngle,
+                            scene.spotlightSoftness, lNdot);
+                        if (lNdot > 0.0f && spotAtten > 0.0f) {
                             bool occluded = false;
                             float3 st = make_float3(1,1,1);
                             if (scene.d_bvhNodes && scene.totalTriangles > 0) {
@@ -299,7 +302,7 @@ __global__ void pathTraceKernelSplit(
                                 float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
                                 float w = powerHeuristic(pdfOmega, phase);
                                 float3 Le = sampleAreaLightLe(light, b0, b1, b2);
-                                float3 contrib = throughput * st * Le * (phase / fmaxf(pdfOmega, 1e-7f)) * w;
+                                float3 contrib = throughput * st * Le * (phase / fmaxf(pdfOmega, 1e-7f)) * w * spotAtten;
                                 pathRadiance += clampFirefly(contrib, 10.0f);
                             }
                         }
@@ -585,6 +588,9 @@ __global__ void pathTraceKernelSplit(
         if (isEmissive) {
             float3 Le = emissiveColor * mat.emissionStrength;
             float weight = 1.0f;
+            // Spotlight override does NOT gate BSDF/camera-visible Le here —
+            // see the comment in PathTraceKernel.cu's matching branch. The
+            // cone restriction is applied at NEE sites only.
             if (bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
                 int ali = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
                 if (ali >= 0 && scene.d_areaLights && scene.areaLightCount > 0) {
@@ -627,7 +633,10 @@ __global__ void pathTraceKernelSplit(
             float3 Ld = toL * (1.0f / d);
             float NdotL = fmaxf(dot(N, Ld), 0.0f);
             float lNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
-            if (NdotL > 0.0f && lNdot > 0.0f) {
+            float spotAtten = spotlightAttenuation(
+                scene.spotlightEnabled, scene.spotlightCosHalfAngle,
+                scene.spotlightSoftness, lNdot);
+            if (NdotL > 0.0f && lNdot > 0.0f && spotAtten > 0.0f) {
                 bool occluded = false;
                 float3 st = make_float3(1,1,1);
                 if (scene.d_bvhNodes && scene.totalTriangles > 0) {
@@ -679,7 +688,7 @@ __global__ void pathTraceKernelSplit(
                     }
                     float w = powerHeuristic(pdfOmega, pdfBs);
                     float3 Le = sampleAreaLightLe(light, b0, b1, b2);
-                    float3 neeContrib = throughput * st * brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f)) * w;
+                    float3 neeContrib = throughput * st * brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f)) * w * spotAtten;
                     pathRadiance += clampFirefly(neeContrib, 10.0f);
                 }
             }

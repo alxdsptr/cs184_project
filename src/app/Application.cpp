@@ -465,6 +465,9 @@ void Application::renderSceneSample(uchar4* d_pbo, bool timeHeadless) {
         sceneData.envUseSH = (m_useSHEnvIrradiance && m_d_shEnvCoeffs) ? 1 : 0;
         sceneData.debugNormalViz = m_debugNormalViz;
         sceneData.enableNormalMap = m_enableNormalMap ? 1 : 0;
+        sceneData.spotlightEnabled = m_spotlight.enabled ? 1 : 0;
+        sceneData.spotlightCosHalfAngle = cosf(m_spotlight.halfAngleDeg * (3.14159265358979323846f / 180.0f));
+        sceneData.spotlightSoftness = m_spotlight.softness;
 
         // Debug normal arrows: resize device buffer to match the current
         // window + stride, pre-clear validity flags, and hand the pointer to
@@ -676,7 +679,8 @@ void Application::runGui() {
                 &m_enableNormalMap,
                 &m_showNormalArrows,
                 &m_normalArrowStride,
-                &m_normalArrowLength);
+                &m_normalArrowLength,
+                &m_spotlight);
 
             // Arrow overlay renders under/over the same ImGui frame.
             if (m_showNormalArrows && !m_h_debugArrows.empty() &&

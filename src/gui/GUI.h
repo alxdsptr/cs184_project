@@ -8,6 +8,15 @@ class VulkanDisplay;
 struct CameraParams;
 struct VolumeMedium;
 
+// Runtime override that turns every triangle area light into a spotlight
+// emitting only within a cone around its surface normal. Used to coax fog
+// beams out of Bistro's lamp panels without authoring per-light cones.
+struct SpotlightOverride {
+    bool  enabled       = false;
+    float halfAngleDeg  = 25.0f;
+    float softness      = 0.3f;   // ∈ [0,1]; fraction of (1−cos) used for the fade
+};
+
 class GUI {
 public:
     // Hooks ImGui to the GLFW window for input and to the Vulkan display
@@ -39,7 +48,8 @@ public:
                 // Normal-arrow overlay toggle + its parameters.
                 bool* showNormalArrows = nullptr,
                 int*  normalArrowStride = nullptr,
-                float* normalArrowLength = nullptr);
+                float* normalArrowLength = nullptr,
+                SpotlightOverride* spotlight = nullptr);
 
     // Draw a sparse normal-arrow overlay on top of the path-traced image.
     // Call this once per frame between beginFrame() and endFrame(), only

@@ -422,7 +422,10 @@ __global__ void pathTraceKernel(
                         float d = sqrtf(d2);
                         float3 Ld = toL * (1.0f / d);
                         float lNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
-                        if (lNdot > 0.0f) {
+                        float spotAtten = spotlightAttenuation(
+                            scene.spotlightEnabled, scene.spotlightCosHalfAngle,
+                            scene.spotlightSoftness, lNdot);
+                        if (lNdot > 0.0f && spotAtten > 0.0f) {
                             bool occluded = false;
                             float3 st = make_float3(1, 1, 1);
                             if (scene.d_bvhNodes && scene.totalTriangles > 0) {
@@ -458,7 +461,7 @@ __global__ void pathTraceKernel(
                                 float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
                                 float w = powerHeuristic(pdfOmega, phase);
                                 float3 Le = sampleAreaLightLe(light, b0, b1, b2);
-                                radiance += throughput * st * Le * (phase / fmaxf(pdfOmega, 1e-7f)) * w;
+                                radiance += throughput * st * Le * (phase / fmaxf(pdfOmega, 1e-7f)) * w * spotAtten;
                             }
                         }
                     }
@@ -1002,6 +1005,14 @@ __global__ void pathTraceKernel(
             // Check if this triangle is a registered area light (NEE-sampleable
             // via the area light CDF). Texture-emitter triangles are now
             // registered too, so MIS applies uniformly.
+            //
+            // Note: the spotlight override deliberately does NOT gate the Le
+            // visible to BSDF/camera rays here. Doing so would make the lamp
+            // surface invisible when viewed from outside the cone (camera ray
+            // hits the panel at a grazing angle → Le * 0 → black geometry).
+            // The cone restriction is applied to NEE only; the surface stays
+            // fully visible. This biases MIS slightly at the cone edge but
+            // matches the "visual-only" intent of the override.
             bool isAreaLight = false;
             if (bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
                 int areaLightIndex = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
@@ -1062,7 +1073,10 @@ __global__ void pathTraceKernel(
 
             float NdotL = fmaxf(dot(N, Ld), 0.0f);
             float lightNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
-            if (NdotL > 0.0f && lightNdot > 0.0f) {
+            float spotAtten = spotlightAttenuation(
+                scene.spotlightEnabled, scene.spotlightCosHalfAngle,
+                scene.spotlightSoftness, lightNdot);
+            if (NdotL > 0.0f && lightNdot > 0.0f && spotAtten > 0.0f) {
                 // Shadow ray with glass transparency
                 float3 shadowTransmittance = make_float3(1.0f, 1.0f, 1.0f);
                 bool occluded = false;
@@ -1123,7 +1137,7 @@ __global__ void pathTraceKernel(
                     float weight = powerHeuristic(pdfOmega, pdfBsdf);
 
                     float3 Le = sampleAreaLightLe(light, b0, b1, b2);
-                    radiance += throughput * shadowTransmittance * brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
+                    radiance += throughput * shadowTransmittance * brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight * spotAtten;
                 }
             }
         }

@@ -83,7 +83,8 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
                  bool* enableNormalMap,
                  bool* showNormalArrows,
                  int*  normalArrowStride,
-                 float* normalArrowLength) {
+                 float* normalArrowLength,
+                 SpotlightOverride* spotlight) {
     bool changed = false;
     loadEnvMapRequested = false;
 
@@ -160,6 +161,24 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
             }
 
             changed = changed || any;
+        }
+    }
+
+    if (spotlight) {
+        ImGui::Separator();
+        ImGui::Text("Area-light Spotlight Override");
+        if (ImGui::Checkbox("Enable spotlight cones", &spotlight->enabled)) {
+            changed = true;
+        }
+        if (spotlight->enabled) {
+            if (ImGui::SliderFloat("Cone half-angle (deg)", &spotlight->halfAngleDeg,
+                                   1.0f, 89.0f, "%.1f")) {
+                changed = true;
+            }
+            if (ImGui::SliderFloat("Edge softness", &spotlight->softness,
+                                   0.0f, 1.0f, "%.2f")) {
+                changed = true;
+            }
         }
     }
 

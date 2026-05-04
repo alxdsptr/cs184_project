@@ -32,6 +32,15 @@ struct DeviceSceneData {
     // Scene-global homogeneous medium parameters.
     HomogeneousMedium medium;
 
+    // Spotlight-override: when enabled, every TriangleAreaLight emits only
+    // within a cone around its surface normal — turns Bistro's lamp panels
+    // into downward beams that highlight volumetric fog. cosHalfAngle defaults
+    // to -1 (full hemisphere) so an unset DeviceSceneData behaves identically
+    // to the original area-light path.
+    int   spotlightEnabled      = 0;
+    float spotlightCosHalfAngle = -1.0f;
+    float spotlightSoftness     = 0.1f;
+
     // HDR environment map (equirectangular, float4 texture)
     cudaTextureObject_t envMapTex   = 0;
 
