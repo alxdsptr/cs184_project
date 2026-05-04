@@ -21,11 +21,21 @@ struct SharedAuxSurfaces {
     cudaSurfaceObject_t emissive                = 0; // RGBA16F, linear HDR
     // DLSSOnly: full HDR composite produced by the path-trace kernel directly,
     // bypassing NRD/composite. Render-resolution input to DLSS upscale.
+    // Also reused as DLSS-RR's noisy color input (un-demodulated diff*albedo +
+    // spec + emissive — what RR's DL prior denoises directly).
     cudaSurfaceObject_t hdrColor                = 0; // RGBA16F, linear HDR
     // DLSS requires NDC depth (clip.z / clip.w), not linear viewZ — see the
     // NRD-Sample's DlssBefore.cs.hlsl comment "SR doesn't support linear viewZ".
     // Separate from `viewZ` so NRD can keep consuming linear-meter viewZ.
     cudaSurfaceObject_t ndcDepth                = 0; // R32F, clip.z / clip.w in [0,1]
+    // DLSS-RR specific guides. The DLSS-RR Integration Guide §3.4 disallows
+    // RGBA8_UNORM for normals (RGB16F or 32F required) and requires per-pixel
+    // specular albedo (EnvBRDFApprox2) and a per-pixel specular hit distance
+    // — none of which the NRD path provides. Allocate these once, populate
+    // them in Mode::DLSSRR, and leave them at zero in NRD modes.
+    cudaSurfaceObject_t worldNormalRoughness    = 0; // RGBA16F: world normal.xyz + linear roughness in .w
+    cudaSurfaceObject_t specAlbedo              = 0; // RGBA16F: EnvBRDFApprox2(F0, alpha, NoV)
+    cudaSurfaceObject_t specHitT                = 0; // R32F:    world-space distance from primary hit to first secondary surface
 };
 
 class VulkanSharedAuxBuffers {
@@ -57,6 +67,9 @@ public:
     const SharedVulkanImage& emissive()                const { return m_emissive; }
     const SharedVulkanImage& hdrColor()                const { return m_hdrColor; }
     const SharedVulkanImage& ndcDepth()                const { return m_ndcDepth; }
+    const SharedVulkanImage& worldNormalRoughness()    const { return m_worldNormalRoughness; }
+    const SharedVulkanImage& specAlbedo()              const { return m_specAlbedo; }
+    const SharedVulkanImage& specHitT()                const { return m_specHitT; }
 
     uint32_t width()  const { return m_width; }
     uint32_t height() const { return m_height; }
@@ -72,6 +85,9 @@ private:
     SharedVulkanImage m_emissive;
     SharedVulkanImage m_hdrColor;
     SharedVulkanImage m_ndcDepth;
+    SharedVulkanImage m_worldNormalRoughness;
+    SharedVulkanImage m_specAlbedo;
+    SharedVulkanImage m_specHitT;
     uint32_t m_width  = 0;
     uint32_t m_height = 0;
 };

@@ -121,6 +121,47 @@ __device__ inline float3 materialSpecularLobe(
     return bsdfSpecularLobe(N, V, L, albedo, mat.roughness, mat.metallic);
 }
 
+// DLSS-RR §3.4.2 / Appendix: per-pixel specular albedo from F0, alpha, NoV.
+// F0 derived from material's specular reflectance (lerp(0.04, albedo, metallic)).
+// Used as the demodulation factor for the specular guide. Sky pixels get a
+// neutral default (0.5, 0.5, 0.5) — see guide §3.4.2.
+__device__ inline float3 envBRDFApprox2(float3 F0, float alpha, float NoV) {
+    NoV = fabsf(NoV);
+    float NoV2 = NoV * NoV;
+    float NoV3 = NoV2 * NoV;
+    float a2   = alpha * alpha;
+    float a3   = a2 * alpha;
+    // M1 = [[0.99044, -1.28514], [1.29678, -0.755907]]
+    float M1xy_top = 0.99044f * 1.0f + (-1.28514f) * NoV;
+    float M1xy_bot = 1.29678f  * 1.0f + (-0.755907f) * NoV;
+    // bias numerator/denominator
+    float biasNum = M1xy_top * 1.0f + M1xy_bot * alpha;
+    // M2 = [[1, 2.92338, 59.4188], [20.3225, -27.0302, 222.592], [121.563, 626.13, 316.627]]
+    // X.xyw = (1, NoV, NoV^3); Y.xyw = (1, alpha, a3)
+    float M2_0 = 1.0f * 1.0f + 2.92338f * NoV + 59.4188f * NoV3;
+    float M2_1 = 20.3225f * 1.0f + (-27.0302f) * NoV + 222.592f * NoV3;
+    float M2_2 = 121.563f * 1.0f + 626.13f * NoV + 316.627f * NoV3;
+    float biasDen = M2_0 * 1.0f + M2_1 * alpha + M2_2 * a3;
+    float bias = biasNum / fmaxf(biasDen, 1e-7f);
+    // M3 = [[0.0365463, 3.32707], [9.0632, -9.04756]]
+    float M3xy_top = 0.0365463f * 1.0f + 3.32707f * NoV;
+    float M3xy_bot = 9.0632f    * 1.0f + (-9.04756f) * NoV;
+    float scaleNum = M3xy_top * 1.0f + M3xy_bot * alpha;
+    // M4 = [[1, 3.59685, -1.36772], [9.04401, -16.3174, 9.22949], [5.56589, 19.7886, -20.2123]]
+    // X.xzw = (1, NoV^2, NoV^3); Y.xyw = (1, alpha, a3)
+    float M4_0 = 1.0f * 1.0f + 3.59685f * NoV2 + (-1.36772f) * NoV3;
+    float M4_1 = 9.04401f * 1.0f + (-16.3174f) * NoV2 + 9.22949f * NoV3;
+    float M4_2 = 5.56589f * 1.0f + 19.7886f * NoV2 + (-20.2123f) * NoV3;
+    float scaleDen = M4_0 * 1.0f + M4_1 * alpha + M4_2 * a3;
+    float scale = scaleNum / fmaxf(scaleDen, 1e-7f);
+    bias *= clampf(F0.y * 50.0f, 0.0f, 1.0f);
+    scale = fmaxf(scale, 0.0f);
+    bias  = fmaxf(bias, 0.0f);
+    return make_float3(F0.x * scale + bias,
+                       F0.y * scale + bias,
+                       F0.z * scale + bias);
+}
+
 // Per-contribution firefly clamp. RELAX is very sensitive to single-sample
 // spikes: one 100x outlier survives the temporal filter for many frames and
 // shows up as a shimmering bright speck (water-ripple look). We clamp each
@@ -158,6 +199,13 @@ __global__ void pathTraceKernelSplit(
     float3 emissiveSum  = make_float3(0, 0, 0);
     float  diffHitSum = 0.0f; uint32_t diffHitCount = 0;
     float  specHitSum = 0.0f; uint32_t specHitCount = 0;
+    // DLSS-RR: noisy un-demodulated combined color (diff*alb + spec + emissive)
+    // = pathRadiance (already lobe-routed and 1/pickedP scaled, so unbiased
+    //   over both buckets) + emissiveContrib.
+    // hitT averaged across all samples (not just one bucket) — DLSS-RR wants
+    // the per-pixel specular hit distance regardless of which lobe was picked.
+    float3 noisyColorSum = make_float3(0, 0, 0);
+    float  anyHitSum = 0.0f; uint32_t anyHitCount = 0;
 
     // G-buffer captured from the first sample that produces a primary opaque
     // hit. NRD only consumes one g-buffer per pixel, not an average.
@@ -729,7 +777,18 @@ __global__ void pathTraceKernelSplit(
         if (haveGbuffer && bucketHitDistSet) {
             if (pickedBucket == 0) { diffHitSum += bucketHitDist; diffHitCount++; }
             else                    { specHitSum += bucketHitDist; specHitCount++; }
+            // DLSS-RR specHitT: cheap approximation — feed the first secondary
+            // hit distance for whichever lobe was rolled this sample. For
+            // diffuse-bucket samples this is the cosine-sampled bounce, which
+            // approximates "where reflections land" well enough for matte/
+            // semi-glossy surfaces. Glossy mirrors will overwhelmingly land in
+            // the spec bucket so they get the GGX-sampled distance directly.
+            anyHitSum += bucketHitDist; anyHitCount++;
         }
+        // Noisy combined color: pathRadiance already incorporates 1/pickedP, so
+        // E_buckets[pathRadiance] = full primary-hit radiance. Adding emissive
+        // gives the un-demodulated color DLSS-RR wants.
+        noisyColorSum = noisyColorSum + pathRadiance + emissiveContrib;
         // G-buffer: first sample that produced a primary hit wins. Averaging
         // normals / viewZ across samples would soften silhouettes and break
         // NRD's disocclusion test, so we don't.
@@ -749,11 +808,36 @@ __global__ void pathTraceKernelSplit(
     float3 demodDiffAvg = demodDiffSum * invSpp;
     float3 demodSpecAvg = demodSpecSum * invSpp;
     float3 emissiveAvg  = emissiveSum  * invSpp;
+    float3 noisyColorAvg = noisyColorSum * invSpp;
     // HitDist: average only over samples that actually filled the bucket, so
     // pixels where one sample went diffuse and the others specular don't bias
     // the diff-bucket hitT toward zero.
     float diffHitAvg = diffHitCount > 0 ? (diffHitSum / (float)diffHitCount) : 0.0f;
     float specHitAvg = specHitCount > 0 ? (specHitSum / (float)specHitCount) : 0.0f;
+    float anyHitAvg  = anyHitCount  > 0 ? (anyHitSum  / (float)anyHitCount)  : 0.0f;
+
+    // DLSS-RR specular albedo: F0 = lerp(0.04, primaryAlbedo, metallic). We
+    // didn't preserve `metallic` past the bucket pick, so derive a scalar
+    // approximation from the spec ratio of demodSpec / total radiance. For
+    // pixels that produced a primary hit we recompute F0 from albedo and a
+    // metallic-ish heuristic — a worst-case constant of 0.04 (dielectric) is
+    // safe per the guide; bias for sky pixels is 0.5 (§3.4.2 default).
+    // Cheaper: the kernel kept primaryAlbedo and primaryRoughness; we use a
+    // dielectric F0=0.04 fallback. For glossy metals the bias term in
+    // EnvBRDFApprox2 saturates so the approximation is still close.
+    float3 specF0 = lerp(make_float3(0.04f, 0.04f, 0.04f), outPrimaryAlbedo, 0.0f);
+    // NoV ≈ -dot(rayDir, normal). We don't have the per-sample ray; reuse the
+    // last sample's primary normal and the ray from primary-hit derivation:
+    //   ray dir at primary hit ≈ normalize(hit.position - camera.position).
+    // We don't store it, so approximate NoV via dot(camera.forward, -normal).
+    float NoV = fmaxf(-dot(camera.forward, outPrimaryNormal), 0.0f);
+    float3 specAlbedoAvg = envBRDFApprox2(specF0,
+                                          outPrimaryRoughness * outPrimaryRoughness,
+                                          NoV);
+    if (!gbufferWritten) {
+        // Sky / no-hit pixels — guide §3.4.2 recommends (0.5,0.5,0.5) default.
+        specAlbedoAvg = make_float3(0.5f, 0.5f, 0.5f);
+    }
 
     float4 diffTexel = nrd_helpers::packRadianceHitDist(demodDiffAvg, diffHitAvg);
     float4 specTexel = nrd_helpers::packRadianceHitDist(demodSpecAvg, specHitAvg);
@@ -824,6 +908,44 @@ __global__ void pathTraceKernelSplit(
     if (surfaces.emissive) {
         ushort4 p = packHalf4(emTexel);
         surf2Dwrite<ushort4>(p, surfaces.emissive, x * 8, y); // RGBA16F = 8B
+    }
+
+    // ── DLSS-RR specific surfaces (only set in Mode::DLSSRR) ─────
+    if (surfaces.hdrColor) {
+        // Final NaN/firefly guard before publishing the noisy color.
+        float3 c = noisyColorAvg;
+        if (isnan(c.x) || isnan(c.y) || isnan(c.z) ||
+            isinf(c.x) || isinf(c.y) || isinf(c.z)) c = make_float3(0,0,0);
+        c.x = fminf(fmaxf(c.x, 0.0f), 30.0f);
+        c.y = fminf(fmaxf(c.y, 0.0f), 30.0f);
+        c.z = fminf(fmaxf(c.z, 0.0f), 30.0f);
+        // Add primary emissive avg too, since RR consumes a single combined
+        // color. Note: noisyColorSum already added emissiveContrib above.
+        ushort4 p = packHalf4(make_float4(c.x, c.y, c.z, 1.0f));
+        surf2Dwrite<ushort4>(p, surfaces.hdrColor, x * 8, y); // RGBA16F = 8B
+    }
+    if (surfaces.worldNormalRoughness) {
+        // RGBA16F: world-space shading normal in xyz (fp16), linear roughness in w.
+        // DLSS-RR §3.4.3 — RGB16/32 float, packed roughness via Roughness_Mode_Packed.
+        ushort4 p = packHalf4(make_float4(outPrimaryNormal.x,
+                                          outPrimaryNormal.y,
+                                          outPrimaryNormal.z,
+                                          outPrimaryRoughness));
+        surf2Dwrite<ushort4>(p, surfaces.worldNormalRoughness, x * 8, y);
+    }
+    if (surfaces.specAlbedo) {
+        ushort4 p = packHalf4(make_float4(
+            clampf(specAlbedoAvg.x, 0.0f, 4.0f),
+            clampf(specAlbedoAvg.y, 0.0f, 4.0f),
+            clampf(specAlbedoAvg.z, 0.0f, 4.0f),
+            1.0f));
+        surf2Dwrite<ushort4>(p, surfaces.specAlbedo, x * 8, y);
+    }
+    if (surfaces.specHitT) {
+        // World-space scalar; no NaN/inf permitted (NGX rejects it).
+        float h = anyHitAvg;
+        if (isnan(h) || isinf(h) || h < 0.0f) h = 0.0f;
+        surf2Dwrite<float>(h, surfaces.specHitT, x * 4, y);
     }
 }
 

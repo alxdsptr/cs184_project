@@ -40,6 +40,11 @@ struct LaunchParams {
     cudaSurfaceObject_t splitAlbedo;                   // RGBA8_UNORM (demodulation factor)
     cudaSurfaceObject_t splitEmissive;                 // RGBA16F (linear HDR)
     cudaSurfaceObject_t splitNdcDepth;                 // R32F (DLSS depth in [0,1])
+    // DLSS-RR specific guides (zero in NRD modes; populated in Mode::DLSSRR).
+    cudaSurfaceObject_t splitHdrColor;                 // RGBA16F (un-demod noisy color)
+    cudaSurfaceObject_t splitWorldNormalRoughness;     // RGBA16F (worldN.xyz, roughness in .w)
+    cudaSurfaceObject_t splitSpecAlbedo;               // RGBA16F (EnvBRDFApprox2 per-pixel)
+    cudaSurfaceObject_t splitSpecHitT;                 // R32F    (world-space scalar)
 
     unsigned int    width;
     unsigned int    height;

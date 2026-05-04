@@ -16,7 +16,7 @@ int main(int argc, char** argv) {
     uint32_t maxBounces = 8;
     uint32_t samples = 1;
     uint32_t samplesPerFrame = 1;  // spp per realtime frame (independent of `-s`)
-    int initialMode = -1;  // -1=default, 0=Native, 1=NRDOnly, 2=NRDDLSS, 3=DLSSOnly
+    int initialMode = -1;  // -1=default, 0=Native, 1=NRDOnly, 2=NRDDLSS, 3=DLSSOnly, 4=DLSSRR
     int backendKind = 0;   // 0=CUDA, 1=OptiX
     SGWorkflowMode sgMode = SGWorkflowMode::Off;
     float emissiveTargetLum = 20.0f;
@@ -51,7 +51,9 @@ int main(int argc, char** argv) {
             if (m == "native") initialMode = 0;
             else if (m == "nrd" || m == "nrdonly") initialMode = 1;
             else if (m == "dlss" || m == "nrddlss") initialMode = 2;
-            else LOG_WARN("Invalid --mode value: %s (use native|nrd|dlss)", m.c_str());
+            else if (m == "dlssonly") initialMode = 3;
+            else if (m == "rr" || m == "dlssrr") initialMode = 4;
+            else LOG_WARN("Invalid --mode value: %s (use native|nrd|dlss|dlssonly|rr)", m.c_str());
         } else if (arg == "--backend" && i + 1 < argc) {
             std::string b = argv[++i];
             if (b == "cuda") backendKind = 0;
