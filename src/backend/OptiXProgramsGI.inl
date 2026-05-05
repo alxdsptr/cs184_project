@@ -97,75 +97,115 @@ __device__ inline float3 giDirectLightingAtSampleOptiX(
     const float3& viewDir,
     uint32_t& rng)
 {
-    if (!scene.d_areaLights || scene.areaLightCount == 0 ||
-        !scene.d_lightBVHNodes) return make_float3(0, 0, 0);
+    float3 Li = make_float3(0.0f, 0.0f, 0.0f);
 
-    uint32_t slot = 0;
-    float    pSelect = 0.0f;
-    if (!lightBVH_sample(scene.d_lightBVHNodes, scene.lightBVHRootIndex,
-                         pos, pcg32_float(rng), slot, pSelect) ||
-        !(pSelect > 0.0f))
-        return make_float3(0, 0, 0);
-    uint32_t lightIdx = scene.d_lightOrderedIndices[slot];
-    GPUAreaLight light = scene.d_areaLights[lightIdx];
+    // ── Area-light NEE via light BVH ──────────────────────────────────────
+    do {
+        if (!scene.d_areaLights || scene.areaLightCount == 0 ||
+            !scene.d_lightBVHNodes) break;
 
-    float r1 = pcg32_float(rng);
-    float r2 = pcg32_float(rng);
-    float su = sqrtf(r1);
-    float b0 = 1.0f - su;
-    float b1 = su * (1.0f - r2);
-    float b2 = su * r2;
-    float3 lp = light.v0 * b0 + (light.v0 + light.e1) * b1 + (light.v0 + light.e2) * b2;
-    float3 toL = lp - pos;
-    float  d2  = fmaxf(dot(toL, toL), 1e-6f);
-    float  d   = sqrtf(d2);
-    float3 L   = toL * (1.0f / d);
-    float NdotL = fmaxf(dot(normal, L), 0.0f);
-    float lightCos = fmaxf(dot(light.normal, -L), 0.0f);
-    if (NdotL <= 0.0f || lightCos <= 0.0f) return make_float3(0, 0, 0);
+        uint32_t slot = 0;
+        float    pSelect = 0.0f;
+        if (!lightBVH_sample(scene.d_lightBVHNodes, scene.lightBVHRootIndex,
+                             pos, pcg32_float(rng), slot, pSelect) ||
+            !(pSelect > 0.0f))
+            break;
+        uint32_t lightIdx = scene.d_lightOrderedIndices[slot];
+        GPUAreaLight light = scene.d_areaLights[lightIdx];
 
-    float3 origin = pos + normal * 0.001f;
-    float tmax = fmaxf(d - 0.002f, 0.001f);
-    float3 trans = traceShadowRay(handle, origin, L, 1e-3f, tmax);
-    if (restirLuminance(trans) <= 1e-6f) return make_float3(0, 0, 0);
+        float r1 = pcg32_float(rng);
+        float r2 = pcg32_float(rng);
+        float su = sqrtf(r1);
+        float b0 = 1.0f - su;
+        float b1 = su * (1.0f - r2);
+        float b2 = su * r2;
+        float3 lp = light.v0 * b0 + (light.v0 + light.e1) * b1 + (light.v0 + light.e2) * b2;
+        float3 toL = lp - pos;
+        float  d2  = fmaxf(dot(toL, toL), 1e-6f);
+        float  d   = sqrtf(d2);
+        float3 L   = toL * (1.0f / d);
+        float NdotL = fmaxf(dot(normal, L), 0.0f);
+        float lightCos = fmaxf(dot(light.normal, -L), 0.0f);
+        if (NdotL <= 0.0f || lightCos <= 0.0f) break;
 
-    float3 Le;
-    if (light.emissiveTex == 0) {
-        Le = light.emission;
-    } else {
-        float texU = light.uv0.x * b0 + light.uv1.x * b1 + light.uv2.x * b2;
-        float texV = light.uv0.y * b0 + light.uv1.y * b1 + light.uv2.y * b2;
-        float4 et = tex2D<float4>(light.emissiveTex, texU, texV);
-        Le = make_float3(et.x, et.y, et.z) * light.emission;
+        float3 origin = pos + normal * 0.001f;
+        float tmax = fmaxf(d - 0.002f, 0.001f);
+        float3 trans = traceShadowRay(handle, origin, L, 1e-3f, tmax);
+        if (restirLuminance(trans) <= 1e-6f) break;
+
+        float3 Le;
+        if (light.emissiveTex == 0) {
+            Le = light.emission;
+        } else {
+            float texU = light.uv0.x * b0 + light.uv1.x * b1 + light.uv2.x * b2;
+            float texV = light.uv0.y * b0 + light.uv1.y * b1 + light.uv2.y * b2;
+            float4 et = tex2D<float4>(light.emissiveTex, texU, texV);
+            Le = make_float3(et.x, et.y, et.z) * light.emission;
+        }
+
+        float3 brdf;
+        if (pureDiffuse) {
+            brdf = albedo * (1.0f / M_PI_F);
+        } else {
+            ReSTIRSurface tmp{};
+            tmp.position    = pos;
+            tmp.normal      = normal;
+            tmp.albedo      = albedo;
+            tmp.roughness   = fmaxf(roughness, 0.04f);
+            tmp.metallic    = metallic;
+            tmp.viewDir     = viewDir;
+            tmp.pureDiffuse = 0u;
+            brdf = restirEvalBrdf(tmp, L);
+        }
+
+        float pTri  = pSelect;
+        float pArea = pTri / fmaxf(light.area, 1e-7f);
+        float pdfOmega = pArea * d2 / fmaxf(lightCos, 1e-7f);
+        float3 areaLi = brdf * Le * trans * (NdotL / fmaxf(pdfOmega, 1e-7f));
+        // Source-side firefly clamp — mirror the CUDA kernel
+        // (render/ReSTIRGI.cu giDirectLightingAtSample). M7 with 9759 small
+        // emissive triangles produces grazing NEE samples whose 1/pdfOmega
+        // term spikes Li. Without this clamp the bright Lo gets stored in
+        // the GI reservoir's `sampleRadiance` and persists for ~mCap frames.
+        float lumLi = restirLuminance(areaLi);
+        const float liCap = 50.0f;
+        if (lumLi > liCap) areaLi = areaLi * (liCap / lumLi);
+        Li = Li + areaLi;
+    } while (0);
+
+    // ── Directional-light NEE ─────────────────────────────────────────────
+    // Delta direction → no MIS, no 1/pdfOmega blow-up, no firefly clamp
+    // needed. Point lights are intentionally omitted (matches the area-vs-
+    // point exclusivity on the megakernel side).
+    if (scene.d_directionalLights && scene.directionalLightCount > 0) {
+        float3 origin = pos + normal * 0.001f;
+        for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
+            GPUDirectionalLight light = scene.d_directionalLights[li];
+            float3 Ld = light.direction;
+            float NdotL = fmaxf(dot(normal, Ld), 0.0f);
+            if (NdotL <= 0.0f) continue;
+
+            float3 trans = traceShadowRay(handle, origin, Ld, 1e-3f, 1e30f);
+            if (restirLuminance(trans) <= 1e-6f) continue;
+
+            float3 brdf;
+            if (pureDiffuse) {
+                brdf = albedo * (1.0f / M_PI_F);
+            } else {
+                ReSTIRSurface tmp{};
+                tmp.position    = pos;
+                tmp.normal      = normal;
+                tmp.albedo      = albedo;
+                tmp.roughness   = fmaxf(roughness, 0.04f);
+                tmp.metallic    = metallic;
+                tmp.viewDir     = viewDir;
+                tmp.pureDiffuse = 0u;
+                brdf = restirEvalBrdf(tmp, Ld);
+            }
+            Li = Li + brdf * trans * light.color * NdotL;
+        }
     }
 
-    float3 brdf;
-    if (pureDiffuse) {
-        brdf = albedo * (1.0f / M_PI_F);
-    } else {
-        ReSTIRSurface tmp{};
-        tmp.position    = pos;
-        tmp.normal      = normal;
-        tmp.albedo      = albedo;
-        tmp.roughness   = fmaxf(roughness, 0.04f);
-        tmp.metallic    = metallic;
-        tmp.viewDir     = viewDir;
-        tmp.pureDiffuse = 0u;
-        brdf = restirEvalBrdf(tmp, L);
-    }
-
-    float pTri  = pSelect;
-    float pArea = pTri / fmaxf(light.area, 1e-7f);
-    float pdfOmega = pArea * d2 / fmaxf(lightCos, 1e-7f);
-    float3 Li = brdf * Le * trans * (NdotL / fmaxf(pdfOmega, 1e-7f));
-    // Source-side firefly clamp — mirror the CUDA kernel
-    // (render/ReSTIRGI.cu giDirectLightingAtSample). M7 with 9759 small
-    // emissive triangles produces grazing NEE samples whose 1/pdfOmega
-    // term spikes Li. Without this clamp the bright Lo gets stored in
-    // the GI reservoir's `sampleRadiance` and persists for ~mCap frames.
-    float lumLi = restirLuminance(Li);
-    const float liCap = 50.0f;
-    if (lumLi > liCap) Li = Li * (liCap / lumLi);
     return Li;
 }
 
