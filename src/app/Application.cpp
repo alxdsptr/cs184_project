@@ -1,5 +1,7 @@
 #include "app/Application.h"
 #include "scene/SceneLoader.h"
+#include "scene/AnimationEval.h"
+#include "gpu/PoseUpdate.h"
 #include "util/Log.h"
 #include "util/CudaCheck.h"
 #ifdef PATHTRACER_OPTIX_ENABLED
@@ -540,6 +542,18 @@ void Application::loadEnvMap(const std::string& path) {
 
 void Application::renderSceneSample(uchar4* d_pbo, bool timeHeadless) {
     if (m_sceneLoaded) {
+        // Advance animation only on the first sample of each pose. The
+        // accumulator's sample-count resets to 0 on camera move (replay loop,
+        // capture motion-frame, GUI input). When it's >0 we're integrating
+        // more samples at the same camera pose AND same animation time, so
+        // touching the geometry would re-pose mid-accumulation and produce
+        // ghosted frames. Also skip on GUI mode where the user is exploring;
+        // they call --play-anim explicitly when they want playback.
+        if (m_playAnimation && m_scene.hasAnimation() &&
+            m_renderer.getSampleCount() == 0) {
+            advanceAnimation(1.0f / std::max(1.0f, m_animFps));
+        }
+
         CameraParams camParams = m_camera.getParams(m_frameIndex);
         DeviceSceneData sceneData = m_backend->getSceneData();
         sceneData.envMapTex = m_envMapTex;
@@ -1313,5 +1327,71 @@ void Application::stopRecording() {
     LOG_INFO("Recording: STOPPED, saved %zu frames (%.2f s) to %s",
              m_recordedPath.size(), m_recordedPath.back().t, path.str().c_str());
     m_recordedPath.clear();
+}
+
+// ── Animation playback driver ────────────────────────────────
+// Called once per render frame BEFORE the path-trace launch when animation
+// is active. Evaluates the AnimationClip at the current `m_animTime`,
+// computes per-mesh world deltas, uploads them, runs the GPU pose-update
+// kernel, and refits the OptiX GAS so the launch sees the new geometry.
+//
+// No-ops cleanly when the scene has no clip or playback is off; the engine
+// falls back to the static rest pose written into d_positions at upload.
+void Application::advanceAnimation(float stepSeconds) {
+    if (!m_playAnimation) return;
+    if (!m_sceneLoaded) return;
+    if (!m_scene.hasAnimation()) return;
+
+#ifdef PATHTRACER_OPTIX_ENABLED
+    auto* optix = dynamic_cast<OptiXBackend*>(m_backend.get());
+    if (!optix) {
+        // Animation only supported on the OptiX backend (CUDA backend uses a
+        // CPU-built BVH that we'd have to rebuild every frame; not worth it
+        // for this pass). Silently do nothing on the CUDA backend so the
+        // user gets a static render rather than a hard error.
+        return;
+    }
+
+    DeviceScene& dsc = optix->deviceScene();
+    if (!dsc.hasAnimation()) return;  // no animated meshes in this scene
+
+    // Sample time = m_animStartTime + m_animTime. The very first call (after
+    // load) sees m_animTime == 0 → exactly the user-supplied start time.
+    // After rendering, we advance by stepSeconds for the next call, so frame
+    // N (0-indexed) is at time (animStartTime + N * stepSeconds).
+    const float t = m_animStartTime + m_animTime;
+    const AnimationClip& clip = m_scene.getAnimations().front();
+
+    // 1) Evaluate per-node local + world transforms at this time.
+    evalAnimation(m_scene, clip, t, m_animLocalScratch, m_animWorldScratch);
+
+    // 2) Per-mesh delta = worldCurr * worldRest^-1.
+    computeMeshDeltas(m_scene, m_animWorldScratch, m_animMeshDeltaScratch);
+
+    // 3) Cofactor of the upper-3x3 of each delta, for normal transformation.
+    computeNormalMats(m_animMeshDeltaScratch, m_animNormalMatScratch);
+
+    // 4) Push to GPU + run the pose-update kernel.
+    PoseUpdateData& pose = dsc.pose();
+    poseUpdateUploadDeltas(pose, m_animMeshDeltaScratch, m_animNormalMatScratch);
+    poseUpdateLaunch(pose, m_firstAnimFrame);
+    m_firstAnimFrame = false;
+
+    // 5) Refit the OptiX GAS so the next path-trace launch sees the new
+    //    vertex positions.
+    optix->refitGAS();
+
+    // Advance for the next call. This ordering means: first invocation
+    // renders at m_animStartTime, second at start + stepSeconds, etc.
+    m_animTime += stepSeconds;
+
+    // Note: caller already gated us on `sampleCount == 0` (see
+    // renderSceneSample), so the accumulator is freshly reset from the
+    // outer loop's camera-motion / replay-pose logic. We don't reset here;
+    // doing so would also break GUI-driven playback where the user might
+    // want to accumulate while paused.
+#else
+    (void)stepSeconds;
+#endif
 }
 

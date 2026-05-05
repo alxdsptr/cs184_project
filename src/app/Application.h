@@ -5,6 +5,7 @@
 #include "gui/GUI.h"
 #include "scene/Scene.h"
 #include "scene/SceneLoader.h"
+#include "scene/AnimationEval.h"
 #include "scene/Texture.h"
 #include "render/Renderer.h"
 #include "backend/RayTracingBackend.h"
@@ -139,6 +140,16 @@ public:
     void setReSTIRPTEnabled(bool on)  { m_pendingReSTIRPT = on; }
     void setEnvMap(const std::string& path);
     void loadCameraFile(const std::string& path) { m_cameraFilePath = path; }
+
+    // Animation playback. When the loaded scene contains an AnimationClip and
+    // playAnim is on, the renderer advances animation time per render frame
+    // (`dt = 1 / animFps`) before each path-trace launch, evaluates the clip
+    // pose, refits the OptiX GAS, and writes per-vertex motion vectors via
+    // d_positionsPrev. Animation is skipped silently when the scene has no
+    // clip — bistro/sponza still render normally.
+    void setPlayAnimation(bool on)    { m_playAnimation = on; }
+    void setAnimationFps(float fps)   { if (fps > 0.0f) m_animFps = fps; }
+    void setAnimationStartTime(float t) { m_animStartTime = t; }
 
 private:
     static void glfwScrollCallback(GLFWwindow* window, double xoffset, double yoffset);
@@ -279,4 +290,27 @@ private:
 
     bool          m_replayEnabled = false;
     ReplayOptions m_replayOpts;
+
+    // ── Animation state ──
+    // Time-based eval driven from the render loop (NOT the wall clock — for
+    // headless capture / replay we step at exactly 1/animFps each frame so
+    // the produced video matches the recording's intent).
+    bool   m_playAnimation = false;
+    float  m_animFps       = 30.0f;
+    float  m_animTime      = 0.0f;
+    float  m_animStartTime = 0.0f;
+    bool   m_firstAnimFrame = true;
+    // Reusable host scratch buffers for the per-frame eval. Sized once, reused
+    // every frame to avoid per-frame heap churn when the scene has 10k+
+    // nodes / meshes.
+    std::vector<float4x4>      m_animLocalScratch;
+    std::vector<float4x4>      m_animWorldScratch;
+    std::vector<float4x4>      m_animMeshDeltaScratch;
+    std::vector<NormalMat34>   m_animNormalMatScratch;
+
+    // Advance animation by `stepSeconds`, evaluate the pose, upload mesh
+    // deltas, launch the pose-update kernel, refit the GAS. No-op when the
+    // scene has no animation, when playback is off, or when the backend is
+    // not OptiX.
+    void advanceAnimation(float stepSeconds);
 };

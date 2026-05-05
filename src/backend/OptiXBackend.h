@@ -21,6 +21,20 @@ public:
 
     void buildAccelerationStructure(const Scene& scene) override;
 
+    // Re-refit the existing GAS in place. Used between animation frames after
+    // the pose-update kernel has rewritten the per-vertex positions buffer.
+    // Only valid when the GAS was built with `allowUpdate=true` (set
+    // automatically by buildAccelerationStructure when the scene contains
+    // animation). Cheap: ~10× faster than a fresh build; quality degrades
+    // slightly relative to a full rebuild but for our 619-node, 14.67s clip
+    // the tree topology stays close enough.
+    void refitGAS();
+
+    // Direct access to the device scene so Application can run the pose-
+    // update kernel + reupload deltas without going through the abstract
+    // RayTracingBackend interface (whose role is per-frame ray launches).
+    DeviceScene& deviceScene() { return m_deviceScene; }
+
     void launchPathTrace(
         const DeviceSceneData& scene,
         const CameraParams& camera,
@@ -192,7 +206,7 @@ private:
     bool loadModule(const std::string& optixirPath);
     bool buildPipeline();
     bool buildSBT();
-    bool buildGAS(const DeviceSceneData& data);
+    bool buildGAS(const DeviceSceneData& data, bool allowUpdate);
     void freeGAS();
     void destroyAll();
 
@@ -224,6 +238,18 @@ private:
 
     CUdeviceptr             m_gasOutput      = 0;
     OptixTraversableHandle  m_gasHandle      = 0;
+
+    // GAS UPDATE bookkeeping. When the scene has animation, buildGAS()
+    // allocates these so refitGAS() can run optixAccelBuild with
+    // OPTIX_BUILD_OPERATION_UPDATE. m_gasUpdateTempBuf is the temp scratch
+    // OptiX wants for the update; we cache the build inputs / size info so
+    // refit doesn't have to recompute them.
+    bool                    m_gasAllowUpdate = false;
+    CUdeviceptr             m_gasUpdateTempBuf = 0;
+    size_t                  m_gasUpdateTempSize = 0;
+    size_t                  m_gasOutputSize = 0;
+    OptixBuildInput         m_gasBuildInput{};
+    unsigned int            m_gasTriangleFlags = 0;
 
     CUdeviceptr             m_dLaunchParams  = 0;
     CUstream                m_stream         = nullptr;

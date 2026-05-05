@@ -5,6 +5,7 @@
 #include "scene/Mesh.h"
 #include "scene/Material.h"
 #include "scene/Light.h"
+#include "scene/Animation.h"
 #include <vector>
 
 struct SceneCamera {
@@ -38,14 +39,29 @@ public:
     VolumeMedium& getMedium() { return m_medium; }
     const VolumeMedium& getMedium() const { return m_medium; }
 
+    // ── Animation ────────────────────────────────────────────
+    // Hierarchy preserved from Assimp (after collapsing the
+    // `$AssimpFbx$_*` pivot-chain intermediates). `m_meshNodeBinding[i]`
+    // tells which SceneNode owns TriangleMesh `m_meshes[i]`.
+    std::vector<SceneNode>&       getNodes()             { return m_nodes; }
+    const std::vector<SceneNode>& getNodes() const       { return m_nodes; }
+    std::vector<MeshNodeBinding>&       getMeshBindings()       { return m_meshBindings; }
+    const std::vector<MeshNodeBinding>& getMeshBindings() const { return m_meshBindings; }
+    std::vector<AnimationClip>&       getAnimations()       { return m_animations; }
+    const std::vector<AnimationClip>& getAnimations() const { return m_animations; }
+    bool hasAnimation() const { return !m_animations.empty(); }
+
     uint32_t totalTriangles() const;
     uint32_t totalVertices() const;
 
 private:
-    std::vector<TriangleMesh> m_meshes;
-    std::vector<PBRMaterial>  m_materials;
-    std::vector<PointLight>   m_lights;
+    std::vector<TriangleMesh>      m_meshes;
+    std::vector<PBRMaterial>       m_materials;
+    std::vector<PointLight>        m_lights;
     std::vector<TriangleAreaLight> m_areaLights;
+    std::vector<SceneNode>         m_nodes;
+    std::vector<MeshNodeBinding>   m_meshBindings;   // 1:1 with m_meshes
+    std::vector<AnimationClip>     m_animations;
     AABB m_bounds;
     SceneCamera m_camera;
     VolumeMedium m_medium;

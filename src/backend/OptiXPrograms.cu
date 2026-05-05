@@ -517,7 +517,21 @@ extern "C" __global__ void __raygen__path_trace()
                 if (!gbufferWritten) {
                     float viewZprim = dot(hit.position - camera.position, camera.forward);
                     float3 clipCurr = mat4_transformPoint(camera.viewProjMatrix, hit.position);
-                    float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hit.position);
+                    // Previous-frame world-space hit position. For static
+                    // geometry this == hit.position, so reprojecting through
+                    // prevViewProjMatrix captures camera motion only. For
+                    // animated geometry we interpolate the previous frame's
+                    // posed vertex positions with the same barycentrics, so
+                    // the motion vector tracks the mesh's movement too —
+                    // critical for DLSS/NRD temporal reuse on moving objects.
+                    float3 hitPosPrev = hit.position;
+                    if (scene.d_positionsPrev) {
+                        float3 v0p = scene.d_positionsPrev[i0];
+                        float3 v1p = scene.d_positionsPrev[i1];
+                        float3 v2p = scene.d_positionsPrev[i2];
+                        hitPosPrev = v0p * baryW + v1p * baryU + v2p * baryV;
+                    }
+                    float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hitPosPrev);
                     float2 screenCurr = make_float2((clipCurr.x + 1.0f) * 0.5f * params.width,
                                                      (1.0f - clipCurr.y) * 0.5f * params.height);
                     float2 screenPrev = make_float2((clipPrev.x + 1.0f) * 0.5f * params.width,
@@ -1349,9 +1363,22 @@ extern "C" __global__ void __raygen__path_trace_split()
                 primaryRayDir    = ray.direction;
                 primaryMetallic  = mat.metallic;
                 primaryViewZ     = nrd_helpers::computeViewZ(hit.position, camera.position, camera.forward);
-                primaryMvPx      = nrd_helpers::computeMotionVectorPx(
-                    hit.position, camera.viewProjMatrix, camera.prevViewProjMatrix,
-                    params.width, params.height);
+                // Animated-geometry-aware motion vector — see comment at the
+                // matching site in __raygen__path_trace.
+                if (scene.d_positionsPrev) {
+                    float3 v0p = scene.d_positionsPrev[i0];
+                    float3 v1p = scene.d_positionsPrev[i1];
+                    float3 v2p = scene.d_positionsPrev[i2];
+                    float3 hitPosPrev = v0p * baryW + v1p * baryU + v2p * baryV;
+                    primaryMvPx = nrd_helpers::computeMotionVectorPxAnimated(
+                        hit.position, hitPosPrev,
+                        camera.viewProjMatrix, camera.prevViewProjMatrix,
+                        params.width, params.height);
+                } else {
+                    primaryMvPx = nrd_helpers::computeMotionVectorPx(
+                        hit.position, camera.viewProjMatrix, camera.prevViewProjMatrix,
+                        params.width, params.height);
+                }
                 {
                     float3 ndc = mat4_transformPoint(camera.viewProjMatrix, hit.position);
                     primaryNdcZ = clampf(ndc.z * 0.5f + 0.5f, 0.0f, 1.0f);
@@ -1926,7 +1953,15 @@ extern "C" __global__ void __raygen__restir_init_candidates()
                 surf.specProb = fminf(fmaxf(p, 0.1f), 0.9f);
             }
 
-            float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hitPos);
+            // Animated-geometry-aware prev-pixel for temporal reservoir reuse.
+            float3 hitPosPrevDI = hitPos;
+            if (scene.d_positionsPrev) {
+                float3 v0p = scene.d_positionsPrev[i0];
+                float3 v1p = scene.d_positionsPrev[i1];
+                float3 v2p = scene.d_positionsPrev[i2];
+                hitPosPrevDI = v0p * baryW + v1p * baryU + v2p * baryV;
+            }
+            float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hitPosPrevDI);
             surf.prevPixel = make_float2(
                 (clipPrev.x + 1.0f) * 0.5f * (float)params.width,
                 (1.0f - clipPrev.y) * 0.5f * (float)params.height);

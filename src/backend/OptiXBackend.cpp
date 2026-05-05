@@ -76,7 +76,10 @@ void OptiXBackend::destroyAll() {
 
 void OptiXBackend::freeGAS() {
     if (m_gasOutput) { cudaFree((void*)m_gasOutput); m_gasOutput = 0; }
+    if (m_gasUpdateTempBuf) { cudaFree((void*)m_gasUpdateTempBuf); m_gasUpdateTempBuf = 0; }
+    m_gasUpdateTempSize = 0;
     m_gasHandle = 0;
+    m_gasAllowUpdate = false;
 }
 
 static bool readFile(const std::string& path, std::vector<char>& out) {
@@ -436,78 +439,136 @@ bool OptiXBackend::buildSBT() {
     return true;
 }
 
-bool OptiXBackend::buildGAS(const DeviceSceneData& data) {
+bool OptiXBackend::buildGAS(const DeviceSceneData& data, bool allowUpdate) {
     freeGAS();
     if (data.totalTriangles == 0) {
         LOG_WARN("OptiXBackend: no triangles to build GAS");
         return true;
     }
 
-    unsigned int triangleFlags = OPTIX_GEOMETRY_FLAG_REQUIRE_SINGLE_ANYHIT_CALL;
+    m_gasAllowUpdate = allowUpdate;
+    m_gasTriangleFlags = OPTIX_GEOMETRY_FLAG_REQUIRE_SINGLE_ANYHIT_CALL;
 
-    OptixBuildInput buildInput{};
+    // Build input. We hold these in member fields so refitGAS() can replay
+    // them with OPTIX_BUILD_OPERATION_UPDATE without recomputing.
+    OptixBuildInput& buildInput = m_gasBuildInput;
+    buildInput = OptixBuildInput{};
     buildInput.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
     buildInput.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
     buildInput.triangleArray.vertexStrideInBytes = (unsigned int)sizeof(float3);
     buildInput.triangleArray.numVertices = data.totalVertices;
-    CUdeviceptr d_positions = (CUdeviceptr)data.d_positions;
-    buildInput.triangleArray.vertexBuffers = &d_positions;
-
+    // The vertex-buffer pointer is stashed in a static so the address held in
+    // buildInput.triangleArray.vertexBuffers stays valid across refits.
+    static CUdeviceptr s_dPositions; // pointer-to-pointer; OptiX wants an array of CUdeviceptr*
+    s_dPositions = (CUdeviceptr)data.d_positions;
+    buildInput.triangleArray.vertexBuffers = &s_dPositions;
     buildInput.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
     buildInput.triangleArray.indexStrideInBytes = (unsigned int)(3 * sizeof(uint32_t));
     buildInput.triangleArray.numIndexTriplets = data.totalTriangles;
     buildInput.triangleArray.indexBuffer = (CUdeviceptr)data.d_indices;
-
-    buildInput.triangleArray.flags = &triangleFlags;
+    buildInput.triangleArray.flags = &m_gasTriangleFlags;
     buildInput.triangleArray.numSbtRecords = 1;
 
+    // Build options: animated GASes use ALLOW_UPDATE and skip compaction
+    // (compaction is incompatible with cheap UPDATE). Static GASes get
+    // ALLOW_COMPACTION as before.
     OptixAccelBuildOptions accelOptions{};
-    accelOptions.buildFlags = OPTIX_BUILD_FLAG_ALLOW_COMPACTION | OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
-    accelOptions.operation  = OPTIX_BUILD_OPERATION_BUILD;
+    if (allowUpdate) {
+        accelOptions.buildFlags = OPTIX_BUILD_FLAG_ALLOW_UPDATE | OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+    } else {
+        accelOptions.buildFlags = OPTIX_BUILD_FLAG_ALLOW_COMPACTION | OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+    }
+    accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
 
     OptixAccelBufferSizes bufSizes{};
     OPTIX_CHECK(optixAccelComputeMemoryUsage(
         m_ctx, &accelOptions, &buildInput, 1, &bufSizes));
 
     CUdeviceptr tempBuf = 0;
-    CUdeviceptr uncompactedOutput = 0;
     CUDA_CHECK(cudaMalloc((void**)&tempBuf, bufSizes.tempSizeInBytes));
-    CUDA_CHECK(cudaMalloc((void**)&uncompactedOutput, bufSizes.outputSizeInBytes));
 
-    CUdeviceptr d_compactedSize = 0;
-    CUDA_CHECK(cudaMalloc((void**)&d_compactedSize, sizeof(size_t)));
-    OptixAccelEmitDesc emitDesc{};
-    emitDesc.type   = OPTIX_PROPERTY_TYPE_COMPACTED_SIZE;
-    emitDesc.result = d_compactedSize;
-
-    OptixTraversableHandle uncompactedHandle = 0;
-    OPTIX_CHECK(optixAccelBuild(
-        m_ctx, m_stream, &accelOptions, &buildInput, 1,
-        tempBuf, bufSizes.tempSizeInBytes,
-        uncompactedOutput, bufSizes.outputSizeInBytes,
-        &uncompactedHandle, &emitDesc, 1));
-    CUDA_CHECK(cudaStreamSynchronize(m_stream));
-
-    size_t compactedSize = 0;
-    CUDA_CHECK(cudaMemcpy(&compactedSize, (void*)d_compactedSize, sizeof(size_t), cudaMemcpyDeviceToHost));
-
-    if (compactedSize < bufSizes.outputSizeInBytes) {
-        CUDA_CHECK(cudaMalloc((void**)&m_gasOutput, compactedSize));
-        OPTIX_CHECK(optixAccelCompact(
-            m_ctx, m_stream, uncompactedHandle, m_gasOutput, compactedSize, &m_gasHandle));
+    if (allowUpdate) {
+        // No compaction; allocate the persistent output buffer at full size.
+        CUDA_CHECK(cudaMalloc((void**)&m_gasOutput, bufSizes.outputSizeInBytes));
+        m_gasOutputSize = bufSizes.outputSizeInBytes;
+        OPTIX_CHECK(optixAccelBuild(
+            m_ctx, m_stream, &accelOptions, &buildInput, 1,
+            tempBuf, bufSizes.tempSizeInBytes,
+            m_gasOutput, bufSizes.outputSizeInBytes,
+            &m_gasHandle, nullptr, 0));
+        // Persist the update temp buffer for refits.
+        m_gasUpdateTempSize = bufSizes.tempUpdateSizeInBytes;
+        if (m_gasUpdateTempSize > 0) {
+            CUDA_CHECK(cudaMalloc((void**)&m_gasUpdateTempBuf, m_gasUpdateTempSize));
+        }
         CUDA_CHECK(cudaStreamSynchronize(m_stream));
-        cudaFree((void*)uncompactedOutput);
+        cudaFree((void*)tempBuf);
+        LOG_INFO("OptiXBackend: GAS built with UPDATE (%u tris, output=%zu, updateTemp=%zu)",
+                 data.totalTriangles, bufSizes.outputSizeInBytes, m_gasUpdateTempSize);
     } else {
-        m_gasOutput = uncompactedOutput;
-        m_gasHandle = uncompactedHandle;
+        // Compaction path (static scene).
+        CUdeviceptr uncompactedOutput = 0;
+        CUDA_CHECK(cudaMalloc((void**)&uncompactedOutput, bufSizes.outputSizeInBytes));
+
+        CUdeviceptr d_compactedSize = 0;
+        CUDA_CHECK(cudaMalloc((void**)&d_compactedSize, sizeof(size_t)));
+        OptixAccelEmitDesc emitDesc{};
+        emitDesc.type   = OPTIX_PROPERTY_TYPE_COMPACTED_SIZE;
+        emitDesc.result = d_compactedSize;
+
+        OptixTraversableHandle uncompactedHandle = 0;
+        OPTIX_CHECK(optixAccelBuild(
+            m_ctx, m_stream, &accelOptions, &buildInput, 1,
+            tempBuf, bufSizes.tempSizeInBytes,
+            uncompactedOutput, bufSizes.outputSizeInBytes,
+            &uncompactedHandle, &emitDesc, 1));
+        CUDA_CHECK(cudaStreamSynchronize(m_stream));
+
+        size_t compactedSize = 0;
+        CUDA_CHECK(cudaMemcpy(&compactedSize, (void*)d_compactedSize, sizeof(size_t), cudaMemcpyDeviceToHost));
+
+        if (compactedSize < bufSizes.outputSizeInBytes) {
+            CUDA_CHECK(cudaMalloc((void**)&m_gasOutput, compactedSize));
+            OPTIX_CHECK(optixAccelCompact(
+                m_ctx, m_stream, uncompactedHandle, m_gasOutput, compactedSize, &m_gasHandle));
+            CUDA_CHECK(cudaStreamSynchronize(m_stream));
+            cudaFree((void*)uncompactedOutput);
+        } else {
+            m_gasOutput = uncompactedOutput;
+            m_gasHandle = uncompactedHandle;
+        }
+        cudaFree((void*)tempBuf);
+        cudaFree((void*)d_compactedSize);
+
+        LOG_INFO("OptiXBackend: GAS built (%u tris, compacted=%zu bytes)",
+                 data.totalTriangles, compactedSize);
+    }
+    return true;
+}
+
+void OptiXBackend::refitGAS() {
+    if (!m_initialized || !m_gasHandle) return;
+    if (!m_gasAllowUpdate) {
+        LOG_WARN("OptiXBackend::refitGAS called on a GAS built without ALLOW_UPDATE");
+        return;
     }
 
-    cudaFree((void*)tempBuf);
-    cudaFree((void*)d_compactedSize);
+    OptixAccelBuildOptions opts{};
+    opts.buildFlags = OPTIX_BUILD_FLAG_ALLOW_UPDATE | OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+    opts.operation  = OPTIX_BUILD_OPERATION_UPDATE;
 
-    LOG_INFO("OptiXBackend: GAS built (%u tris, compacted=%zu bytes)",
-             data.totalTriangles, compactedSize);
-    return true;
+    // The vertex buffer pointer in m_gasBuildInput.triangleArray.vertexBuffers
+    // already points at the static slot inside buildGAS() (s_dPositions),
+    // which still holds the CUdeviceptr we set at build time. For our
+    // animation case the device pointer doesn't change between frames (the
+    // pose-update kernel writes in-place into d_positionsCurr), so we leave
+    // it untouched.
+    OPTIX_CHECK_VOID(optixAccelBuild(
+        m_ctx, m_stream, &opts, &m_gasBuildInput, 1,
+        m_gasUpdateTempBuf, m_gasUpdateTempSize,
+        m_gasOutput, m_gasOutputSize,
+        &m_gasHandle, nullptr, 0));
+    CUDA_CHECK(cudaStreamSynchronize(m_stream));
 }
 
 void OptiXBackend::buildAccelerationStructure(const Scene& scene) {
@@ -519,7 +580,10 @@ void OptiXBackend::buildAccelerationStructure(const Scene& scene) {
     // so optixGetPrimitiveIndex() indexes d_materialIndices / d_triangleAreaLightIndex directly.
     m_deviceScene.upload(scene);
     DeviceSceneData data = m_deviceScene.getData();
-    buildGAS(data);
+    // When the scene has animation, build with ALLOW_UPDATE so we can refit
+    // the GAS in place each frame after the pose-update kernel rewrites the
+    // vertex buffer.
+    buildGAS(data, /*allowUpdate=*/scene.hasAnimation());
 }
 
 void OptiXBackend::launchPathTrace(

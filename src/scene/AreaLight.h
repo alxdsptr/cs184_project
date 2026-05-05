@@ -28,4 +28,10 @@ struct TriangleAreaLight {
     // look up the emissive cudaTextureObject_t after texture upload. -1 for
     // lights that do not need a texture (uniform emitters).
     int materialIndex = -1;
+
+    // True if the source mesh sits under a non-animated SceneNode. Static
+    // emitters get NEE direct sampling via the light BVH; dynamic emitters
+    // are excluded from the BVH (their world-space bounds change every frame)
+    // and contribute to illumination only through BSDF hits + MIS.
+    bool isStatic = true;
 };

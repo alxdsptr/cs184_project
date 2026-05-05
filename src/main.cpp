@@ -41,6 +41,12 @@ int main(int argc, char** argv) {
     Application::ReplayOptions replayOpts;
     bool replayEnabled = false;
 
+    // Animation playback. --play-anim enables time-driven AnimationClip
+    // sampling per render frame. Defaults to 30 fps (the FBX clip's tps).
+    bool playAnim = false;
+    float animFps = 30.0f;
+    float animStartTime = 0.0f;
+
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "-e" && i + 1 < argc) {
@@ -226,6 +232,16 @@ int main(int argc, char** argv) {
         } else if (arg == "--replay-max" && i + 1 < argc) {
             int v = std::atoi(argv[++i]);
             if (v >= 0) replayOpts.maxPoses = (uint32_t)v;
+        } else if (arg == "--play-anim") {
+            // Enable time-driven AnimationClip playback. The renderer
+            // advances animation by 1/animFps each rendered frame.
+            playAnim = true;
+        } else if (arg == "--anim-fps" && i + 1 < argc) {
+            float v = (float)std::atof(argv[++i]);
+            if (v > 0.0f) animFps = v; else LOG_WARN("Invalid --anim-fps: %s", argv[i]);
+        } else if (arg == "--anim-start" && i + 1 < argc) {
+            float v = (float)std::atof(argv[++i]);
+            animStartTime = v;
         } else if (arg == "-r" && i + 2 < argc) {
             int parsedWidth = std::atoi(argv[++i]);
             int parsedHeight = std::atoi(argv[++i]);
@@ -261,6 +277,9 @@ int main(int argc, char** argv) {
     app.setReSTIREnabled(restirDI);
     app.setReSTIRGIEnabled(restirGI);
     app.setReSTIRPTEnabled(restirPT);
+    app.setPlayAnimation(playAnim);
+    app.setAnimationFps(animFps);
+    app.setAnimationStartTime(animStartTime);
     if (mediumAnyOverride) {
         app.setMediumEnabled(mediumEnabled);
         app.setMediumSigmaA(mediumSigmaA);

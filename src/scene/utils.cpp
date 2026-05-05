@@ -520,44 +520,76 @@ void applyUnitScaling(aiScene* aiScn, const std::string& ext) {
     bool applied = false;
 
     if (ext == ".fbx") {
-        if (aiScn->mMetaData) {
+        // Detect whether the FBX's own root transform already includes a
+        // unit-conversion scale (common for assets exported in cm with a
+        // 0.01-scale root). If WORLD-space coordinates after the existing
+        // root transform are already in a reasonable range (max < ~500),
+        // we don't apply any extra scaling — the file is self-contained.
+        // Otherwise, fall back to UnitScaleFactor metadata or the cm→m
+        // heuristic (max > 100 in *world* space).
+        //
+        // Note: the previous loader inspected raw mesh-local coordinates
+        // here. With aiProcess_PreTransformVertices removed, mesh-local
+        // values can be huge (DCC tools author in cm) even when the
+        // FBX root applies a 0.01 scale that brings world space to a
+        // sensible range. Inspecting pre-transformed positions would
+        // double-apply the scale. So we walk the tree once to compute
+        // approximate world-space bounds, then decide.
+        float maxWorldCoord = 0.0f;
+        float minWorldCoord = 1e10f;
+        double sumWorld = 0.0;
+        uint64_t totalVerts = 0;
+        struct Walk {
+            static void rec(const aiNode* n, const aiScene* sc, aiMatrix4x4 acc,
+                            float& maxC, float& minC, double& sumC, uint64_t& cnt) {
+                if (!n) return;
+                acc = acc * n->mTransformation;
+                for (unsigned i = 0; i < n->mNumMeshes; i++) {
+                    const aiMesh* mesh = sc->mMeshes[n->mMeshes[i]];
+                    for (unsigned v = 0; v < mesh->mNumVertices; v++) {
+                        aiVector3D wp = acc * mesh->mVertices[v];
+                        float mag = std::sqrt(wp.x*wp.x + wp.y*wp.y + wp.z*wp.z);
+                        maxC = std::max(maxC, mag);
+                        minC = std::min(minC, mag);
+                        sumC += mag;
+                        cnt++;
+                    }
+                }
+                for (unsigned i = 0; i < n->mNumChildren; i++)
+                    rec(n->mChildren[i], sc, acc, maxC, minC, sumC, cnt);
+            }
+        };
+        Walk::rec(aiScn->mRootNode, aiScn, aiMatrix4x4(),
+                  maxWorldCoord, minWorldCoord, sumWorld, totalVerts);
+        float avgWorld = totalVerts > 0 ? (float)(sumWorld / (double)totalVerts) : 0.0f;
+        LOG_INFO("FBX world-space coord analysis (post-hierarchy): max=%.2f, min=%.2f, avg=%.2f",
+                 maxWorldCoord, minWorldCoord < 1e9f ? minWorldCoord : 0.0f, avgWorld);
+
+        if (maxWorldCoord > 100.0f) {
+            // World coords are still huge — apply the cm→m heuristic.
+            unitScale = 0.01;
+            applied = true;
+            LOG_INFO("World coords still large (max=%.1f). Applying 0.01 scale factor.", maxWorldCoord);
+        } else if (aiScn->mMetaData) {
+            // World coords look fine. Only honor UnitScaleFactor if the
+            // file explicitly says it's in non-cm units AND world coords
+            // would benefit from the conversion. Most modern FBX exporters
+            // bake unit info into the root transform — UnitScaleFactor is
+            // usually 1.0 already in those cases.
             double metaScale = 1.0;
-            if (aiScn->mMetaData->Get("UnitScaleFactor", metaScale)) {
-                if (metaScale > 1e-6) {
+            if (aiScn->mMetaData->Get("UnitScaleFactor", metaScale) &&
+                metaScale > 1e-6 &&
+                std::abs(metaScale - 1.0) > 0.01)
+            {
+                // Sanity check: would applying the scale help or hurt?
+                // If world coords are already small (<10), don't shrink them
+                // further. If they're large (>100), the heuristic above
+                // would have already fired. The middle ground (10..100):
+                // honor the metadata.
+                if (maxWorldCoord >= 10.0f) {
                     unitScale = 1.0 / metaScale;
                     applied = true;
                     LOG_INFO("FBX UnitScaleFactor metadata: %.6f, applying scale: %.6f", metaScale, unitScale);
-                }
-            }
-        }
-
-        if (!applied) {
-            float maxCoord = 0.0f;
-            float minCoord = 1e10f;
-            float avgCoord = 0.0f;
-            unsigned totalVerts = 0;
-
-            for (unsigned m = 0; m < aiScn->mNumMeshes; m++) {
-                const aiMesh* mesh = aiScn->mMeshes[m];
-                for (unsigned v = 0; v < mesh->mNumVertices; v++) {
-                    const aiVector3D& pos = mesh->mVertices[v];
-                    float mag = std::sqrt(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
-                    maxCoord = std::max(maxCoord, mag);
-                    minCoord = std::min(minCoord, mag);
-                    avgCoord += mag;
-                    totalVerts++;
-                }
-            }
-
-            if (totalVerts > 0) {
-                avgCoord /= totalVerts;
-                LOG_INFO("FBX coordinate analysis: max=%.2f, min=%.2f, avg=%.2f",
-                         maxCoord, minCoord < 1e9f ? minCoord : 0.0f, avgCoord);
-
-                if (maxCoord > 100.0f) {
-                    unitScale = 0.01;
-                    applied = true;
-                    LOG_INFO("Detected large FBX coordinates (max: %.1f). Applying 0.01 scale factor.", maxCoord);
                 }
             }
         }
@@ -566,28 +598,30 @@ void applyUnitScaling(aiScene* aiScn, const std::string& ext) {
     if (applied && std::abs(unitScale - 1.0) > 1e-6) {
         LOG_INFO("Applying unit scale factor: %.6f to %s file", unitScale, ext.c_str());
 
-        for (unsigned m = 0; m < aiScn->mNumMeshes; m++) {
-            aiMesh* mesh = aiScn->mMeshes[m];
-            for (unsigned v = 0; v < mesh->mNumVertices; v++) {
-                mesh->mVertices[v] *= (float)unitScale;
-            }
+        // Scale the entire scene by `unitScale` by left-multiplying the
+        // ROOT NODE's transform with a uniform scale matrix. With the import
+        // flag `aiProcess_PreTransformVertices` removed, the node hierarchy
+        // is preserved and the world transform of any leaf is the product of
+        // all node transforms from root down. Putting the scale at the root
+        // applies it exactly once to every world position — including the
+        // animation tracks, since those are sampled in the same frame. We do
+        // NOT scale per-mesh vertices or per-node translations directly: that
+        // would compound the scale by the tree depth (0.01^N) and break the
+        // composed transforms.
+        if (aiScn->mRootNode) {
+            aiMatrix4x4 S;
+            S.a1 = (float)unitScale;
+            S.b2 = (float)unitScale;
+            S.c3 = (float)unitScale;
+            S.d4 = 1.0f;
+            aiScn->mRootNode->mTransformation = S * aiScn->mRootNode->mTransformation;
         }
 
-        for (unsigned c = 0; c < aiScn->mNumCameras; c++) {
-            aiCamera* cam = aiScn->mCameras[c];
-            if (cam) {
-                cam->mPosition *= (float)unitScale;
-                cam->mLookAt *= (float)unitScale;
-            }
-        }
-
-        for (unsigned l = 0; l < aiScn->mNumLights; l++) {
-            aiLight* light = aiScn->mLights[l];
-            if (light) {
-                light->mPosition *= (float)unitScale;
-                light->mDirection *= (float)unitScale;
-            }
-        }
+        // Note: aiCamera::mPosition / aiLight::mPosition are interpreted in
+        // the LOCAL space of their owning node by SceneLoader (it transforms
+        // them via that node's worldRest). The root-scale matrix is already
+        // baked into worldRest, so we must NOT scale these positions again
+        // here — doing so would compound the scale.
     } else if (!applied) {
         LOG_INFO("No unit scaling applied to %s file (units appear standard)", ext.c_str());
     }

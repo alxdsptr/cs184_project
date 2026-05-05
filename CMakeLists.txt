@@ -186,6 +186,8 @@ add_executable(pathtracer
     # Scene
     src/scene/Scene.cpp
     src/scene/SceneLoader.cpp
+    src/scene/SceneTreeBuilder.cpp
+    src/scene/AnimationEval.cpp
     src/scene/PbrtLoader.cpp
     src/scene/Texture.cpp
     src/scene/utils.cpp
@@ -203,6 +205,7 @@ add_executable(pathtracer
 # CUDA sources
 target_sources(pathtracer PRIVATE
     src/gpu/DeviceScene.cu
+    src/gpu/PoseUpdate.cu
     src/backend/CUDABackend.cu
     src/render/PathTraceKernel.cu
     src/render/Tonemapping.cu
