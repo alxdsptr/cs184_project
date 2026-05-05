@@ -1197,7 +1197,15 @@ extern "C" __global__ void __raygen__path_trace_split()
                         !shForThisBounce);
                     float envLum = 0.2126f*envColor.x + 0.7152f*envColor.y + 0.0722f*envColor.z;
                     if (envLum > 20.0f) envColor = envColor * (20.0f / envLum);
-                    pathRadiance += clampFirefly_split(throughput * envColor, 10.0f);
+                    if (bounce == 0) {
+                        // Primary-ray miss: no surface → no diff/spec bucket
+                        // to demodulate into. Route the sky through the
+                        // emissive channel so it bypasses NRD denoise and
+                        // the composite shader picks it up via `+ emis`.
+                        emissiveContrib = envColor;
+                    } else {
+                        pathRadiance += clampFirefly_split(throughput * envColor, 10.0f);
+                    }
                 }
                 // Sky pixel sentinel viewZ — only the first sample's miss wins.
                 if (firstBounce && !haveGbuffer) {

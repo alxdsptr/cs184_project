@@ -191,6 +191,22 @@ bool Camera::saveToFile(const std::string& path) const {
     return out.good();
 }
 
+void Camera::setPose(float3 position, float yawDeg, float pitchDeg,
+                     float fovDeg, float aspect, float nearPlane, float farPlane) {
+    m_position  = position;
+    m_yaw       = yawDeg;
+    m_pitch     = pitchDeg;
+    m_fovDeg    = fovDeg;
+    m_aspect    = aspect;
+    m_nearPlane = nearPlane;
+    m_farPlane  = farPlane;
+    rebuildMatrices();
+    m_prevViewProj    = mat4_multiply(m_projMatrix, m_viewMatrix);
+    m_prevViewMatrix  = m_viewMatrix;
+    m_prevProjMatrix  = m_projMatrix;
+    m_moved = true;
+}
+
 bool Camera::loadFromFile(const std::string& path) {
     std::ifstream in(path);
     if (!in.is_open()) {

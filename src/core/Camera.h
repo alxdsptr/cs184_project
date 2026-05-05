@@ -59,6 +59,11 @@ public:
 
     float3 getPosition() const { return m_position; }
     float  getFovDeg() const { return m_fovDeg; }
+    float  getYawDeg() const { return m_yaw; }
+    float  getPitchDeg() const { return m_pitch; }
+    float  getAspect() const { return m_aspect; }
+    float  getNearPlane() const { return m_nearPlane; }
+    float  getFarPlane() const { return m_farPlane; }
     float  getMoveSpeed() const { return m_moveSpeed; }
     void   setMoveSpeed(float s) { m_moveSpeed = clampf(s, 0.05f, 200.0f); }
 
@@ -95,6 +100,12 @@ public:
 
     bool saveToFile(const std::string& path) const;
     bool loadFromFile(const std::string& path);
+    // Symmetric in-memory write of all v1 camera fields. Marks the camera as
+    // moved so the renderer drops temporal history. Used by the replay loop
+    // (Application::runReplay) to inject one pose per frame without touching
+    // the disk.
+    void setPose(float3 position, float yawDeg, float pitchDeg,
+                 float fovDeg, float aspect, float nearPlane, float farPlane);
 
 private:
     void rebuildMatrices();

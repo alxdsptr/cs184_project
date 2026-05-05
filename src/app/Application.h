@@ -47,6 +47,23 @@ public:
     void setMediumDensityKind(uint32_t k) { m_medium.densityKind = k; m_hasMediumOverride = true; }
     void setHeadlessOutput(const std::string& outputPath, uint32_t sampleCount);
 
+    // Replay mode: load a recorded camera path (JSON written by F5 / stopRecording),
+    // render one PNG per pose into outDir/frame_NNNNNN.png, then quit.
+    // Scene loads exactly once → 100x faster than launching pathtracer per frame.
+    // sppPerPose is the per-frame sample budget; for "1spp comparison" sweeps,
+    // pass 1. The full ReSTIR/denoiser state from the CLI is honoured.
+    struct ReplayOptions {
+        std::string recordingPath;
+        std::string outDir = "replay_frames";
+        uint32_t    sppPerPose = 1;
+        // If >0, replay only the first N poses of the recording (debug knob).
+        uint32_t    maxPoses = 0;
+        // If >1, render every Kth pose (drops the rest). Useful when the
+        // recording is at GUI fps but the GIF target is lower.
+        uint32_t    stride = 1;
+    };
+    void setReplayOptions(const ReplayOptions& o) { m_replayOpts = o; m_replayEnabled = true; }
+
     // ── Capture mode: deterministic camera path + periodic screenshot dump ─
     // Two motion modes, selected by CaptureOptions::motion:
     //
@@ -128,6 +145,7 @@ private:
     void processInput();
     void runGui();
     void runHeadless();
+    void runReplay();
     void renderSceneSample(uchar4* d_pbo, bool timeHeadless);
     void frameCameraToScene();
 
@@ -186,6 +204,26 @@ private:
     bool m_prevF2Down = false;
     bool m_prevF3Down = false;
     bool m_prevF4Down = false;
+    bool m_prevF5Down = false;
+
+    // Camera-path recording. Toggled with F5. While active, every GUI frame
+    // appends (timestamp, pose) to m_recordedPath. Stopping flushes the
+    // buffer to recordings/path_*.json — replayed by scripts/render_camera_path.py.
+    struct RecordedPose {
+        float    t;            // seconds since record-start
+        float3   position;
+        float    yaw;          // degrees
+        float    pitch;        // degrees
+        float    fovDeg;
+        float    aspect;
+        float    nearPlane;
+        float    farPlane;
+    };
+    bool                       m_recording = false;
+    double                     m_recordStartTime = 0.0;
+    std::vector<RecordedPose>  m_recordedPath;
+    void startRecording();
+    void stopRecording();
     uint32_t m_maxBounces = 8;
     uint32_t m_samplesPerFrame = 1;
     // Pending ReSTIR toggles applied to m_renderer right after init().
@@ -238,4 +276,7 @@ private:
     uint32_t m_captureMotionFrames    = 0;  // motion frames issued since warmup
     uint32_t m_captureDwellRemaining  = 0;  // >0 means we're in a dwell phase
     uint32_t m_captureMotionRemaining = 0;  // >0 means we're advancing motion
+
+    bool          m_replayEnabled = false;
+    ReplayOptions m_replayOpts;
 };

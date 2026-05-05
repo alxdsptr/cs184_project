@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 
 #include <chrono>
+#include <ctime>
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -713,6 +714,17 @@ void Application::runGui() {
         }
         m_prevF4Down = f4Down;
 
+        // F5 toggles camera-path recording. When ON, the renderer appends
+        // (timestamp, pose) every GUI frame to m_recordedPath. Stopping flushes
+        // the buffer to recordings/path_*.json — replayed by
+        // scripts/render_camera_path.py via --recording.
+        bool f5Down = glfwGetKey(m_window, GLFW_KEY_F5) == GLFW_PRESS;
+        if (f5Down && !m_prevF5Down) {
+            if (m_recording) stopRecording();
+            else             startRecording();
+        }
+        m_prevF5Down = f5Down;
+
         // 'H' toggles SH environment irradiance shortcut (only takes effect
         // when an env map is loaded and its SH has been precomputed).
         bool shKeyDown = glfwGetKey(m_window, GLFW_KEY_H) == GLFW_PRESS;
@@ -978,6 +990,18 @@ void Application::runGui() {
         m_gui.endFrame();
 
         m_display.present();
+        if (m_recording) {
+            RecordedPose rp;
+            rp.t         = (float)(glfwGetTime() - m_recordStartTime);
+            rp.position  = m_camera.getPosition();
+            rp.yaw       = m_camera.getYawDeg();
+            rp.pitch     = m_camera.getPitchDeg();
+            rp.fovDeg    = m_camera.getFovDeg();
+            rp.aspect    = m_camera.getAspect();
+            rp.nearPlane = m_camera.getNearPlane();
+            rp.farPlane  = m_camera.getFarPlane();
+            m_recordedPath.push_back(rp);
+        }
         // Snapshot current view/proj as "prev" for next frame's motion
         // vectors. Must come AFTER all getParams() calls of this frame
         // (renderer + any GUI overlay), otherwise the next frame's
@@ -995,6 +1019,10 @@ void Application::runHeadless() {
         uchar4* d_pbo = (uchar4*)m_display.mapForCUDA();
         renderSceneSample(d_pbo, true);
         m_display.unmapFromCUDA();
+        // saveToPNG reads m_sampledImage, which is only populated by the
+        // present-time composite path (NRD denoise + tonemap + blit). Without
+        // present() the headless screenshot is uninitialised RGBA(0,0,0,0).
+        m_display.present();
 
         if (m_sceneLoaded && m_renderer.getSampleCount() >= m_targetSamples) {
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -1015,8 +1043,187 @@ void Application::runHeadless() {
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// Replay-mode JSON parsing.
+//
+// Recordings are produced by Application::stopRecording. Format is fixed and
+// we control both writer and reader, so a tiny hand-rolled reader is enough —
+// avoids pulling in a JSON library. We strip whitespace, then for every
+// "{...}" object inside the "poses" array we extract the seven numeric fields
+// by scanning for `"key":` and parsing the next number / number-list.
+// ─────────────────────────────────────────────────────────────
+namespace {
+struct ReplayPose {
+    float    t;
+    float3   position;
+    float    yawDeg;
+    float    pitchDeg;
+    float    fovDeg;
+    float    aspect;
+    float    nearPlane;
+    float    farPlane;
+};
+
+bool readNumber(const std::string& s, size_t& i, float& out) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == ',' || s[i] == ':' || s[i] == '[' || s[i] == ']')) ++i;
+    size_t start = i;
+    while (i < s.size() && (isdigit((unsigned char)s[i]) || s[i] == '.' ||
+                            s[i] == '-' || s[i] == '+' || s[i] == 'e' || s[i] == 'E')) ++i;
+    if (i == start) return false;
+    out = std::stof(s.substr(start, i - start));
+    return true;
+}
+
+bool readKeyedFloat(const std::string& s, const char* key, float& out) {
+    std::string needle = std::string("\"") + key + "\"";
+    size_t k = s.find(needle);
+    if (k == std::string::npos) return false;
+    k += needle.size();
+    return readNumber(s, k, out);
+}
+
+bool readKeyedFloat3(const std::string& s, const char* key, float3& out) {
+    std::string needle = std::string("\"") + key + "\"";
+    size_t k = s.find(needle);
+    if (k == std::string::npos) return false;
+    k += needle.size();
+    return readNumber(s, k, out.x) && readNumber(s, k, out.y) && readNumber(s, k, out.z);
+}
+
+bool loadReplayPoses(const std::string& path, std::vector<ReplayPose>& outPoses) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        LOG_ERROR("Replay: failed to open %s", path.c_str());
+        return false;
+    }
+    std::ostringstream ss; ss << in.rdbuf();
+    std::string text = ss.str();
+
+    // Slice out the poses array. The closing ']' must be matched against its
+    // own '[' — naive find(']') would land on the inner "position": [x,y,z]
+    // bracket and only the first pose's prefix would be parsed.
+    size_t arr = text.find("\"poses\"");
+    if (arr == std::string::npos) { LOG_ERROR("Replay: no 'poses' field in %s", path.c_str()); return false; }
+    size_t lb = text.find('[', arr);
+    if (lb == std::string::npos) { LOG_ERROR("Replay: no '[' after 'poses'"); return false; }
+    int depth = 1;
+    size_t rb = std::string::npos;
+    for (size_t k = lb + 1; k < text.size(); ++k) {
+        if (text[k] == '[') ++depth;
+        else if (text[k] == ']') {
+            if (--depth == 0) { rb = k; break; }
+        }
+    }
+    if (rb == std::string::npos) {
+        LOG_ERROR("Replay: unmatched '[' for poses array");
+        return false;
+    }
+    std::string body = text.substr(lb + 1, rb - lb - 1);
+
+    size_t cur = 0;
+    while (true) {
+        size_t obj_l = body.find('{', cur);
+        if (obj_l == std::string::npos) break;
+        size_t obj_r = body.find('}', obj_l);
+        if (obj_r == std::string::npos) break;
+        std::string obj = body.substr(obj_l, obj_r - obj_l + 1);
+
+        ReplayPose p{};
+        // Sensible defaults for any missing field.
+        p.t = 0.0f; p.fovDeg = 60.0f; p.aspect = 16.0f / 9.0f;
+        p.nearPlane = 0.001f; p.farPlane = 100.0f;
+        readKeyedFloat (obj, "t",       p.t);
+        readKeyedFloat3(obj, "position",p.position);
+        readKeyedFloat (obj, "yaw",     p.yawDeg);
+        readKeyedFloat (obj, "pitch",   p.pitchDeg);
+        readKeyedFloat (obj, "fov_deg", p.fovDeg);
+        readKeyedFloat (obj, "aspect",  p.aspect);
+        readKeyedFloat (obj, "near",    p.nearPlane);
+        readKeyedFloat (obj, "far",     p.farPlane);
+        outPoses.push_back(p);
+        cur = obj_r + 1;
+    }
+    return !outPoses.empty();
+}
+}  // namespace
+
+void Application::runReplay() {
+    std::vector<ReplayPose> poses;
+    if (!loadReplayPoses(m_replayOpts.recordingPath, poses)) {
+        LOG_ERROR("Replay: no usable poses in %s", m_replayOpts.recordingPath.c_str());
+        return;
+    }
+    if (m_replayOpts.stride == 0) m_replayOpts.stride = 1;
+    if (m_replayOpts.maxPoses > 0 && poses.size() > m_replayOpts.maxPoses) {
+        poses.resize(m_replayOpts.maxPoses);
+    }
+
+    std::filesystem::create_directories(m_replayOpts.outDir);
+
+    // Override aspect to match the actual render resolution. Otherwise a
+    // recording made at one window size would render squashed at another.
+    float renderAspect = m_height > 0 ? (float)m_width / (float)m_height : 1.0f;
+
+    const uint32_t spp = m_replayOpts.sppPerPose > 0 ? m_replayOpts.sppPerPose : 1;
+    LOG_INFO("Replay: %zu pose(s) (stride=%u → %zu frames), spp=%u, out=%s",
+             poses.size(), m_replayOpts.stride,
+             (poses.size() + m_replayOpts.stride - 1) / m_replayOpts.stride,
+             spp, m_replayOpts.outDir.c_str());
+
+    const auto totalStart = std::chrono::steady_clock::now();
+    uint32_t saved = 0;
+
+    for (size_t i = 0; i < poses.size(); i += m_replayOpts.stride) {
+        if (glfwWindowShouldClose(m_window)) break;
+        const ReplayPose& p = poses[i];
+
+        // Inject pose. Aspect is overridden so headless render dimensions
+        // dictate the projection regardless of what was recorded.
+        m_camera.setPose(p.position, p.yawDeg, p.pitchDeg, p.fovDeg,
+                         renderAspect, p.nearPlane, p.farPlane);
+
+        // Each replay frame is independent — no temporal carry-over (matches
+        // what the user expects when comparing 1spp renders across modes).
+        m_renderer.resetAccumulation();
+        m_renderer.invalidateReSTIRHistory();
+        m_renderer.markPipelineNeedsReset();
+
+        // Pump until we've rendered the requested spp at this pose.
+        while (m_renderer.getSampleCount() < spp) {
+            uchar4* d_pbo = (uchar4*)m_display.mapForCUDA();
+            renderSceneSample(d_pbo, true);
+            m_display.unmapFromCUDA();
+            m_display.present();
+            m_camera.advanceFrame();
+            m_frameIndex++;
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        std::ostringstream name;
+        name << m_replayOpts.outDir << "/frame_" << std::setw(6)
+             << std::setfill('0') << saved << ".png";
+        if (!m_display.saveToPNG(name.str())) {
+            LOG_ERROR("Replay: failed to save %s", name.str().c_str());
+        }
+        ++saved;
+
+        if (saved % 10 == 0 || saved == 1) {
+            LOG_INFO("Replay: %u frames written", saved);
+        }
+    }
+
+    const auto totalEnd = std::chrono::steady_clock::now();
+    double totalMs = std::chrono::duration<double, std::milli>(totalEnd - totalStart).count();
+    LOG_INFO("Replay: done, %u frame(s) in %.2f s (%.1f ms/frame)",
+             saved, totalMs / 1000.0, saved > 0 ? totalMs / saved : 0.0);
+
+    glfwSetWindowShouldClose(m_window, true);
+}
+
 void Application::run() {
-    if (!m_guiEnabled && !m_headlessOutputPath.empty()) {
+    if (!m_guiEnabled && m_replayEnabled) {
+        runReplay();
+    } else if (!m_guiEnabled && !m_headlessOutputPath.empty()) {
         runHeadless();
     } else {
         runGui();
@@ -1024,6 +1231,7 @@ void Application::run() {
 }
 
 void Application::shutdown() {
+    if (m_recording) stopRecording();
     m_display.waitIdle();
     m_renderer.shutdown();
     m_textures.freeAll();
@@ -1039,3 +1247,71 @@ void Application::shutdown() {
     glfwTerminate();
     LOG_INFO("Application shutdown");
 }
+
+void Application::startRecording() {
+    m_recordedPath.clear();
+    m_recordStartTime = glfwGetTime();
+    m_recording = true;
+    LOG_INFO("Recording: STARTED (press F5 again to stop)");
+}
+
+void Application::stopRecording() {
+    m_recording = false;
+    if (m_recordedPath.empty()) {
+        LOG_WARN("Recording: STOPPED with 0 frames captured (nothing written)");
+        return;
+    }
+    std::filesystem::create_directories("recordings");
+
+    // Build a filename containing the local date+time so multiple recordings
+    // don't clobber each other across sessions.
+    std::time_t now = std::time(nullptr);
+    std::tm tm_local{};
+#ifdef _WIN32
+    localtime_s(&tm_local, &now);
+#else
+    localtime_r(&now, &tm_local);
+#endif
+    std::ostringstream stamp;
+    stamp << std::put_time(&tm_local, "%Y%m%d_%H%M%S");
+
+    std::ostringstream path;
+    path << "recordings/path_" << stamp.str() << ".json";
+
+    std::ofstream out(path.str(), std::ios::binary);
+    if (!out) {
+        LOG_ERROR("Recording: failed to open %s for write", path.str().c_str());
+        return;
+    }
+
+    // Hand-rolled JSON — avoids pulling in a json library for one writer.
+    // Format matches what scripts/render_camera_path.py expects via --recording.
+    out << "{\n";
+    out << "  \"version\": 1,\n";
+    out << "  \"recorded_frames\": " << m_recordedPath.size() << ",\n";
+    out << "  \"duration_seconds\": " << m_recordedPath.back().t << ",\n";
+    out << "  \"poses\": [\n";
+    for (size_t i = 0; i < m_recordedPath.size(); ++i) {
+        const RecordedPose& p = m_recordedPath[i];
+        out << "    {"
+            << "\"t\": "          << p.t          << ", "
+            << "\"position\": ["  << p.position.x << ", " << p.position.y << ", " << p.position.z << "], "
+            << "\"yaw\": "        << p.yaw        << ", "
+            << "\"pitch\": "      << p.pitch      << ", "
+            << "\"fov_deg\": "    << p.fovDeg     << ", "
+            << "\"aspect\": "     << p.aspect     << ", "
+            << "\"near\": "       << p.nearPlane  << ", "
+            << "\"far\": "        << p.farPlane
+            << "}";
+        if (i + 1 < m_recordedPath.size()) out << ",";
+        out << "\n";
+    }
+    out << "  ]\n";
+    out << "}\n";
+    out.close();
+
+    LOG_INFO("Recording: STOPPED, saved %zu frames (%.2f s) to %s",
+             m_recordedPath.size(), m_recordedPath.back().t, path.str().c_str());
+    m_recordedPath.clear();
+}
+

@@ -37,6 +37,10 @@ int main(int argc, char** argv) {
     Application::CaptureOptions capOpts;
     bool captureEnabled = false;
 
+    // Replay-mode CLI state. Setting --replay activates it.
+    Application::ReplayOptions replayOpts;
+    bool replayEnabled = false;
+
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "-e" && i + 1 < argc) {
@@ -208,6 +212,20 @@ int main(int argc, char** argv) {
             if (v > 0.0f) capOpts.orbitRadius = v;
         } else if (arg == "--capture-pitch" && i + 1 < argc) {
             capOpts.orbitPitchDeg = (float)std::atof(argv[++i]);
+        } else if (arg == "--replay" && i + 1 < argc) {
+            replayOpts.recordingPath = argv[++i];
+            replayEnabled = true;
+        } else if (arg == "--replay-out" && i + 1 < argc) {
+            replayOpts.outDir = argv[++i];
+        } else if (arg == "--replay-spp" && i + 1 < argc) {
+            int v = std::atoi(argv[++i]);
+            if (v > 0) replayOpts.sppPerPose = (uint32_t)v;
+        } else if (arg == "--replay-stride" && i + 1 < argc) {
+            int v = std::atoi(argv[++i]);
+            if (v > 0) replayOpts.stride = (uint32_t)v;
+        } else if (arg == "--replay-max" && i + 1 < argc) {
+            int v = std::atoi(argv[++i]);
+            if (v >= 0) replayOpts.maxPoses = (uint32_t)v;
         } else if (arg == "-r" && i + 2 < argc) {
             int parsedWidth = std::atoi(argv[++i]);
             int parsedHeight = std::atoi(argv[++i]);
@@ -260,8 +278,13 @@ int main(int argc, char** argv) {
     if (captureEnabled) {
         app.setCaptureOptions(capOpts);
     }
+    if (replayEnabled) {
+        app.setReplayOptions(replayOpts);
+    }
 
-    if (!app.init(width, height, "CUDA Path Tracer", outputPath.empty())) {
+    // Replay mode runs without GUI (loops poses internally and exits).
+    bool enableGui = outputPath.empty() && !replayEnabled;
+    if (!app.init(width, height, "CUDA Path Tracer", enableGui)) {
         return 1;
     }
 

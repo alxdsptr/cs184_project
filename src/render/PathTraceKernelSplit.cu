@@ -213,7 +213,9 @@ __global__ void pathTraceKernelSplit(
     float3 outPrimaryAlbedo   = make_float3(0, 0, 0);
     float3 outPrimaryNormal   = make_float3(0, 1, 0);
     float  outPrimaryRoughness = 1.0f;
-    float  outPrimaryViewZ     = 0.0f;
+    // Sky-pixel sentinel viewZ: large positive value → NRD treats as "far".
+    // viewZ=0 would be misread as the near plane and corrupt disocclusion.
+    float  outPrimaryViewZ     = 1.0e6f;
     float2 outPrimaryMvPx      = make_float2(0.0f, 0.0f);
     float  outPrimaryNdcZ      = 1.0f;  // DLSS-style NDC depth (1 = far)
     // DLSS-RR fix: capture primary hit position + metallic for an explicit
@@ -298,7 +300,17 @@ __global__ void pathTraceKernelSplit(
                     !shForThisBounce);
                 float envLum = 0.2126f*envColor.x + 0.7152f*envColor.y + 0.0722f*envColor.z;
                 if (envLum > 20.0f) envColor = envColor * (20.0f / envLum);
-                pathRadiance += clampFirefly(throughput * envColor, 10.0f);
+                if (bounce == 0) {
+                    // Primary-ray miss: there is no surface, so there's no
+                    // diff/spec bucket to demodulate into. Route the sky
+                    // through the emissive channel — it bypasses NRD denoise
+                    // and the composite shader adds it as `+ emis`. Without
+                    // this the env color silently drops on the floor: the
+                    // demod block below only runs when haveGbuffer is true.
+                    emissiveContrib = envColor;
+                } else {
+                    pathRadiance += clampFirefly(throughput * envColor, 10.0f);
+                }
             }
             break;
         }
