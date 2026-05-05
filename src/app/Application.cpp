@@ -1177,7 +1177,8 @@ void Application::runReplay() {
     float renderAspect = m_height > 0 ? (float)m_width / (float)m_height : 1.0f;
 
     const uint32_t spp = m_replayOpts.sppPerPose > 0 ? m_replayOpts.sppPerPose : 1;
-    LOG_INFO("Replay: %zu pose(s) (stride=%u → %zu frames), spp=%u, out=%s",
+    LOG_INFO("Replay: %zu pose(s) rendered, save stride=%u → %zu PNG(s), "
+             "spp=%u, out=%s",
              poses.size(), m_replayOpts.stride,
              (poses.size() + m_replayOpts.stride - 1) / m_replayOpts.stride,
              spp, m_replayOpts.outDir.c_str());
@@ -1185,22 +1186,55 @@ void Application::runReplay() {
     const auto totalStart = std::chrono::steady_clock::now();
     uint32_t saved = 0;
 
-    for (size_t i = 0; i < poses.size(); i += m_replayOpts.stride) {
+    // ── History policy ──────────────────────────────────────────────────
+    // Earlier versions iterated by `i += stride` and called
+    // resetAccumulation()/invalidateReSTIRHistory()/markPipelineNeedsReset()
+    // at every saved pose. That fed NRD/DLSS a cold pipeline on every output
+    // frame (= max-noise input to a temporal denoiser/upscaler) AND skipped
+    // the intermediate poses entirely (= huge motion-vector jumps between
+    // saved frames). Result was severe artifacts in --mode nrd / dlss / rr.
+    //
+    // Fix:
+    //   1. Hard-reset NRD/DLSS/ReSTIR history exactly once, before pose 0
+    //      (we *are* teleporting from the startup pose to pose[0]).
+    //   2. Walk EVERY recorded pose (no stride skipping at the C++ layer),
+    //      using advanceFrame() + setPosePreserveHistory() so each frame's
+    //      motion vectors are (pose[i-1] → pose[i]) instead of zero.
+    //   3. Save a PNG only on stride-multiples — stride is a "decimate
+    //      output" knob, not a "skip pose" knob.
+    //   4. resetAccumulation() between poses so the path-trace sample
+    //      averaging starts fresh per pose (radiance from a different
+    //      viewpoint can't be pixel-averaged), but ReSTIR/NRD/DLSS history
+    //      survives — that's exactly what motion vectors are for.
+    m_renderer.resetAccumulation();
+    m_renderer.invalidateReSTIRHistory();
+    m_renderer.markPipelineNeedsReset();
+
+    for (size_t i = 0; i < poses.size(); ++i) {
         if (glfwWindowShouldClose(m_window)) break;
         const ReplayPose& p = poses[i];
 
-        // Inject pose. Aspect is overridden so headless render dimensions
-        // dictate the projection regardless of what was recorded.
-        m_camera.setPose(p.position, p.yawDeg, p.pitchDeg, p.fovDeg,
-                         renderAspect, p.nearPlane, p.farPlane);
+        if (i == 0) {
+            // Teleport from startup pose; intentionally zero motion vectors
+            // (the one-shot pipeline reset above will be consumed this frame).
+            m_camera.setPose(p.position, p.yawDeg, p.pitchDeg, p.fovDeg,
+                             renderAspect, p.nearPlane, p.farPlane);
+        } else {
+            // Snapshot the previous pose's matrices as "prev", then update
+            // current to pose[i] without clobbering them. NRD/DLSS now see
+            // real motion (pose[i-1] → pose[i]).
+            m_camera.advanceFrame();
+            m_camera.setPosePreserveHistory(p.position, p.yawDeg, p.pitchDeg,
+                                            p.fovDeg, renderAspect,
+                                            p.nearPlane, p.farPlane);
+            // Path-trace accumulator can't average across viewpoints; restart
+            // sample count at each pose. Does NOT touch denoiser history.
+            m_renderer.resetAccumulation();
+        }
 
-        // Each replay frame is independent — no temporal carry-over (matches
-        // what the user expects when comparing 1spp renders across modes).
-        m_renderer.resetAccumulation();
-        m_renderer.invalidateReSTIRHistory();
-        m_renderer.markPipelineNeedsReset();
-
-        // Pump until we've rendered the requested spp at this pose.
+        // Render `spp` samples at this pose. After each sub-frame call
+        // advanceFrame() so subsequent sub-frames at the same pose see
+        // prev == current (zero motion), which is correct for a static cam.
         while (m_renderer.getSampleCount() < spp) {
             uchar4* d_pbo = (uchar4*)m_display.mapForCUDA();
             renderSceneSample(d_pbo, true);
@@ -1209,8 +1243,11 @@ void Application::runReplay() {
             m_camera.advanceFrame();
             m_frameIndex++;
         }
-        CUDA_CHECK(cudaDeviceSynchronize());
 
+        const bool isOutputFrame = (i % m_replayOpts.stride == 0);
+        if (!isOutputFrame) continue;
+
+        CUDA_CHECK(cudaDeviceSynchronize());
         std::ostringstream name;
         name << m_replayOpts.outDir << "/frame_" << std::setw(6)
              << std::setfill('0') << saved << ".png";

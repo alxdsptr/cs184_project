@@ -106,6 +106,15 @@ public:
     // the disk.
     void setPose(float3 position, float yawDeg, float pitchDeg,
                  float fovDeg, float aspect, float nearPlane, float farPlane);
+    // Like setPose but does NOT overwrite the prev-frame matrices, so the
+    // next renderFrame still produces correct motion vectors against whatever
+    // prev was before the call. Caller is expected to have invoked
+    // advanceFrame() first to snapshot the previous pose. Used by the replay
+    // loop to thread motion vectors between successive recorded poses;
+    // setPose() is the teleport variant that intentionally zeroes them.
+    void setPosePreserveHistory(float3 position, float yawDeg, float pitchDeg,
+                                float fovDeg, float aspect,
+                                float nearPlane, float farPlane);
 
 private:
     void rebuildMatrices();
