@@ -542,16 +542,27 @@ void Application::loadEnvMap(const std::string& path) {
 
 void Application::renderSceneSample(uchar4* d_pbo, bool timeHeadless) {
     if (m_sceneLoaded) {
-        // Advance animation only on the first sample of each pose. The
-        // accumulator's sample-count resets to 0 on camera move (replay loop,
-        // capture motion-frame, GUI input). When it's >0 we're integrating
-        // more samples at the same camera pose AND same animation time, so
-        // touching the geometry would re-pose mid-accumulation and produce
-        // ghosted frames. Also skip on GUI mode where the user is exploring;
-        // they call --play-anim explicitly when they want playback.
-        if (m_playAnimation && m_scene.hasAnimation() &&
-            m_renderer.getSampleCount() == 0) {
-            advanceAnimation(1.0f / std::max(1.0f, m_animFps));
+        // Animation playback. Two modes:
+        //
+        //   - GUI realtime: advance the clip every render frame and reset the
+        //     accumulator. Each rendered frame is one new pose at 1-spp (or
+        //     whatever the user set). Decoupled from camera motion so the
+        //     animation keeps playing while you sit still and watch.
+        //
+        //   - Batch (replay/capture): advance only on sample 0 of each pose,
+        //     so multi-spp accumulation can still build up at a fixed pose
+        //     without re-posing geometry mid-integration.
+        if (m_playAnimation && m_scene.hasAnimation()) {
+            const bool realtime = m_guiEnabled && !m_captureEnabled;
+            const bool sampleZero = (m_renderer.getSampleCount() == 0);
+            if (realtime || sampleZero) {
+                advanceAnimation(1.0f / std::max(1.0f, m_animFps));
+                if (realtime) {
+                    // Geometry just changed — drop accumulated samples so the
+                    // next launch shows the new pose, not a blend of poses.
+                    m_renderer.resetAccumulation();
+                }
+            }
         }
 
         CameraParams camParams = m_camera.getParams(m_frameIndex);
@@ -943,7 +954,12 @@ void Application::runGui() {
                 &guiReSTIRDI,
                 &guiReSTIRGI,
                 &guiReSTIRPT,
-                &guiReSTIRPTLen);
+                &guiReSTIRPTLen,
+                m_scene.hasAnimation() ? &m_playAnimation : nullptr,
+                m_scene.hasAnimation() ? &m_animFps        : nullptr,
+                m_scene.hasAnimation() && !m_scene.getAnimations().empty()
+                    ? m_scene.getAnimations().front().duration : 0.0f,
+                m_animTime);
             if (guiReSTIRDI != m_renderer.isReSTIREnabled()) {
                 m_renderer.setReSTIREnabled(guiReSTIRDI);
             }

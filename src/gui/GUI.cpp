@@ -85,7 +85,11 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
                  bool* restirDIEnabled,
                  bool* restirGIEnabled,
                  bool* restirPTEnabled,
-                 int*  restirPTPathLength) {
+                 int*  restirPTPathLength,
+                 bool*  playAnimation,
+                 float* animFps,
+                 float  animClipDurationSec,
+                 float  animCurrentTime) {
     bool changed = false;
     loadEnvMapRequested = false;
 
@@ -222,6 +226,33 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
                     changed = true;
                 }
             }
+        }
+    }
+
+    if (playAnimation || animFps) {
+        ImGui::Separator();
+        ImGui::Text("Animation");
+        if (animClipDurationSec > 0.0f) {
+            // Show the clip's loop position. The renderer's m_animTime grows
+            // unboundedly; we wrap it into [0, duration) for display purposes
+            // so the readout matches what the user sees in the viewport.
+            float dur = animClipDurationSec;
+            float t = animCurrentTime - dur * floorf(animCurrentTime / dur);
+            ImGui::Text("Time: %.2f / %.2f s", t, dur);
+        } else {
+            ImGui::Text("(no clip loaded)");
+        }
+        if (playAnimation) {
+            // Live toggle. When the renderer sees this flip OFF, advanceAnimation
+            // becomes a no-op and the geometry freezes at whatever pose it was
+            // last rendered at.
+            ImGui::Checkbox("Play", playAnimation);
+        }
+        if (animFps && *animFps > 0.0f) {
+            // Step rate (per-render-frame clip advance). Default 30 matches
+            // most authored FBX tracks. Lower for slow-mo, higher for
+            // fast-forward. Has no effect on the rendered camera framerate.
+            ImGui::SliderFloat("Anim FPS", animFps, 1.0f, 120.0f, "%.1f");
         }
     }
 

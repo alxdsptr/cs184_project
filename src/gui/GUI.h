@@ -45,7 +45,16 @@ public:
                 // ReSTIR PT (Lin et al. 2022) toggle + path-length knob.
                 // Pass nullptr to hide the controls.
                 bool* restirPTEnabled = nullptr,
-                int*  restirPTPathLength = nullptr);
+                int*  restirPTPathLength = nullptr,
+                // FBX-clip animation playback. `playAnimation` toggles
+                // play/pause; `animFps` is the rate at which the renderer
+                // advances clip time per render frame. `animClipDurationSec`
+                // is read-only context (length of the loaded clip). Pass
+                // nullptr to any of them to hide the panel.
+                bool*  playAnimation = nullptr,
+                float* animFps = nullptr,
+                float  animClipDurationSec = 0.0f,
+                float  animCurrentTime = 0.0f);
 
     // Draw a sparse normal-arrow overlay on top of the path-traced image.
     // Call this once per frame between beginFrame() and endFrame(), only
