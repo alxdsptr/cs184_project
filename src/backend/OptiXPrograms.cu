@@ -1802,7 +1802,25 @@ extern "C" __global__ void __raygen__path_trace_split()
         surf2Dwrite<ushort2>(packed, params.splitMotionVectors, x * 4, y);
     }
     if (params.splitAlbedo) {
-        uint32_t packed = packRGBA8(albTexel.x, albTexel.y, albTexel.z, 1.0f);
+        // DLSS-RR min-albedo guard (RTXPT PostProcess.hlsl §349-351):
+        // when both diffAlbedo AND specAlbedo are near-zero, the RR network
+        // has no reflectance signal to demodulate against and produces
+        // splotchy output that flickers during motion. Bumping diffAlbedo
+        // by 0.05 if their sum is below 0.05 keeps RR's reflectance
+        // estimator stable on near-black surfaces (deep wood, dark fabric).
+        // Only relevant when this aux image feeds DLSS-RR (params.splitSpecAlbedo
+        // also set); NRD-only mode still gets the un-bumped albedo for the
+        // composite shader's diff*alb modulation.
+        float3 dA = make_float3(albTexel.x, albTexel.y, albTexel.z);
+        if (params.splitSpecAlbedo) {
+            float avg = (dA.x + dA.y + dA.z + specAlbedoAvg.x +
+                         specAlbedoAvg.y + specAlbedoAvg.z) * (1.0f / 3.0f);
+            if (avg < 0.05f) {
+                dA.x += 0.05f; dA.y += 0.05f; dA.z += 0.05f;
+                dA.x = fminf(dA.x, 1.0f); dA.y = fminf(dA.y, 1.0f); dA.z = fminf(dA.z, 1.0f);
+            }
+        }
+        uint32_t packed = packRGBA8(dA.x, dA.y, dA.z, 1.0f);
         surf2Dwrite<uint32_t>(packed, params.splitAlbedo, x * 4, y);
     }
     if (params.splitEmissive) {
@@ -1815,9 +1833,21 @@ extern "C" __global__ void __raygen__path_trace_split()
         float3 c = noisyColorAvg;
         if (isnan(c.x) || isnan(c.y) || isnan(c.z) ||
             isinf(c.x) || isinf(c.y) || isinf(c.z)) c = make_float3(0,0,0);
-        c.x = fminf(fmaxf(c.x, 0.0f), 30.0f);
-        c.y = fminf(fmaxf(c.y, 0.0f), 30.0f);
-        c.z = fminf(fmaxf(c.z, 0.0f), 30.0f);
+        // RTXPT-style firefly clamp on the DLSS-RR input. RR's neural
+        // model can't denoise outliers above its training distribution,
+        // and a single high-energy firefly bleeds into nearby pixels for
+        // multiple frames during motion. RTXPT's PostProcess.hlsl §354
+        // clamps `max3(combinedRadiance) <= DLSSRRBrightnessClampK` (~10).
+        // We do the same as a max-channel clamp instead of per-channel —
+        // per-channel clamping shifts hue on saturated colors.
+        const float kRRBrightnessClamp = 10.0f;
+        float maxC = fmaxf(c.x, fmaxf(c.y, c.z));
+        if (maxC > kRRBrightnessClamp) {
+            c = c * (kRRBrightnessClamp / maxC);
+        }
+        c.x = fmaxf(c.x, 0.0f);
+        c.y = fmaxf(c.y, 0.0f);
+        c.z = fmaxf(c.z, 0.0f);
         ushort4 p = packHalf4_split(make_float4(c.x, c.y, c.z, 1.0f));
         surf2Dwrite<ushort4>(p, params.splitHdrColor, x * 8, y);
     }

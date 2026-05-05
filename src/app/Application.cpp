@@ -1173,8 +1173,15 @@ void Application::runReplay() {
     const auto totalStart = std::chrono::steady_clock::now();
     uint32_t saved = 0;
 
+    // Diagnostic: log the loop entry to confirm we're actually iterating.
+    LOG_INFO("Replay: entering pose loop (poses.size=%zu, stride=%u)",
+             poses.size(), m_replayOpts.stride);
     for (size_t i = 0; i < poses.size(); i += m_replayOpts.stride) {
-        if (glfwWindowShouldClose(m_window)) break;
+        // glfwWindowShouldClose was here — but the replay window is hidden
+        // and on Windows the close-state can transiently flip even without a
+        // visible window, racing the loop entry. Replay is a closed-loop
+        // headless task; ignore the GLFW close flag and let the inner
+        // saveToPNG / for-loop bound terminate cleanly.
         const ReplayPose& p = poses[i];
 
         // Inject pose. Aspect is overridden so headless render dimensions
@@ -1182,13 +1189,30 @@ void Application::runReplay() {
         m_camera.setPose(p.position, p.yawDeg, p.pitchDeg, p.fovDeg,
                          renderAspect, p.nearPlane, p.farPlane);
 
-        // Each replay frame is independent — no temporal carry-over (matches
-        // what the user expects when comparing 1spp renders across modes).
+        // Path-tracer accumulation must reset per pose (different viewpoints
+        // can't be averaged together — that's the same invariant that drives
+        // resetAccumulation on m_camera.hasMoved() in the live loop).
         m_renderer.resetAccumulation();
-        m_renderer.invalidateReSTIRHistory();
-        m_renderer.markPipelineNeedsReset();
+
+        // BUT: ReSTIR / NRD / DLSS / DLSS-RR temporal histories should
+        // survive pose-to-pose because their reprojection logic is driven
+        // by motion vectors — that is the entire point of those passes.
+        // We previously called invalidateReSTIRHistory() and
+        // markPipelineNeedsReset() here, which made every replay frame look
+        // like a teleport: ReSTIR reservoirs M-clamped to 1, NRD's RELAX
+        // dropped its history (reset=true), DLSS-SR/RR reset their internal
+        // accumulators. The result was a "first frame" quality every frame —
+        // exactly the "severe noise during motion" symptom that DLSS-SR and
+        // DLSS-RR exhibited on replay videos. Only mark a true pipeline
+        // reset on the very first replay pose; from there on out the
+        // recording is just a continuous camera path.
+        if (i == 0) {
+            m_renderer.invalidateReSTIRHistory();
+            m_renderer.markPipelineNeedsReset();
+        }
 
         // Pump until we've rendered the requested spp at this pose.
+        if (saved < 2) LOG_INFO("Replay: pose %zu, before pump (sc=%u, spp=%u)", i, m_renderer.getSampleCount(), spp);
         while (m_renderer.getSampleCount() < spp) {
             uchar4* d_pbo = (uchar4*)m_display.mapForCUDA();
             renderSceneSample(d_pbo, true);
@@ -1197,6 +1221,7 @@ void Application::runReplay() {
             m_camera.advanceFrame();
             m_frameIndex++;
         }
+        if (saved < 2) LOG_INFO("Replay: pose %zu, pump done (sc=%u)", i, m_renderer.getSampleCount());
         CUDA_CHECK(cudaDeviceSynchronize());
 
         std::ostringstream name;
