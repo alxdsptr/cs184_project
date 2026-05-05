@@ -43,6 +43,27 @@ struct PoseUpdateData {
     float3*   d_positionsCurr = nullptr;
     float3*   d_normalsCurr   = nullptr;
     float3*   d_positionsPrev = nullptr;
+
+    // ── Light-BVH refit support (animated emitters) ─────────────────────
+    // Aliased pointers into DeviceScene's m_data arrays so the per-frame
+    // light-update + BVH-refit kernels can re-pose animated area lights and
+    // rebuild the BVH bounds in place. The kernels write into the same
+    // GPUAreaLight[] / LightBVHNode[] arrays the renderer already reads, so
+    // there's nothing else to wire up downstream — NEE just sees fresh
+    // values.
+    void*       d_areaLights        = nullptr; // GPUAreaLight*  (forward decl)
+    uint32_t    areaLightCount      = 0;
+    void*       d_lightBVHNodes     = nullptr; // LightBVHNode*  (forward decl)
+    uint32_t*   d_orderedLightIndices = nullptr; // owned by DeviceScene; aliased
+    uint32_t    lightBVHRootIndex   = 0;
+    uint32_t    lightBVHNodeCount   = 0;
+    // For bottom-up refit of internal nodes: one entry per level (excluding
+    // level 0 which is leaves, refreshed by the per-light kernel directly).
+    // d_lightBVHLevel[i] holds the GPU array of node indices at internal
+    // level (i+1); the refit driver launches each level in order with
+    // `lightBVHLevelSize[i]` threads.
+    std::vector<uint32_t*> d_lightBVHLevel;
+    std::vector<uint32_t>  lightBVHLevelSize;
 };
 
 // Allocate the GPU buffers. Caller is responsible for filling
@@ -66,3 +87,18 @@ void poseUpdateUploadDeltas(PoseUpdateData& d,
 // Pass `firstFrame=true` on the very first frame after upload so that
 // d_positionsPrev is initialised to d_positionsCurr instead of stale data.
 void poseUpdateLaunch(PoseUpdateData& d, bool firstFrame, cudaStream_t stream = 0);
+
+// Re-pose every animated area light (those with meshIndex >= 0): apply the
+// current frame's meshDelta to the rest-pose triangle, write back v0/e1/e2/
+// normal, and atomically expand the corresponding BVH leaf's AABB. After
+// this kernel returns the leaf nodes hold up-to-date bounds.
+//
+// Static lights (meshIndex == -1) are skipped — their leaf bounds were
+// initialised at upload time and never go stale.
+void lightUpdateLaunch(PoseUpdateData& d, cudaStream_t stream = 0);
+
+// Bottom-up internal-node BVH refit. Each level reads the AABBs + weights
+// of children written by the previous level and merges them into the parent.
+// Internal-only (level 0 = leaves was already refreshed by lightUpdateLaunch).
+// Levels are launched in order so each level's writes are visible to the next.
+void lightBVHRefitLaunch(PoseUpdateData& d, cudaStream_t stream = 0);

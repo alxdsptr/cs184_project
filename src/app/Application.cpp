@@ -1428,7 +1428,15 @@ void Application::advanceAnimation(float stepSeconds) {
     poseUpdateLaunch(pose, m_firstAnimFrame);
     m_firstAnimFrame = false;
 
-    // 5) Refit the OptiX GAS so the next path-trace launch sees the new
+    // 5) Re-pose animated area lights and refit the light BVH so NEE keeps
+    //    sampling them with up-to-date AABBs. lightUpdateLaunch rewrites
+    //    each animated light's world triangle from its rest pose; the BVH
+    //    refit then walks leaves->root rebuilding bounds. Same stream =
+    //    natural ordering with the pose-update kernel, no explicit sync.
+    lightUpdateLaunch(pose);
+    lightBVHRefitLaunch(pose);
+
+    // 6) Refit the OptiX GAS so the next path-trace launch sees the new
     //    vertex positions.
     optix->refitGAS();
 

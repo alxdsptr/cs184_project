@@ -288,41 +288,49 @@ void DeviceScene::upload(const Scene& scene) {
                               lights.size() * sizeof(GPUPointLight), cudaMemcpyHostToDevice));
     }
 
-    // Area lights — GPU array carries every light (so BSDF-hit emissive
-    // lookup works for both static and dynamic emitters), but the light BVH
-    // only spans the static subset (dynamic emitters move every frame; their
-    // BVH bounds would be stale).
+    // Area lights — full set goes through both BSDF-hit emissive lookup AND
+    // the NEE / light-BVH path. Animated lights get their world triangle and
+    // BVH leaf AABBs refreshed each frame by the light-update + BVH-refit
+    // kernels in PoseUpdate / LightBVHRefit. Their _rest fields hold the
+    // upload-time pose so the per-frame update is `meshDelta * rest`.
     if (!areaLights.empty()) {
         std::vector<GPUAreaLight> gpuAreaLights(areaLights.size());
-        // CDF over the *static* subset only — used as a fallback when the
-        // light BVH descent fails (and as the basis for total-weight
-        // bookkeeping during NEE PDF). Total weight is the sum across static
-        // emitters; dynamic emitters don't contribute to NEE.
+        // CDF as a fallback when the light BVH descent fails. Built over the
+        // full set including animated emitters — for animated lights area
+        // (and therefore weight) is approximately preserved under rigid-body
+        // animation, so a static CDF is a reasonable approximation.
         std::vector<float> cdf(areaLights.size(), 0.0f);
-        float totalStaticWeight = 0.0f;
+        float totalWeight = 0.0f;
         for (size_t i = 0; i < areaLights.size(); i++) {
             const auto& src = areaLights[i];
             auto& dst = gpuAreaLights[i];
+            // Initialise both current and rest poses to the upload value.
+            // The light-update kernel will overwrite v0/e1/e2/normal each
+            // frame for animated lights (meshIndex >= 0); v0_rest/e1_rest/
+            // e2_rest stay frozen for use as the kernel's source operand.
             dst.v0 = src.v0;
             dst.e1 = src.e1;
             dst.e2 = src.e2;
             dst.normal = src.normal;
+            dst.v0_rest = src.v0;
+            dst.e1_rest = src.e1;
+            dst.e2_rest = src.e2;
+            dst.normal_rest = src.normal;
+            dst.meshIndex = src.meshIndex;
             dst.emission = src.emission;
             dst.area = src.area;
-            // For dynamic emitters, zero the weight so the NEE CDF / light
-            // BVH can't pick them. They still contribute via BSDF hits.
-            dst.weight = src.isStatic ? src.weight : 0.0f;
+            dst.weight = src.weight;
             dst.uv0 = src.uv0;
             dst.uv1 = src.uv1;
             dst.uv2 = src.uv2;
             dst.emissiveTex = src.emissiveTexObj;
-            totalStaticWeight += dst.weight;
-            cdf[i] = totalStaticWeight;
+            totalWeight += dst.weight;
+            cdf[i] = totalWeight;
         }
 
-        if (totalStaticWeight > 0.0f) {
-            for (auto& value : cdf) value /= totalStaticWeight;
-            m_data.areaLightTotalWeight = totalStaticWeight;
+        if (totalWeight > 0.0f) {
+            for (auto& value : cdf) value /= totalWeight;
+            m_data.areaLightTotalWeight = totalWeight;
 
             CUDA_CHECK(cudaMalloc(&m_data.d_areaLights, areaLights.size() * sizeof(GPUAreaLight)));
             CUDA_CHECK(cudaMemcpy(m_data.d_areaLights, gpuAreaLights.data(),
@@ -332,13 +340,11 @@ void DeviceScene::upload(const Scene& scene) {
             CUDA_CHECK(cudaMemcpy(m_data.d_areaLightCDF, cdf.data(),
                                   areaLights.size() * sizeof(float), cudaMemcpyHostToDevice));
 
-            // Light BVH — only over static emitters. We still feed all area-
-            // light slots, but with zeroed weights for dynamic ones. The
-            // builder will produce a tree where dynamic emitters are
-            // effectively unsamplable (zero summed weight on their leaves).
-            // For our scene this works out cleanly: the FBX has static logo
-            // geometry that's emissive AND animated piping/lights — only the
-            // static portion drives NEE.
+            // Light BVH — built over the full set with real weights. Animated
+            // lights' bounds will drift each frame; LightBVHRefit::refit()
+            // walks the leaves up to the root rebuilding AABBs to track them.
+            // Topology stays fixed (build-time partitioning is preserved) so
+            // the stochastic descent + lightIndexToSlot map remain valid.
             std::vector<AABB>  lightBounds(areaLights.size());
             std::vector<float> lightWeights(areaLights.size());
             for (size_t i = 0; i < areaLights.size(); i++) {
@@ -349,7 +355,7 @@ void DeviceScene::upload(const Scene& scene) {
                 AABB b;
                 b.expand(v0); b.expand(v1); b.expand(v2);
                 lightBounds[i]  = b;
-                lightWeights[i] = src.isStatic ? src.weight : 0.0f;
+                lightWeights[i] = src.weight;
             }
 
             LightBVH builder;
@@ -382,6 +388,35 @@ void DeviceScene::upload(const Scene& scene) {
                                   lightIndexToSlot.data(),
                                   lightIndexToSlot.size() * sizeof(uint32_t),
                                   cudaMemcpyHostToDevice));
+
+            // ── Light-BVH refit hookup (animation only) ─────────────────
+            // Wire the per-level node-index arrays into PoseUpdateData so
+            // the per-frame lightBVHRefitLaunch() can wave-front merge the
+            // BVH from leaves up to root. Nothing to do for static scenes —
+            // their bounds were finalised at build time and never go stale.
+            if (useAnimation && !lbvh.nodesByLevel.empty()) {
+                m_pose.d_areaLights        = m_data.d_areaLights;
+                m_pose.areaLightCount      = (uint32_t)areaLights.size();
+                m_pose.d_lightBVHNodes     = m_data.d_lightBVHNodes;
+                m_pose.d_orderedLightIndices = m_data.d_lightOrderedIndices;
+                m_pose.lightBVHRootIndex   = lbvh.rootIndex;
+                m_pose.lightBVHNodeCount   = (uint32_t)lbvh.nodes.size();
+                m_pose.d_lightBVHLevel.resize(lbvh.nodesByLevel.size(), nullptr);
+                m_pose.lightBVHLevelSize.resize(lbvh.nodesByLevel.size(), 0);
+                for (size_t lv = 0; lv < lbvh.nodesByLevel.size(); lv++) {
+                    const auto& level = lbvh.nodesByLevel[lv];
+                    m_pose.lightBVHLevelSize[lv] = (uint32_t)level.size();
+                    if (level.empty()) continue;
+                    CUDA_CHECK(cudaMalloc(&m_pose.d_lightBVHLevel[lv],
+                                          level.size() * sizeof(uint32_t)));
+                    CUDA_CHECK(cudaMemcpy(m_pose.d_lightBVHLevel[lv],
+                                          level.data(),
+                                          level.size() * sizeof(uint32_t),
+                                          cudaMemcpyHostToDevice));
+                }
+                LOG_INFO("Light BVH refit wired: %u nodes across %zu levels",
+                         (unsigned)lbvh.nodes.size(), lbvh.nodesByLevel.size());
+            }
         }
     }
 

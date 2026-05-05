@@ -620,6 +620,10 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
             light.normal = normalize(n);
             light.area = area;
             light.isStatic = !meshAnimated;
+            // Animated lights remember which mesh's pose-delta drives them,
+            // so the per-frame light-update kernel can refresh their world
+            // triangle. Static lights keep meshIndex = -1 and stay frozen.
+            light.meshIndex = meshAnimated ? (int)mi : -1;
 
             if (decoded && !mesh.uvs.empty() &&
                 i0 < mesh.uvs.size() && i1 < mesh.uvs.size() && i2 < mesh.uvs.size())

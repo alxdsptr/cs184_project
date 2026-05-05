@@ -30,8 +30,15 @@ struct TriangleAreaLight {
     int materialIndex = -1;
 
     // True if the source mesh sits under a non-animated SceneNode. Static
-    // emitters get NEE direct sampling via the light BVH; dynamic emitters
-    // are excluded from the BVH (their world-space bounds change every frame)
-    // and contribute to illumination only through BSDF hits + MIS.
+    // emitters never need their world triangle / BVH bounds refreshed; the
+    // upload-time values are valid forever. Dynamic emitters get the per-
+    // frame light-update kernel applied to them in Application::
+    // advanceAnimation, then the light BVH is refit so NEE selection still
+    // uses up-to-date AABBs for stochastic descent.
     bool isStatic = true;
+
+    // Source mesh index in Scene::m_meshes. -1 = static (no per-frame update
+    // needed). Used by the light-update kernel to pick the right meshDelta
+    // when re-posing the light's world triangle each frame.
+    int meshIndex = -1;
 };

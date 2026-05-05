@@ -182,7 +182,38 @@ LightBVHData LightBVH::build(const AABB* bounds, const float* weights, uint32_t 
 
     result.rootIndex = buildRecursive(result.nodes, prims, result.orderedLightIndices,
                                       0, lightCount);
-    LOG_DEBUG("Light BVH: %u nodes, %u lights, root=%u",
-              (uint32_t)result.nodes.size(), lightCount, result.rootIndex);
+
+    // Compute depth of each node for bottom-up refit. We iterate from each
+    // leaf up to the root, recording depth as we walk — but that's O(N×depth)
+    // and needs a parent map. Easier: a single recursive DFS from root that
+    // assigns depths.
+    std::vector<int> depth(result.nodes.size(), 0);
+    {
+        struct Walk {
+            static int rec(const std::vector<LightBVHNode>& nodes, uint32_t idx,
+                           std::vector<int>& depth) {
+                const LightBVHNode& n = nodes[idx];
+                if (n.isLeaf()) {
+                    depth[idx] = 0;
+                    return 0;
+                }
+                int dL = rec(nodes, n.leftChild, depth);
+                int dR = rec(nodes, n.rightChild, depth);
+                int d  = std::max(dL, dR) + 1;
+                depth[idx] = d;
+                return d;
+            }
+        };
+        Walk::rec(result.nodes, result.rootIndex, depth);
+    }
+    int maxDepth = 0;
+    for (int d : depth) maxDepth = std::max(maxDepth, d);
+    result.nodesByLevel.assign((size_t)maxDepth + 1, {});
+    for (uint32_t i = 0; i < result.nodes.size(); i++) {
+        result.nodesByLevel[(size_t)depth[i]].push_back(i);
+    }
+
+    LOG_DEBUG("Light BVH: %u nodes, %u lights, root=%u, depth=%d",
+              (uint32_t)result.nodes.size(), lightCount, result.rootIndex, maxDepth);
     return result;
 }
