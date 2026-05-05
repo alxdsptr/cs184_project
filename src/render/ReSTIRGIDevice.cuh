@@ -196,6 +196,41 @@ __device__ inline float giEvalTargetPdf(
     return fLum * Lum * cosQ;
 }
 
+// Same evaluation as `giEvalTargetPdf` but returns the vector-valued integrand
+// F(y) = brdf · L_o · cos(θ_q) alongside the scalar p̂. Used by ReSTIR PT
+// Enhanced §6.3 for vector-valued resampling weights — accumulate
+//   w_vec = m_i · F(y_i) · W_i · |J|
+// during spatial reuse and shade with `Σ w_vec / p̂(Y)` instead of the scalar
+// estimator `brdf · radiance · cos · W`. Spatial neighbors typically carry
+// uncorrelated chroma noise, so summing the vector form averages it out.
+__device__ inline bool giEvalTargetPdfVec(
+    const ReSTIRSurface& surf,
+    const GIReservoir&   r,
+    float3& wi,
+    float& outPHat,
+    float3& outFvec)
+{
+    float r2 = 0.0f, cosQ = 0.0f, cosS = 0.0f;
+    if (!giConnect(surf.position, surf.normal, r, wi, r2, cosQ, cosS)) {
+        outPHat = 0.0f;
+        outFvec = make_float3(0, 0, 0);
+        return false;
+    }
+
+    float3 brdf = restirEvalBrdf(surf, wi);
+    float fLum  = restirLuminance(brdf);
+    float Lum   = restirLuminance(r.sampleRadiance);
+    if (fLum <= 0.0f || Lum <= 0.0f) {
+        outPHat = 0.0f;
+        outFvec = make_float3(0, 0, 0);
+        return false;
+    }
+
+    outPHat = fLum * Lum * cosQ;
+    outFvec = brdf * r.sampleRadiance * cosQ;
+    return true;
+}
+
 // Reconnection-shift Jacobian (paper Eq. 52) for reusing a sample produced
 // at q_src on dst's surface q_dst. Returns 0 when the configuration violates
 // bijectivity or would inflate the ratio outside a sane range — these
@@ -251,6 +286,16 @@ __device__ inline float giJacobian(
 // for ~mCap frames. Lin et al. §5.4 explicitly warns the resampling weight
 // must be bounded for the convergence proof of Thm A.4 to hold; clamping
 // here enforces that bound.
+// Resampling-weight clamps. Lin et al. Thm A.4 only needs w_i bounded for
+// the convergence proof; in practice the tightness affects bias/variance
+// trade-off:
+//   - Too loose (1e6+): one BSDF sample with low p_src and high luminance
+//     (caustic / grazing emitter hit) can blow up wSum and cause flash-and-
+//     decay artefacts.
+//   - Too tight (<=1e3): legitimate emitter-hit paths get clipped and the
+//     image darkens — visible in M7's 9759 small emissive triangles where
+//     pHat/pSrc legitimately reaches ~10⁴.
+// 1e4 (candidate / final W) and 1e5 (merge step) is the empirical knee.
 #ifndef RESTIR_GI_MAX_WCAND
 #define RESTIR_GI_MAX_WCAND 1.0e4f
 #endif
@@ -258,7 +303,7 @@ __device__ inline float giJacobian(
 #define RESTIR_GI_MAX_W     1.0e4f
 #endif
 #ifndef RESTIR_GI_MAX_MERGE_W
-#define RESTIR_GI_MAX_MERGE_W 1.0e6f
+#define RESTIR_GI_MAX_MERGE_W 1.0e5f
 #endif
 
 // Initial-candidate RIS finalisation. For an M-candidate canonical RIS pass
@@ -360,59 +405,26 @@ __device__ inline void gris_mergeMultiPair(
     uint32_t numPeers,
     const float* u01s)
 {
-    // Snapshot the held sample (we'll re-evaluate its MIS weight against
-    // the full peer set below).
+    // Talbot uniform MIS over (held + peers): m_i(y) = M_i / M for any y in
+    // technique i's support, where M = Mc + Σ M_peer. Trivially satisfies
+    // partition of unity Σ m_i(y) = 1, which is mandatory for unbiased
+    // estimation. (Earlier "defensive pairwise" formula here had broken
+    // partition of unity — Σ m_i collapsed to ~0.06 with N=3 peers,
+    // dimming the integrator by ~16×; advisor reviewed and confirmed.)
     GIReservoir held = dst;
     bool heldValid = (held.valid && held.pHat > 0.0f && held.W > 0.0f);
 
-    float Mc = held.M;                          // canonical confidence (|R|=1)
+    float Mc = held.M;
     float M  = Mc;
     for (uint32_t i = 0; i < numPeers; i++) M += peers[i].M;
-    float Mnon = M - Mc;
-    if (Mnon < 0.0f) Mnon = 0.0f;
     float invM = (M > 0.0f) ? (1.0f / M) : 0.0f;
 
     float wSum = 0.0f;
 
-    // ── Held term: m_dst(y_R) per Eq. 38 (defensive variant) ────────────
+    // Held canonical: m_dst = Mc/M, w_dst = m_dst · p̂(y_R) · W_R.
     if (heldValid) {
-        float pHatR = held.pHat;                // p̂(y_R) at dst's surface
-        float m_dst = invM;                     // 1/M term
-        if (Mnon > 0.0f) {
-            // Inner sum: Σ_{j∈peers} p̂(y_R) / (Mc·p̂(y_R) + Mnon·p̂_{←j}(y_R))
-            // p̂_{←j}(y_R) = p̂(y_R | evaluated at peer j's surface) ·
-            //               jacobian(peer j ← held source)
-            // Because the held sample's source IS dst, we shift to peer j
-            // by treating peer j as the destination of the reconnection.
-            float innerSum = 0.0f;
-            for (uint32_t j = 0; j < numPeers; j++) {
-                if (peerSurf[j].valid < 0.5f) continue;
-                if (!giShiftConnectable(peerSurf[j].position,
-                                         peerSurf[j].normal,
-                                         peerSurf[j].roughness,
-                                         held)) continue;
-
-                float3 wiTmp;
-                GIReservoir tmp = held;
-                float pHatAtJ = giEvalTargetPdf(peerSurf[j], tmp, wiTmp);
-                if (!(pHatAtJ > 0.0f)) continue;
-
-                // Reverse Jacobian: source = dst (held.visiblePos),
-                //                    dest   = peer j (peerSurf[j].position).
-                float jacInv = giJacobian(peerSurf[j].position,
-                                           held.visiblePos, held);
-                if (!(jacInv > 0.0f)) continue;
-
-                float c_at_R_via_j = pHatAtJ * jacInv;
-                float denom = Mc * pHatR + Mnon * c_at_R_via_j;
-                if (denom > 0.0f) {
-                    innerSum += pHatR / denom;
-                }
-            }
-            m_dst += invM * innerSum;
-        }
-        // Eq. 19 with identity shift: w_dst = m_dst · p̂(y_R) · W_dst.
-        float w_dst = m_dst * pHatR * held.W;
+        float m_dst = Mc * invM;
+        float w_dst = m_dst * held.pHat * held.W;
         if (!isfinite(w_dst) || !(w_dst > 0.0f)) {
             w_dst = 0.0f;
         } else if (w_dst > RESTIR_GI_MAX_MERGE_W) {
@@ -421,7 +433,7 @@ __device__ inline void gris_mergeMultiPair(
         if (w_dst > 0.0f) wSum += w_dst;
     }
 
-    // ── Peer terms: m_peer(y_i) per Eq. 38 (defensive variant) ──────────
+    // Peer terms: m_peer = M_peer/M, w_peer = m_peer · p̂(y_i) · W_i · |J|.
     for (uint32_t i = 0; i < numPeers; i++) {
         const GIReservoir& src = peers[i];
         if (!src.valid || src.M <= 0.0f) continue;
@@ -430,42 +442,19 @@ __device__ inline void gris_mergeMultiPair(
 
         float3 wi;
         GIReservoir tmp = src;
-        float pHatYi = giEvalTargetPdf(dstSurf, tmp, wi);   // p̂(y_i) at dst
+        float pHatYi = giEvalTargetPdf(dstSurf, tmp, wi);
         if (!(pHatYi > 0.0f)) continue;
 
         float jac = giJacobian(dstSurf.position, src.visiblePos, src);
         if (!(jac > 0.0f)) continue;
 
-        // p̂_{←i}(y_i) at dst = p̂_i(T_i^{-1}(y_i)) · |∂T_i^{-1}/∂y_i|
-        // For the reconnection shift, T_i^{-1}(y_i) puts the same sample
-        // (x_r, n_r, L_o) back at peer i's surface (where it originally
-        // came from). So p̂_i evaluated there equals the value the peer
-        // had at the time it streamed the sample, which is exactly what
-        // we'd compute as giEvalTargetPdf(peerSurf[i], src). The reverse
-        // Jacobian is 1/jac.
-        float3 wi_at_i;
-        GIReservoir tmp2 = src;
-        float pHatAtI = giEvalTargetPdf(peerSurf[i], tmp2, wi_at_i);
-        if (!(pHatAtI > 0.0f)) continue;
-        // c_{←i}(y_i) = pHatAtI / jac    (since reverse Jac is 1/jac)
-        float c_li = pHatAtI / jac;
-
-        float denom = Mc * pHatYi + Mnon * c_li;
-        if (!(denom > 0.0f)) continue;
-
-        float m_i = (Mnon * invM) * (c_li / denom);
-
-        // Eq. 19: w_i = m_i · p̂(y_i) · W_i · jac
+        float m_i = src.M * invM;
         float w_i = m_i * pHatYi * src.W * jac;
         if (!isfinite(w_i) || !(w_i > 0.0f)) continue;
-        // Same bound as the held term — a peer with an outsized W·M·jac
-        // product would otherwise hijack the destination's reservoir.
         if (w_i > RESTIR_GI_MAX_MERGE_W) w_i = RESTIR_GI_MAX_MERGE_W;
 
         wSum += w_i;
 
-        // Reservoir resampling step. Use peer-specific u01 for proper
-        // marginal probabilities under streaming RIS.
         float u = (u01s) ? u01s[i] : 0.5f;
         if (u * wSum < w_i) {
             dst.visiblePos     = dstSurf.position;
@@ -474,14 +463,14 @@ __device__ inline void gris_mergeMultiPair(
             dst.sampleNormal   = src.sampleNormal;
             dst.sampleRadiance = src.sampleRadiance;
             dst.pHat           = pHatYi;
-            gris_cHat(dst)     = pHatYi;     // becomes canonical at dst
+            gris_cHat(dst)     = pHatYi;
             dst.xrRoughness    = src.xrRoughness;
             dst.isEnv          = src.isEnv;
             dst.valid          = 1u;
         }
+        (void)peerSurf;
     }
 
-    // Update confidence sum, finalise W via Eq. 22.
     dst.M = M;
     if (dst.valid && dst.pHat > 0.0f) {
         float W = wSum / dst.pHat;
@@ -497,6 +486,121 @@ __device__ inline void gris_mergeMultiPair(
 // correlation length so cross-frame `b_k` decays geometrically).
 __device__ inline void gris_capM(GIReservoir& r, float mCap) {
     if (r.M > mCap) r.M = mCap;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ReSTIR PT Enhanced §6.3 — vector-valued spatial merge.
+//
+// Identical resampling logic to `gris_mergeMultiPair`, but additionally
+// accumulates the vector-valued resampling weight
+//     w_vec = m_i · F(y_i) · W_i · |J|     (paper §6.3, footnote 7)
+// across the held term and all peer terms, returning the sum in
+// `outShadeWeight`. The shade kernel divides by `dst.pHat` to obtain the
+// final estimator E[L] ≈ (Σ w_vec) / p̂(Y).
+//
+// Accumulation in vector form gracefully averages the chroma noise inherent
+// to ReSTIR (which selects samples by scalar luminance), at no extra ray-
+// tracing cost — the BRDF * radiance * cos terms are already evaluated for
+// the scalar pHat. The estimator is unbiased in expectation because the held
+// and peer scalar w_i values used for resampling are unchanged.
+//
+// NOT to be carried into temporal reuse — the vector sum is a per-frame
+// shading quantity. Only spatial merge writes it; shade reads it.
+// ─────────────────────────────────────────────────────────────────────────────
+__device__ inline void gris_mergeMultiPairVec(
+    GIReservoir& dst,
+    const ReSTIRSurface& dstSurf,
+    const GIReservoir* peers,
+    const ReSTIRSurface* peerSurf,
+    uint32_t numPeers,
+    const float* u01s,
+    float3& outShadeWeight)        // Σ m_i · F_vec(y_i) · W_i · |J|
+{
+    // Talbot uniform MIS — see gris_mergeMultiPair for rationale.
+    GIReservoir held = dst;
+    bool heldValid = (held.valid && held.pHat > 0.0f && held.W > 0.0f);
+
+    float Mc = held.M;
+    float M  = Mc;
+    for (uint32_t i = 0; i < numPeers; i++) M += peers[i].M;
+    float invM = (M > 0.0f) ? (1.0f / M) : 0.0f;
+
+    float wSum = 0.0f;
+    float3 wVecSum = make_float3(0, 0, 0);
+
+    if (heldValid) {
+        float m_dst = Mc * invM;
+        float3 wi_R, F_R;
+        float pHatR_eval;
+        if (giEvalTargetPdfVec(dstSurf, held, wi_R, pHatR_eval, F_R)) {
+            float w_dst = m_dst * held.pHat * held.W;
+            if (!isfinite(w_dst) || !(w_dst > 0.0f)) {
+                w_dst = 0.0f;
+            } else if (w_dst > RESTIR_GI_MAX_MERGE_W) {
+                w_dst = RESTIR_GI_MAX_MERGE_W;
+            }
+            if (w_dst > 0.0f) {
+                wSum += w_dst;
+                float vecScale = m_dst * held.W;
+                wVecSum = wVecSum + F_R * vecScale;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < numPeers; i++) {
+        const GIReservoir& src = peers[i];
+        if (!src.valid || src.M <= 0.0f) continue;
+        if (!giShiftConnectable(dstSurf.position, dstSurf.normal,
+                                 dstSurf.roughness, src)) continue;
+
+        float3 wi, F_i;
+        GIReservoir tmp = src;
+        float pHatYi;
+        if (!giEvalTargetPdfVec(dstSurf, tmp, wi, pHatYi, F_i)) continue;
+        if (!(pHatYi > 0.0f)) continue;
+
+        float jac = giJacobian(dstSurf.position, src.visiblePos, src);
+        if (!(jac > 0.0f)) continue;
+
+        float m_i = src.M * invM;
+        float w_i = m_i * pHatYi * src.W * jac;
+        if (!isfinite(w_i) || !(w_i > 0.0f)) continue;
+        if (w_i > RESTIR_GI_MAX_MERGE_W) w_i = RESTIR_GI_MAX_MERGE_W;
+
+        wSum += w_i;
+        float vecScale = m_i * src.W * jac;
+        wVecSum = wVecSum + F_i * vecScale;
+
+        float u = (u01s) ? u01s[i] : 0.5f;
+        if (u * wSum < w_i) {
+            dst.visiblePos     = dstSurf.position;
+            dst.visibleNormal  = dstSurf.normal;
+            dst.samplePos      = src.samplePos;
+            dst.sampleNormal   = src.sampleNormal;
+            dst.sampleRadiance = src.sampleRadiance;
+            dst.pHat           = pHatYi;
+            gris_cHat(dst)     = pHatYi;
+            dst.xrRoughness    = src.xrRoughness;
+            dst.isEnv          = src.isEnv;
+            dst.valid          = 1u;
+        }
+        (void)peerSurf;
+    }
+
+    dst.M = M;
+    if (dst.valid && dst.pHat > 0.0f) {
+        float W = wSum / dst.pHat;
+        if (W > RESTIR_GI_MAX_W) W = RESTIR_GI_MAX_W;
+        if (!isfinite(W)) W = 0.0f;
+        dst.W = W;
+    } else {
+        dst.W = 0.0f;
+    }
+
+    if (!isfinite(wVecSum.x) || !isfinite(wVecSum.y) || !isfinite(wVecSum.z)) {
+        wVecSum = make_float3(0, 0, 0);
+    }
+    outShadeWeight = wVecSum;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

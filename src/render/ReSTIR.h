@@ -175,7 +175,7 @@ private:
     ReSTIRBuffers m_buffers;
     uint32_t m_numCandidates = 8;     // M initial candidates per pixel
     uint32_t m_temporalMCap  = 20;    // Bitterli's cap = 20 * M_initial
-    uint32_t m_motionMCap    = 5;     // applied while camera is moving
+    uint32_t m_motionMCap    = 10;    // applied while camera is moving
     uint32_t m_numNeighbors  = 3;     // neighbors per spatial pass
     float    m_spatialRadius = 15.0f; // pixels
     bool     m_enabled       = true;

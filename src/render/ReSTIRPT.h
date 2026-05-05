@@ -46,6 +46,21 @@ struct PTBuffers {
     // as the primary-hit indirect contribution (replaces continuation
     // bounces). Same layout as GI's d_indirectOut.
     float3*         d_indirectOut       = nullptr;
+    // Vector-valued shade weights produced by the spatial pass — paper §6.3
+    // (ReSTIR PT Enhanced). Σ m_i · F(y_i) · W_i · |J| over held + peers.
+    // Shade kernel divides by reservoir.pHat to obtain the chroma-averaged
+    // estimator, replacing the scalar `brdf · L_o · cos · W` form. Lives
+    // only across spatial→shade within one frame; never written to history.
+    float3*         d_shadeWeights      = nullptr;
+    // Duplication map (paper §5, ReSTIR PT Enhanced): for each pixel, the
+    // fraction of surrounding 17×17 reservoirs that share its sample
+    // (detected by quantizing samplePos to a hash). Range [0, 1]; the
+    // temporal pass on the *next* frame uses the prev-frame value at the
+    // backprojected pixel to scale cCap = lerp(cDefault, cMin, D^α).
+    // Ping-pong with d_duplicationPrev: curr is written after this frame's
+    // spatial pass and consumed by next frame's temporal pass.
+    float*          d_duplicationCurr   = nullptr;
+    float*          d_duplicationPrev   = nullptr;
 
     uint32_t width      = 0;
     uint32_t height     = 0;
@@ -99,7 +114,20 @@ void launchReSTIRPTShade(
     uint32_t               width,
     uint32_t               height);
 
-// Host-side management of the ReSTIR PT buffer set.
+// ── Paired spatial reuse texture (paper §3, ReSTIR PT Enhanced) ──
+// A reuse texture holds, per pixel, the (dx, dy) offset to its paired
+// neighbor. The texture is self-inverting: A links to B iff B links to A,
+// so when A merges B's reservoir, B can merge A's the same frame for free.
+//
+// We generate `kPTReuseTexCount` textures of different sizes (paper recommends
+// near-coprime sizes to break correlation when tiled across the frame). Each
+// frame randomly applies flip/mirror/transpose/offset transforms so the same
+// physical neighbor doesn't pair every frame.
+struct PTReuseTexture {
+    int2*    d_offsets   = nullptr;   // size * size offsets (dx, dy)
+    uint32_t size        = 0;          // square edge in pixels
+};
+
 class ReSTIRPTContext {
 public:
     void init(uint32_t width, uint32_t height);
@@ -139,8 +167,14 @@ public:
     uint32_t numCandidates() const { return m_numCandidates; }
     bool     enabled()       const { return m_enabled; }
 
+    // Paired spatial reuse — number of permutation textures (one per
+    // spatial neighbor slot). Different sizes minimise period beats.
+    static constexpr uint32_t kPTReuseTexCount = 3;
+
 private:
     PTBuffers m_buffers;
+    PTReuseTexture m_reuseTex[kPTReuseTexCount];   // §3 paired reuse
+    bool           m_reuseTexBuilt = false;
     // Knob tuning notes (ground out empirically vs. ground-truth path traced
     // reference on the bundled assets; same defaults as ReSTIR GI plus an
     // extra pathLength=4 — beyond ~4 bounces from x_r the additional variance
@@ -153,7 +187,10 @@ private:
     // stay interactive, large enough that initial RIS gives noticeable
     // variance reduction over the M=1 ReSTIR-GI-style baseline).
     uint32_t m_temporalMCap  = 20;
-    uint32_t m_motionMCap    = 5;     // applied while camera is moving
+    // motion mCap = static / 2: 5 was too aggressive and caused per-frame
+    // noise jumps as reservoirs reset. 10 keeps disocclusion responsive
+    // while letting motion-stable regions accumulate ~10 frames of history.
+    uint32_t m_motionMCap    = 10;    // applied while camera is moving
     uint32_t m_spatialMCap   = 500;
     uint32_t m_numNeighbors  = 3;
     float    m_spatialRadius = 20.0f;

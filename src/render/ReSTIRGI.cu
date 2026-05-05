@@ -654,8 +654,15 @@ __global__ void kReSTIRGI_Shade(
         // tighter cap bounds the per-frame indirect contribution, so a
         // bad reservoir that survives ~mCap frames in history can't
         // brighten the running accumulator beyond the cap.
+        // Per-frame firefly clamp on the final estimator. Set to 50 lum to
+        // bound runaway samples (paper §5.4 / Thm A.4) without darkening the
+        // image: the upstream RIS-weight + NEE-source clamps already cap the
+        // typical contribution, and 50 lum is well above the brightest
+        // physical indirect bounce in normal scenes (1.0 ≈ matte white at
+        // full sun). Earlier we used 8 here, which was a defensive over-
+        // tightening that visibly desaturated/darkened ReSTIR GI output.
         float lum = restirLuminance(L);
-        const float clampMax = 8.0f;
+        const float clampMax = 50.0f;
         if (lum > clampMax) L = L * (clampMax / lum);
         if (isnan(L.x) || isnan(L.y) || isnan(L.z) ||
             isinf(L.x) || isinf(L.y) || isinf(L.z)) L = make_float3(0,0,0);

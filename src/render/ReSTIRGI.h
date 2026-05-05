@@ -161,7 +161,7 @@ private:
     uint32_t m_temporalMCap  = 20;    // Bitterli/Lin-style cap on history.
                                        // Lower (~5) is auto-applied while the
                                        // camera is moving; see runFrame().
-    uint32_t m_motionMCap    = 5;     // applied while camera is moving
+    uint32_t m_motionMCap    = 10;    // applied while camera is moving
     uint32_t m_spatialMCap   = 500;   // higher cap once spatially fused
     uint32_t m_numNeighbors  = 0;     // spatial reuse off by default
                                        // (combined with temporal reuse it
