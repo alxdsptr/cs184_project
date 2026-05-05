@@ -1840,6 +1840,12 @@ extern "C" __global__ void __raygen__path_trace_split()
         // clamps `max3(combinedRadiance) <= DLSSRRBrightnessClampK` (~10).
         // We do the same as a max-channel clamp instead of per-channel —
         // per-channel clamping shifts hue on saturated colors.
+        //
+        // M7 with --emissive-target 5 still produces visible streak
+        // artifacts during continuous motion regardless of the clamp
+        // value (5–10 tested). Root cause is M7's 9759 sub-pixel emissive
+        // triangles aliasing during motion faster than RR's history can
+        // resolve, not a clamp tuning. Bistro motion is clean at 10.
         const float kRRBrightnessClamp = 10.0f;
         float maxC = fmaxf(c.x, fmaxf(c.y, c.z));
         if (maxC > kRRBrightnessClamp) {
