@@ -965,7 +965,10 @@ __global__ void pathTraceKernelSplit(
         a4.x = (unsigned char)(albTexel.x * 255.0f + 0.5f);
         a4.y = (unsigned char)(albTexel.y * 255.0f + 0.5f);
         a4.z = (unsigned char)(albTexel.z * 255.0f + 0.5f);
-        a4.w = 255;
+        // Alpha = surface-valid mask. 0 on primary-miss (sky) pixels so the
+        // composite shader can suppress NRD's stale OUT_SPEC values there;
+        // see composite_tonemap.frag.
+        a4.w = gbufferWritten ? 255 : 0;
         surf2Dwrite<uchar4>(a4, surfaces.albedo, x * 4, y);
     }
     if (surfaces.emissive) {

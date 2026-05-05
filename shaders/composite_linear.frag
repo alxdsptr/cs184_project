@@ -14,10 +14,14 @@ layout(set = 0, binding = 3) uniform sampler2D uEmis;
 void main() {
     vec3 diff = texture(uDiff, vUV).rgb;   // demodulated
     vec3 spec = texture(uSpec, vUV).rgb;
-    vec3 alb  = texture(uAlb,  vUV).rgb;
+    vec4 alb4 = texture(uAlb,  vUV);       // .a = surface-valid mask (0 for sky)
+    vec3 alb  = alb4.rgb;
     vec3 emis = texture(uEmis, vUV).rgb;
 
-    vec3 hdr = diff * alb + spec + emis;
+    // alb.a masks NRD's diff/spec outputs on sky pixels — see
+    // composite_tonemap.frag for the longer rationale. Emissive bypasses NRD
+    // and is added unmasked.
+    vec3 hdr = (diff * alb + spec) * alb4.a + emis;
 
     // No tonemap, no gamma — output linear HDR directly.
     fragColor = vec4(hdr, 1.0);

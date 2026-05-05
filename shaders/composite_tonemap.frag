@@ -43,11 +43,18 @@ vec3 linearToSRGB(vec3 c) {
 void main() {
     vec3 diff = texture(uDiff, vUV).rgb;   // demodulated
     vec3 spec = texture(uSpec, vUV).rgb;
-    vec3 alb  = texture(uAlb,  vUV).rgb;   // RGBA8 unorm
+    vec4 alb4 = texture(uAlb,  vUV);       // RGBA8 unorm; .a = surface-valid mask
+    vec3 alb  = alb4.rgb;
     vec3 emis = texture(uEmis, vUV).rgb;
 
     // Remodulate diffuse by albedo; specular already lives in radiance space.
-    vec3 hdr = diff * alb + spec + emis;
+    // Mask both NRD outputs by alb.a (kernel writes 0 for sky pixels, 1 for
+    // primary-hit pixels). NRD's RELAX leaves OUT_SPEC populated with stale
+    // prev-frame values at sky pixels (some internal stage doesn't honor
+    // viewZ > denoisingRange), which would otherwise produce visible ghost
+    // trails on the env when the camera moves. Emissive is added unmasked
+    // because the kernel writes envColor freshly for sky pixels every frame.
+    vec3 hdr = (diff * alb + spec) * alb4.a + emis;
 
     // Exposure.
     hdr *= pc.exposure;

@@ -1820,7 +1820,11 @@ extern "C" __global__ void __raygen__path_trace_split()
                 dA.x = fminf(dA.x, 1.0f); dA.y = fminf(dA.y, 1.0f); dA.z = fminf(dA.z, 1.0f);
             }
         }
-        uint32_t packed = packRGBA8(dA.x, dA.y, dA.z, 1.0f);
+        // Alpha = surface-valid mask. 0 on primary-miss (sky) pixels so the
+        // composite shader can suppress NRD's stale OUT_SPEC values there;
+        // see composite_tonemap.frag.
+        float aMask = gbufferWritten ? 1.0f : 0.0f;
+        uint32_t packed = packRGBA8(dA.x, dA.y, dA.z, aMask);
         surf2Dwrite<uint32_t>(packed, params.splitAlbedo, x * 4, y);
     }
     if (params.splitEmissive) {
