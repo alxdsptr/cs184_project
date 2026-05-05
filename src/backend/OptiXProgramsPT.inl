@@ -358,7 +358,18 @@ extern "C" __global__ void __raygen__restir_pt_init_candidates()
     surf.valid       = 1.0f;
     surf.specProb    = pt_optix::ptComputeSpecProb(hN, surf.viewDir, hAlbedo, hMetallic);
 
-    float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hPos);
+    float3 hPosPrev = hPos;
+    if (scene.d_positionsPrev) {
+        uint32_t triIdx = rp.primIdx;
+        uint32_t i0 = scene.d_indices[triIdx * 3 + 0];
+        uint32_t i1 = scene.d_indices[triIdx * 3 + 1];
+        uint32_t i2 = scene.d_indices[triIdx * 3 + 2];
+        float bU = rp.baryU, bV = rp.baryV, bW = 1.0f - bU - bV;
+        hPosPrev = scene.d_positionsPrev[i0] * bW
+                 + scene.d_positionsPrev[i1] * bU
+                 + scene.d_positionsPrev[i2] * bV;
+    }
+    float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hPosPrev);
     surf.prevPixel  = make_float2((clipPrev.x + 1.0f) * 0.5f * (float)params.width,
                                    (1.0f - clipPrev.y) * 0.5f * (float)params.height);
 

@@ -99,6 +99,20 @@ def parse_args() -> argparse.Namespace:
                    help="Cap output framerate. Pass 0 to disable the cap. Default 30.")
     p.add_argument("--verbose", action="store_true",
                    help="Stream pathtracer stdout/stderr instead of swallowing it")
+
+    # Animation playback (FBX scenes whose authored clip should drive
+    # mesh motion, e.g. MEASURE_SEVEN_COLORED_LIGHTS). Forwards
+    # `--play-anim --anim-fps <fps> --anim-start <t0>` to pathtracer so
+    # each replayed pose advances the animation by 1/anim-fps seconds.
+    # The replay's recorded duration controls the camera path; anim-fps
+    # controls how fast the *meshes* move. Set them equal for "1 sec of
+    # camera = 1 sec of animation".
+    p.add_argument("--play-anim", action="store_true",
+                   help="Forward --play-anim to pathtracer (FBX animation playback).")
+    p.add_argument("--anim-fps", type=float, default=30.0,
+                   help="Animation step rate (renderer advances 1/anim-fps per pose). Default 30.")
+    p.add_argument("--anim-start", type=float, default=0.0,
+                   help="Animation start time in seconds (offset into the clip). Default 0.")
     return p.parse_args()
 
 
@@ -137,6 +151,10 @@ def main() -> int:
 
     rec_stem = rec_abs.stem
     extra_flags = shlex.split(args.flags) if args.flags else []
+    if args.play_anim:
+        extra_flags += ["--play-anim",
+                        "--anim-fps", str(args.anim_fps),
+                        "--anim-start", str(args.anim_start)]
 
     # Build the variant. For "custom" we synthesize one with no preset flags so
     # the only renderer flags come from --flags / --mode.

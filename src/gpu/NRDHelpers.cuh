@@ -74,4 +74,24 @@ __device__ __forceinline__ float2 computeMotionVectorPx(
     return make_float2(prev.x - curr.x, prev.y - curr.y);
 }
 
+// Animated-geometry overload: takes the world-space position of the same
+// shading point at the *previous* frame (computed by interpolating
+// d_positionsPrev with the current barycentrics). Reprojecting that through
+// the previous frame's view-projection matrix gives a motion vector that
+// captures both camera motion AND mesh motion.
+__device__ __forceinline__ float2 computeMotionVectorPxAnimated(
+    float3 hitPosCurr, float3 hitPosPrev,
+    const float4x4& viewProj,
+    const float4x4& prevViewProj,
+    uint32_t width, uint32_t height)
+{
+    float3 clipCurr = mat4_transformPoint(viewProj,     hitPosCurr);
+    float3 clipPrev = mat4_transformPoint(prevViewProj, hitPosPrev);
+    float2 curr = make_float2((clipCurr.x + 1.0f) * 0.5f * width,
+                              (1.0f - clipCurr.y) * 0.5f * height);
+    float2 prev = make_float2((clipPrev.x + 1.0f) * 0.5f * width,
+                              (1.0f - clipPrev.y) * 0.5f * height);
+    return make_float2(prev.x - curr.x, prev.y - curr.y);
+}
+
 } // namespace nrd_helpers

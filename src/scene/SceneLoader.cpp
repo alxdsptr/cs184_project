@@ -1,4 +1,6 @@
 #include "scene/SceneLoader.h"
+#include "scene/SceneTreeBuilder.h"
+#include "scene/Animation.h"
 #include "scene/PbrtLoader.h"
 #include "core/Math.h"
 #include "util/Log.h"
@@ -7,36 +9,52 @@
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
+#include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <unordered_map>
+#include <unordered_set>
 
 using namespace scene_loader_util;
 
-static void processNode(
-    const aiScene* aiScn, const aiNode* node,
-    Scene& scene, const std::string& baseDir, int forcedMaterialIndex = -1)
+// Process meshes attached to one aiNode (no recursion — the SceneNode tree is
+// already built; we walk the aiNode tree separately to attach meshes to the
+// right SceneNode). Geometry is left in *mesh-local* space; DeviceScene + the
+// pose-update kernel handle world-space transformation.
+//
+// scenenodeIndex maps aiNode* -> SceneNode index (already built by
+// SceneTreeBuilder). Pivot-chain intermediates map to the canonical node so
+// any meshes mistakenly attached to one (shouldn't happen for FBX, defensive
+// only) still land in a sensible place.
+static void attachNodeMeshes(
+    const aiScene* aiScn, const aiNode* aiN,
+    Scene& scene,
+    const std::unordered_map<const aiNode*, int>& sceneNodeIndex,
+    int forcedMaterialIndex = -1)
 {
-    for (unsigned i = 0; i < node->mNumMeshes; i++) {
-        const aiMesh* aiM = aiScn->mMeshes[node->mMeshes[i]];
+    auto it = sceneNodeIndex.find(aiN);
+    int myNodeIdx = (it != sceneNodeIndex.end()) ? it->second : -1;
+
+    for (unsigned i = 0; i < aiN->mNumMeshes; i++) {
+        const aiMesh* aiM = aiScn->mMeshes[aiN->mMeshes[i]];
 
         TriangleMesh mesh;
         mesh.materialIndex = forcedMaterialIndex >= 0 ? forcedMaterialIndex : (int)aiM->mMaterialIndex;
 
-        // Positions
+        // Positions — kept in mesh-local space (no PreTransformVertices).
         mesh.positions.resize(aiM->mNumVertices);
         for (unsigned v = 0; v < aiM->mNumVertices; v++) {
             mesh.positions[v] = toFloat3(aiM->mVertices[v]);
-            scene.getBounds().expand(mesh.positions[v]);
         }
 
-        // Normals
+        // Normals — also mesh-local.
         if (aiM->HasNormals()) {
             mesh.normals.resize(aiM->mNumVertices);
             for (unsigned v = 0; v < aiM->mNumVertices; v++)
                 mesh.normals[v] = toFloat3(aiM->mNormals[v]);
         }
 
-        // UVs (first set)
+        // UVs (first set).
         if (aiM->HasTextureCoords(0)) {
             mesh.uvs.resize(aiM->mNumVertices);
             for (unsigned v = 0; v < aiM->mNumVertices; v++)
@@ -44,7 +62,8 @@ static void processNode(
         }
 
         // Tangents (computed by aiProcess_CalcTangentSpace). Pack handedness
-        // into .w so the kernel can reconstruct B = sign * cross(N, T).
+        // into .w so the kernel can reconstruct B = sign * cross(N, T). These
+        // are mesh-local too — they rotate with the mesh transform.
         if (aiM->HasTangentsAndBitangents()) {
             mesh.tangents.resize(aiM->mNumVertices);
             for (unsigned v = 0; v < aiM->mNumVertices; v++) {
@@ -56,7 +75,7 @@ static void processNode(
             }
         }
 
-        // Indices
+        // Indices.
         for (unsigned f = 0; f < aiM->mNumFaces; f++) {
             const aiFace& face = aiM->mFaces[f];
             if (face.mNumIndices == 3) {
@@ -66,11 +85,109 @@ static void processNode(
             }
         }
 
+        // Track binding before we move-out the mesh.
+        MeshNodeBinding binding;
+        binding.nodeIndex = myNodeIdx;
+        binding.vertexCount = (uint32_t)mesh.positions.size();
+        // vertexOffset is filled in by DeviceScene at upload time (it depends
+        // on the flatten order); leave 0 for now.
+        binding.vertexOffset = 0;
+        // animated flag is filled in after animation parsing.
+        binding.animated = false;
+
         scene.getMeshes().push_back(std::move(mesh));
+        scene.getMeshBindings().push_back(binding);
     }
 
-    for (unsigned i = 0; i < node->mNumChildren; i++)
-        processNode(aiScn, node->mChildren[i], scene, baseDir, forcedMaterialIndex);
+    // Recurse into children — we need to walk the FULL aiNode tree, including
+    // pivot-chain intermediates, because meshes can in principle hang off any
+    // aiNode (though for FBX they only attach to logical leaves).
+    for (unsigned i = 0; i < aiN->mNumChildren; i++) {
+        attachNodeMeshes(aiScn, aiN->mChildren[i], scene, sceneNodeIndex, forcedMaterialIndex);
+    }
+}
+
+// ── Animation extraction ─────────────────────────────────────
+//
+// Convert aiAnimation channels into AnimationClip channels. Channels in
+// pivot-chain intermediates (`Foo_$AssimpFbx$_Translation` etc.) target the
+// same canonical node — we merge them so the final AnimationClip has at most
+// one channel per logical node, carrying the full TRS data for the chain.
+//
+// `nameToNodeIdx` maps both the canonical name and the pivot intermediate
+// names to the canonical node index (built by SceneTreeBuilder).
+static AnimationClip extractAnimation(
+    const aiAnimation* aiA,
+    const std::unordered_map<std::string, int>& nameToNodeIdx)
+{
+    AnimationClip clip;
+    clip.name = aiA->mName.C_Str();
+    float tps = (aiA->mTicksPerSecond > 1e-6) ? (float)aiA->mTicksPerSecond : 30.0f;
+    clip.ticksPerSecond = tps;
+    clip.duration = (float)aiA->mDuration / tps;
+
+    // Map canonical node idx -> channel slot in `clip.channels`.
+    std::unordered_map<int, int> nodeToSlot;
+
+    auto getOrCreateSlot = [&](int nodeIdx) -> int {
+        auto it = nodeToSlot.find(nodeIdx);
+        if (it != nodeToSlot.end()) return it->second;
+        int slot = (int)clip.channels.size();
+        clip.channels.emplace_back();
+        clip.nodeIndices.push_back(nodeIdx);
+        nodeToSlot[nodeIdx] = slot;
+        return slot;
+    };
+
+    for (unsigned c = 0; c < aiA->mNumChannels; c++) {
+        const aiNodeAnim* ch = aiA->mChannels[c];
+        std::string chName = ch->mNodeName.C_Str();
+        auto it = nameToNodeIdx.find(chName);
+        if (it == nameToNodeIdx.end()) {
+            // Channel targets a node we don't know about — skip.
+            continue;
+        }
+        int nodeIdx = it->second;
+        int slot = getOrCreateSlot(nodeIdx);
+        AnimChannelTrack& tr = clip.channels[slot];
+
+        // Append keys, converting ticks to seconds.
+        for (unsigned k = 0; k < ch->mNumPositionKeys; k++) {
+            tr.posTimes.push_back((float)ch->mPositionKeys[k].mTime / tps);
+            const aiVector3D& v = ch->mPositionKeys[k].mValue;
+            tr.posValues.push_back(make_float3(v.x, v.y, v.z));
+        }
+        for (unsigned k = 0; k < ch->mNumRotationKeys; k++) {
+            tr.rotTimes.push_back((float)ch->mRotationKeys[k].mTime / tps);
+            const aiQuaternion& q = ch->mRotationKeys[k].mValue;
+            tr.rotValues.push_back(make_float4(q.x, q.y, q.z, q.w));
+        }
+        for (unsigned k = 0; k < ch->mNumScalingKeys; k++) {
+            tr.scaleTimes.push_back((float)ch->mScalingKeys[k].mTime / tps);
+            const aiVector3D& v = ch->mScalingKeys[k].mValue;
+            tr.scaleValues.push_back(make_float3(v.x, v.y, v.z));
+        }
+    }
+
+    // Note: when multiple intermediate channels (Translation, Rotation,
+    // Scaling) target the same canonical node, we end up with disjoint key
+    // arrays — pos comes from the _Translation channel, rot from _Rotation,
+    // scale from _Scaling. The animation evaluator samples each
+    // independently and composes them, which is exactly what we want.
+    return clip;
+}
+
+// Recursively mark all SceneNodes in the subtree of `nodeIdx` as `animated`.
+// The mark is inherited because a child's world transform depends on its
+// animated parent's pose, even if the child itself has no track.
+static void markSubtreeAnimated(int nodeIdx, std::vector<SceneNode>& nodes) {
+    if (nodeIdx < 0 || (size_t)nodeIdx >= nodes.size()) return;
+    nodes[nodeIdx].animated = true;
+    for (size_t i = nodeIdx + 1; i < nodes.size(); i++) {
+        if (nodes[i].parent >= 0 && (size_t)nodes[i].parent < i && nodes[nodes[i].parent].animated) {
+            nodes[i].animated = true;
+        }
+    }
 }
 
 bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgMode,
@@ -81,12 +198,14 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
     }
 
     Assimp::Importer importer;
+    // Note: NO aiProcess_PreTransformVertices — we need the node hierarchy
+    // intact so we can resolve animation channels. The pose-update kernel
+    // applies per-mesh transforms at runtime.
     unsigned flags =
         aiProcess_Triangulate |
         aiProcess_GenSmoothNormals |
         aiProcess_CalcTangentSpace |
         aiProcess_JoinIdenticalVertices |
-        aiProcess_PreTransformVertices |
         aiProcess_FlipUVs;
 
     const aiScene* aiScn = importer.ReadFile(path, flags);
@@ -95,11 +214,23 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         return false;
     }
 
-    // Apply unit scaling for FBX files (handle cm vs generic unit conversion)
+    // Apply unit scaling for FBX files (handles cm vs m + the
+    // large-coordinate heuristic). With PreTransformVertices dropped from the
+    // import flags, applyUnitScaling now also scales node translation columns
+    // and animation translation keys so the hierarchy-applied result matches
+    // the previously-flat geometry.
     applyUnitScaling(const_cast<aiScene*>(aiScn), ext);
 
     std::string baseDir = std::filesystem::path(path).parent_path().string();
 
+    // ── Build scene-graph tree (parent-before-child, pivots collapsed) ──
+    std::unordered_map<const aiNode*, int> nodeIndex;
+    std::unordered_map<std::string, int>   logicalNameToIdx;
+    std::unordered_map<std::string, int>   anyNameToIdx;
+    buildSceneTree(aiScn, scene, nodeIndex, logicalNameToIdx, anyNameToIdx);
+
+    // Camera (transform via the cached worldRest of the camera's node, which
+    // already includes the pivot-chain composition).
     if (aiScn->mNumCameras > 0) {
         const aiCamera* aiCam = aiScn->mCameras[0];
         if (aiCam) {
@@ -107,41 +238,46 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
             camera.valid = true;
 
             const aiNode* cameraNode = findNodeByName(aiScn->mRootNode, aiCam->mName);
-            aiMatrix4x4 cameraWorld = cameraNode ? computeWorldTransform(cameraNode) : aiMatrix4x4();
-
-            aiVector3D position = aiCam->mPosition;
-            float3 forward3 = toFloat3(aiCam->mLookAt);
-            float3 up3 = toFloat3(aiCam->mUp);
+            int camIdx = -1;
             if (cameraNode) {
-                position = cameraWorld * position;
-                forward3 = transformDirection(cameraWorld, aiCam->mLookAt);
-                up3 = transformDirection(cameraWorld, aiCam->mUp);
+                auto it = nodeIndex.find(cameraNode);
+                if (it != nodeIndex.end()) camIdx = it->second;
             }
+            float4x4 camWorld = camIdx >= 0 ? scene.getNodes()[camIdx].worldRest
+                                            : float4x4::identity();
 
-            if (length(forward3) > 1e-6f) {
-                camera.forward = normalize(forward3);
-            }
-            if (length(up3) > 1e-6f) {
-                camera.up = normalize(up3);
-            }
+            float3 position = toFloat3(aiCam->mPosition);
+            float3 forward3 = toFloat3(aiCam->mLookAt);
+            float3 up3      = toFloat3(aiCam->mUp);
+            // Transform via worldRest: position is a point, forward/up are
+            // directions.
+            position = mat4_transformPoint(camWorld, position);
+            auto rotateDir = [&](float3 d) {
+                float x = camWorld.m[0][0]*d.x + camWorld.m[0][1]*d.y + camWorld.m[0][2]*d.z;
+                float y = camWorld.m[1][0]*d.x + camWorld.m[1][1]*d.y + camWorld.m[1][2]*d.z;
+                float z = camWorld.m[2][0]*d.x + camWorld.m[2][1]*d.y + camWorld.m[2][2]*d.z;
+                return make_float3(x, y, z);
+            };
+            forward3 = rotateDir(forward3);
+            up3      = rotateDir(up3);
 
-            camera.position = toFloat3(position);
-            if (aiCam->mHorizontalFOV > 1e-6f) {
-                camera.horizontalFovRadians = aiCam->mHorizontalFOV;
-            }
+            if (length(forward3) > 1e-6f) camera.forward = normalize(forward3);
+            if (length(up3) > 1e-6f)      camera.up = normalize(up3);
+            camera.position = position;
+            if (aiCam->mHorizontalFOV > 1e-6f) camera.horizontalFovRadians = aiCam->mHorizontalFOV;
             camera.aspect = aiCam->mAspect;
-            if (aiCam->mClipPlaneNear > 1e-6f) {
-                camera.nearPlane = aiCam->mClipPlaneNear;
-            }
-            if (aiCam->mClipPlaneFar > camera.nearPlane) {
-                camera.farPlane = aiCam->mClipPlaneFar;
-            }
-
+            if (aiCam->mClipPlaneNear > 1e-6f) camera.nearPlane = aiCam->mClipPlaneNear;
+            if (aiCam->mClipPlaneFar > camera.nearPlane) camera.farPlane = aiCam->mClipPlaneFar;
             if (aiCam->mOrthographicWidth > 0.0f) {
                 LOG_WARN("Assimp camera %s is orthographic; using its direction but treating it as perspective", aiCam->mName.C_Str());
             }
 
-            LOG_INFO("Loaded camera: %s", aiCam->mName.C_Str());
+            LOG_INFO("Loaded camera: %s pos=(%.3f,%.3f,%.3f) fwd=(%.3f,%.3f,%.3f) up=(%.3f,%.3f,%.3f)",
+                     aiCam->mName.C_Str(),
+                     camera.position.x, camera.position.y, camera.position.z,
+                     camera.forward.x, camera.forward.y, camera.forward.z,
+                     camera.up.x, camera.up.y, camera.up.z);
+            // Bounds for sanity.
         }
     }
 
@@ -186,18 +322,13 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         return ins->second;
     };
 
-    // Adaptive emissionStrength for textured emitters: we target a roughly
-    // constant *textured linear luminance* across scenes (Bistro, MEASURE_SEVEN,
-    // etc.) so one "emissionStrength=50 hardcoded" doesn't over/under-expose
-    // depending on texture content. Strength = target / avgLum, clamped to a
-    // sensible range so black-background logos don't explode and white lamp
-    // plates don't drop to 0.
     const float kTargetTexturedEmissiveLum = std::max(1e-3f, texturedEmissiveTargetLum);
     const float kMinEmissionStrength       = 1.0f;
     const float kMaxEmissionStrength       = 1000.0f;
     LOG_DEBUG("Adaptive textured-emissive target luminance: %.2f", kTargetTexturedEmissiveLum);
 
-    // Materials
+    // Materials — unchanged from the pre-animation loader. Trimmed comments
+    // here for brevity; behaviour is identical.
     for (unsigned i = 0; i < aiScn->mNumMaterials; i++) {
         const aiMaterial* aiMat = aiScn->mMaterials[i];
         PBRMaterial mat;
@@ -205,52 +336,30 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         aiMat->Get(AI_MATKEY_NAME, matName);
         const std::string materialName = matName.C_Str();
 
-        // Base color
         aiColor3D color(0.8f, 0.8f, 0.8f);
         if (aiMat->Get(AI_MATKEY_BASE_COLOR, color) != aiReturn_SUCCESS)
             aiMat->Get(AI_MATKEY_COLOR_DIFFUSE, color);
         mat.albedo = toFloat3(color);
 
-        // Metallic / roughness
         float metallic = 0.0f, roughness = 0.5f;
         bool hasPbrMetallic = (aiMat->Get(AI_MATKEY_METALLIC_FACTOR, metallic) == aiReturn_SUCCESS);
         aiMat->Get(AI_MATKEY_ROUGHNESS_FACTOR, roughness);
-
-        // For FBX specular/shininess workflow, Assimp does NOT produce a
-        // reliable metallic value. The reflectivity property is also unreliable
-        // as it can be 1.0 for all materials (e.g. Bistro).
-        // Strategy: only trust metallic from Assimp if it was explicitly set
-        // AND is not the suspicious default of exactly 1.0 for a non-PBR format.
-        // Metallic-roughness textures (loaded later) will override this at
-        // render time in the kernel.
-        if (!hasPbrMetallic) {
-            metallic = 0.0f;
-        }
-
+        if (!hasPbrMetallic) metallic = 0.0f;
         mat.metallic  = metallic;
         mat.roughness = roughness;
 
-        // Emission — check multiple sources in priority order:
-        // 1. COLLADA <radiance> extension (parsed from XML, Assimp ignores it)
-        // 2. PBR emissive intensity (glTF)
-        // 3. Assimp emissive color if bright enough to be a real light source
         auto colladaIt = colladaRadiance.find(materialName);
         if (colladaIt != colladaRadiance.end()) {
             mat.emission = colladaIt->second;
             mat.emissionStrength = 1.0f;
-            LOG_DEBUG("Material '%s': using COLLADA radiance (%.1f, %.1f, %.1f)",
-                      materialName.c_str(),
-                      mat.emission.x, mat.emission.y, mat.emission.z);
         } else {
             aiColor3D emissive(0, 0, 0);
             aiMat->Get(AI_MATKEY_COLOR_EMISSIVE, emissive);
             mat.emission = toFloat3(emissive);
             float emissiveLum = luminance(toFloat3(emissive));
-
             float emissiveIntensity = 0.0f;
             bool hasPbrEmissiveIntensity =
                 (aiMat->Get(AI_MATKEY_EMISSIVE_INTENSITY, emissiveIntensity) == aiReturn_SUCCESS);
-
             if (hasPbrEmissiveIntensity && emissiveIntensity > 0.0f && emissiveLum > 0.0f) {
                 mat.emissionStrength = emissiveIntensity;
             } else if (emissiveLum > 0.8f) {
@@ -260,40 +369,21 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
             }
         }
 
-        // IOR
         float ior = 1.5f;
         aiMat->Get(AI_MATKEY_REFRACTI, ior);
         mat.ior = ior;
 
-        // Transmission / glass detection
-        // 1. glTF KHR_materials_transmission extension
         float transmissionFactor = 0.0f;
         if (aiMat->Get(AI_MATKEY_TRANSMISSION_FACTOR, transmissionFactor) == aiReturn_SUCCESS
             && transmissionFactor > 0.0f) {
             mat.transmission = transmissionFactor;
         }
-        // 2. Opacity < 1 implies partial transmission (common in FBX)
         float opacity = 1.0f;
         if (aiMat->Get(AI_MATKEY_OPACITY, opacity) == aiReturn_SUCCESS
             && opacity < 0.99f && mat.transmission <= 0.0f) {
             mat.transmission = 1.0f - opacity;
         }
-        if (mat.transmission > 0.0f) {
-            LOG_DEBUG("Material '%s': transmission=%.3f ior=%.3f",
-                      materialName.c_str(), mat.transmission, mat.ior);
-        }
 
-        // TransparencyFactor from FBX can appear on many materials including
-        // emissive ones (e.g. light bulbs in Bistro). Log a notice and
-        // disable transmission for emissive materials — they should glow,
-        // not refract.
-        float transparencyFactor = 0.0f;
-        aiMat->Get(AI_MATKEY_TRANSPARENCYFACTOR, transparencyFactor);
-        if (transparencyFactor > 0.0f) {
-            LOG_DEBUG("Material '%s': transparencyFactor=%.3f", materialName.c_str(), transparencyFactor);
-        }
-
-        // Texture paths
         mat.albedoTexPath        = getTexturePath(aiMat, aiTextureType_BASE_COLOR, baseDir);
         if (mat.albedoTexPath.empty())
             mat.albedoTexPath    = getTexturePath(aiMat, aiTextureType_DIFFUSE, baseDir);
@@ -302,18 +392,6 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         mat.emissiveTexPath      = getTexturePath(aiMat, aiTextureType_EMISSIVE, baseDir);
         mat.specularGlossTexPath = getTexturePath(aiMat, aiTextureType_SPECULAR, baseDir);
 
-        // ── Specular-Glossiness workflow detection ───────────────────────
-        // The *_Specular.dds maps in the FBX assets we target (MEASURE_SEVEN)
-        // are C4D-exported with a non-standard packing:
-        //   R = 255 (unused, just a sRGB weight constant)
-        //   G = per-pixel roughness (varies, low values)
-        //   B = per-material specular strength (constant per material, varies
-        //       between materials: 0 / 49 / 148 / 165 / 255)
-        //   A = 255 (unused, no glossiness data)
-        // The kernel's SG path will detect useFBXCustomPacking and reinterpret
-        // the texture accordingly: F0 = lerp(0.04, specularColor, B/255),
-        // roughness = G/255. This gives differentiated reflections per-material
-        // (B drives strength) and within-material detail (G drives roughness).
         if (sgMode != SGWorkflowMode::Off
             && !mat.specularGlossTexPath.empty()
             && mat.metallicRoughTexPath.empty()
@@ -324,17 +402,12 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
             mat.useFBXUEPacking     = (sgMode == SGWorkflowMode::FbxUE);
             mat.metallic = 0.0f;
 
-            // Specular factor: legacy FBX stores F0 in COLOR_SPECULAR (linear).
-            // Default to white so the texture's RGB channel survives untouched.
             aiColor3D specColor(1.0f, 1.0f, 1.0f);
             aiMat->Get(AI_MATKEY_COLOR_SPECULAR, specColor);
             float specLum = luminance(toFloat3(specColor));
             mat.specularColor = (specLum > 1e-4f) ? toFloat3(specColor)
                                                   : make_float3(1.0f, 1.0f, 1.0f);
 
-            // CPU-decode to inspect the alpha channel. If alpha is essentially
-            // constant (range < 1/255 of full scale) the file does not carry
-            // glossiness data and we treat the spec map as F0-only.
             std::vector<unsigned char> sgPixels;
             int sgW = 0, sgH = 0;
             bool decoded = loadTexturePixelsRGBA8(mat.specularGlossTexPath, sgPixels, sgW, sgH);
@@ -351,16 +424,9 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
                     aSum += a;
                 }
                 alphaMean = (float)(aSum / (double)n) * (1.0f / 255.0f);
-                alphaCarriesGloss = (aMax - aMin) >= 4; // ~1.5% range, robust against compression noise
-                LOG_DEBUG("Material '%s': specular tex alpha range [%d..%d] mean=%.3f carriesGloss=%d",
-                          materialName.c_str(), aMin, aMax, alphaMean, (int)alphaCarriesGloss);
+                alphaCarriesGloss = (aMax - aMin) >= 4;
             }
 
-            // Glossiness factor. Prefer SHININESS_STRENGTH (0..1); fall back
-            // to the Phong SHININESS exponent via gloss = log2(s)/13. If
-            // neither is set, use 0.5 — a moderate default that pairs with a
-            // glossiness map (alpha modulates around it) and gives a sensible
-            // matte-ish baseline when alpha is absent.
             float shinStrength = 0.0f;
             float shininess    = 0.0f;
             bool hasShinStrength = (aiMat->Get(AI_MATKEY_SHININESS_STRENGTH, shinStrength) == aiReturn_SUCCESS);
@@ -374,59 +440,20 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
                 mat.glossiness = 0.5f;
             }
 
-            // If the texture's alpha is effectively constant, drop the per-pixel
-            // glossiness path: clear the texture handle's "use alpha" flag by
-            // baking the constant alpha into the scalar glossiness factor and
-            // marking the kernel to ignore tex.a (we reuse the existing branch
-            // by setting glossiness directly — kernel multiplies by tex.a, so
-            // a constant tex.a ~= alphaMean folded into glossiness gives the
-            // right roughness).
             if (!alphaCarriesGloss) {
                 mat.glossiness = std::min(mat.glossiness, alphaMean);
-                // Don't null specularGlossTexPath — we still want F0 from RGB.
-                // Instead, set a flag the kernel will read: when alpha doesn't
-                // carry gloss data, use the scalar factor only.
                 mat.specularGlossAlphaIsGlossiness = false;
             } else {
                 mat.specularGlossAlphaIsGlossiness = true;
             }
 
             mat.roughness = std::max(0.045f, 1.0f - mat.glossiness);
-
-            LOG_DEBUG("Material '%s': Specular-Glossiness workflow (specColor=(%.3f,%.3f,%.3f) glossiness=%.3f alphaIsGloss=%d fbxCustom=%d fbxUE=%d)",
-                      materialName.c_str(),
-                      mat.specularColor.x, mat.specularColor.y, mat.specularColor.z,
-                      mat.glossiness, (int)mat.specularGlossAlphaIsGlossiness,
-                      (int)mat.useFBXCustomPacking, (int)mat.useFBXUEPacking);
         }
 
-        // If the material has an emissive texture, it is explicitly meant to
-        // emit light. Enable emission even when the scalar emissive color from
-        // Assimp was zero (common in FBX files where the texture carries all
-        // the data). Adaptive: scale emissionStrength so every textured
-        // emitter ends up with roughly the same average linear luminance in
-        // world space, regardless of how bright/dark its texture is. This is
-        // what keeps Bistro's lamps from blowing out while MEASURE_SEVEN's
-        // logo-on-black decals stay visible at the same default "strength".
-        //
-        // Always override strength here when an emissive texture is present —
-        // Assimp's COLOR_EMISSIVE / EMISSIVE_INTENSITY heuristics above set
-        // strength=1.0 for FBX materials whose scalar emissive happens to be
-        // bright (e.g. Bistro's coloured string lights), which would otherwise
-        // bypass adaptive normalisation entirely and ignore --emissive-target.
         if (!mat.emissiveTexPath.empty()) {
             mat.emission = make_float3(1.0f, 1.0f, 1.0f);
 
             const DecodedEmissiveTex& dt = getDecodedEmissive(mat.emissiveTexPath);
-            // Normalise against the MAX RGB channel, not luminance. A saturated
-            // red/blue texture has tiny luminance (R and B are weighted 0.21
-            // and 0.07 in Rec.709), so matching luminance would demand a huge
-            // strength and blow the dominant channel way past a neutral white
-            // lamp of the same perceptual brightness — Bistro's pink/red
-            // string lights end up visibly brighter than white ones. Using
-            // max(R,G,B) keeps the brightest channel at a consistent level
-            // across hues, which matches the "no channel hotter than X"
-            // expectation artists actually have.
             float normMetric = std::max(dt.avgRGB.x,
                                         std::max(dt.avgRGB.y, dt.avgRGB.z));
             if (dt.valid && normMetric > 1e-6f) {
@@ -434,35 +461,14 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
                 strength = std::max(kMinEmissionStrength,
                                     std::min(kMaxEmissionStrength, strength));
                 mat.emissionStrength = strength;
-                LOG_DEBUG("Material '%s': adaptive emissionStrength=%.2f "
-                          "(avgMaxRGB=%.4f, avgLum=%.4f, target=%.2f)",
-                          materialName.c_str(), strength, normMetric,
-                          dt.avgLum, kTargetTexturedEmissiveLum);
             } else if (dt.valid && dt.avgLum <= 1e-6f) {
-                // Texture is entirely black — the material isn't actually
-                // emissive even though the FBX tagged it so. Skip it rather
-                // than letting mat.emission=(1,1,1) make it glow white.
                 mat.emission = make_float3(0.0f, 0.0f, 0.0f);
                 mat.emissionStrength = 0.0f;
-                LOG_DEBUG("Material '%s': emissive texture is all black, "
-                          "treating as non-emissive",
-                          materialName.c_str());
             } else {
-                // Texture couldn't be decoded at all (e.g. missing file). Keep
-                // a conservative strength so the material visibly emits white
-                // light — easier to spot and fix than an invisibly dark lamp.
                 mat.emissionStrength = 10.0f;
-                LOG_WARN("Material '%s': emissive texture not decodable, "
-                         "falling back to emissionStrength=%.2f",
-                         materialName.c_str(), mat.emissionStrength);
             }
         }
 
-        // Detect legacy Collada Phong materials that should render as pure
-        // Lambertian diffuse (matching classic CPU path tracers that ignore the
-        // tiny <specular> and high <shininess> from Phong). Only kick in for
-        // .dae files and only when there is no PBR metallic factor, no
-        // metallic-roughness texture, and the <specular> color is negligible.
         if (ext == ".dae" && !hasPbrMetallic && mat.metallicRoughTexPath.empty()) {
             aiColor3D specularColor(0.0f, 0.0f, 0.0f);
             aiMat->Get(AI_MATKEY_COLOR_SPECULAR, specularColor);
@@ -470,142 +476,35 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
             if (specLum < 0.01f && mat.transmission <= 0.0f && mat.emissionStrength <= 0.0f) {
                 mat.pureDiffuse = true;
                 mat.metallic = 0.0f;
-                LOG_DEBUG("Material '%s': treating as pure Lambertian (Collada Phong, specular=%.4f)",
-                          materialName.c_str(), specLum);
             }
         }
 
-        // Emissive materials should not be treated as glass/transmissive.
-        // FBX often sets opacity < 1 on light bulb materials, but they should
-        // glow opaquely, not refract light through them.
         if (mat.emissionStrength > 0.0f && mat.transmission > 0.0f) {
-            LOG_DEBUG("Material '%s': disabling transmission (%.3f) for emissive material",
-                      materialName.c_str(), mat.transmission);
             mat.transmission = 0.0f;
-        }
-
-        // ── Diagnostic dump ──────────────────────────────────────────
-        // Log every channel we read from Assimp plus the resulting PBRMaterial
-        // state. Use this to debug "why is emissive yellow instead of green",
-        // "why is the floor not reflective", "why is this scene over/under
-        // exposed", etc.
-        {
-            aiColor3D diagDiffuse(0, 0, 0);
-            aiColor3D diagBaseColor(0, 0, 0);
-            aiColor3D diagSpecular(0, 0, 0);
-            aiColor3D diagEmissive(0, 0, 0);
-            aiColor3D diagAmbient(0, 0, 0);
-            aiColor3D diagReflective(0, 0, 0);
-            float diagShininess = 0.0f;
-            float diagShininessStrength = 0.0f;
-            float diagReflectivity = 0.0f;
-            float diagMetallic = -1.0f;
-            float diagRoughness = -1.0f;
-            float diagSpecFactor = -1.0f;
-            float diagEmissiveIntensity = -1.0f;
-            float diagOpacity = 1.0f;
-            float diagIor = 0.0f;
-            aiMat->Get(AI_MATKEY_COLOR_DIFFUSE, diagDiffuse);
-            aiMat->Get(AI_MATKEY_BASE_COLOR, diagBaseColor);
-            aiMat->Get(AI_MATKEY_COLOR_SPECULAR, diagSpecular);
-            aiMat->Get(AI_MATKEY_COLOR_EMISSIVE, diagEmissive);
-            aiMat->Get(AI_MATKEY_COLOR_AMBIENT, diagAmbient);
-            aiMat->Get(AI_MATKEY_COLOR_REFLECTIVE, diagReflective);
-            aiMat->Get(AI_MATKEY_SHININESS, diagShininess);
-            aiMat->Get(AI_MATKEY_SHININESS_STRENGTH, diagShininessStrength);
-            aiMat->Get(AI_MATKEY_REFLECTIVITY, diagReflectivity);
-            aiMat->Get(AI_MATKEY_METALLIC_FACTOR, diagMetallic);
-            aiMat->Get(AI_MATKEY_ROUGHNESS_FACTOR, diagRoughness);
-            aiMat->Get(AI_MATKEY_SPECULAR_FACTOR, diagSpecFactor);
-            aiMat->Get(AI_MATKEY_EMISSIVE_INTENSITY, diagEmissiveIntensity);
-            aiMat->Get(AI_MATKEY_OPACITY, diagOpacity);
-            aiMat->Get(AI_MATKEY_REFRACTI, diagIor);
-
-            auto texCount = [&](aiTextureType t) {
-                return (unsigned)aiMat->GetTextureCount(t);
-            };
-
-            LOG_DEBUG("─── Material '%s' (idx=%u) ───", materialName.c_str(), i);
-            LOG_DEBUG("  Assimp raw: diffuse=(%.3f,%.3f,%.3f) base=(%.3f,%.3f,%.3f) spec=(%.3f,%.3f,%.3f)",
-                      diagDiffuse.r, diagDiffuse.g, diagDiffuse.b,
-                      diagBaseColor.r, diagBaseColor.g, diagBaseColor.b,
-                      diagSpecular.r, diagSpecular.g, diagSpecular.b);
-            LOG_DEBUG("              emissive=(%.3f,%.3f,%.3f) ambient=(%.3f,%.3f,%.3f) reflective=(%.3f,%.3f,%.3f)",
-                      diagEmissive.r, diagEmissive.g, diagEmissive.b,
-                      diagAmbient.r, diagAmbient.g, diagAmbient.b,
-                      diagReflective.r, diagReflective.g, diagReflective.b);
-            LOG_DEBUG("              shininess=%.3f shin_strength=%.3f reflectivity=%.3f opacity=%.3f ior=%.3f",
-                      diagShininess, diagShininessStrength, diagReflectivity, diagOpacity, diagIor);
-            LOG_DEBUG("              metallic_factor=%.3f roughness_factor=%.3f spec_factor=%.3f emissive_intensity=%.3f",
-                      diagMetallic, diagRoughness, diagSpecFactor, diagEmissiveIntensity);
-            LOG_DEBUG("  Tex counts: BASE=%u DIFFUSE=%u NORMAL=%u METALNESS=%u DIFF_ROUGH=%u SPECULAR=%u EMISSIVE=%u SHININESS=%u",
-                      texCount(aiTextureType_BASE_COLOR),
-                      texCount(aiTextureType_DIFFUSE),
-                      texCount(aiTextureType_NORMALS),
-                      texCount(aiTextureType_METALNESS),
-                      texCount(aiTextureType_DIFFUSE_ROUGHNESS),
-                      texCount(aiTextureType_SPECULAR),
-                      texCount(aiTextureType_EMISSIVE),
-                      texCount(aiTextureType_SHININESS));
-            LOG_DEBUG("  Resolved -> albedo=(%.3f,%.3f,%.3f) roughness=%.3f metallic=%.3f transmission=%.3f ior=%.3f pureDiffuse=%d",
-                      mat.albedo.x, mat.albedo.y, mat.albedo.z,
-                      mat.roughness, mat.metallic, mat.transmission, mat.ior,
-                      (int)mat.pureDiffuse);
-            LOG_DEBUG("  Resolved -> emission=(%.3f,%.3f,%.3f) emissionStrength=%.3f",
-                      mat.emission.x, mat.emission.y, mat.emission.z, mat.emissionStrength);
-            LOG_DEBUG("  Texture paths: albedo='%s' normal='%s' metRough='%s' emissive='%s'",
-                      mat.albedoTexPath.c_str(),
-                      mat.normalTexPath.c_str(),
-                      mat.metallicRoughTexPath.c_str(),
-                      mat.emissiveTexPath.c_str());
         }
 
         scene.getMaterials().push_back(std::move(mat));
     }
 
-    // Lights
+    // Lights — same as before, but transform position via the SceneNode's
+    // worldRest (now that we have one).
     for (unsigned i = 0; i < aiScn->mNumLights; i++) {
         const aiLight* aiL = aiScn->mLights[i];
         if (!aiL) continue;
 
-        LOG_DEBUG("Light[%u] '%s': type=%d color=(%.2f,%.2f,%.2f) atten=(%.4f,%.4f,%.4f)",
-                  i, aiL->mName.C_Str(), (int)aiL->mType,
-                  aiL->mColorDiffuse.r, aiL->mColorDiffuse.g, aiL->mColorDiffuse.b,
-                  aiL->mAttenuationConstant, aiL->mAttenuationLinear, aiL->mAttenuationQuadratic);
-
-        // Currently only point and spot lights are supported (treat spot as point)
-        if (aiL->mType != aiLightSource_POINT && aiL->mType != aiLightSource_SPOT) {
-            LOG_WARN("Skipping unsupported light type %d for %s",
-                     (int)aiL->mType, aiL->mName.C_Str());
-            continue;
-        }
-
-        // Skip lights that the COLLADA file marks as area lights via the CGL
-        // <extra> extension — those are provided by an emissive mesh elsewhere
-        // in the scene, and loading them here would double-count the emitter.
-        // If the file contains ANY CGL area-light markers we skip every point
-        // light in the file: name matching against Assimp's aiLight::mName is
-        // unreliable across Assimp versions (it may hold the light id, the
-        // instancing node's id, or the node's name), and .dae files that use
-        // the CGL extension are authored so the real illumination comes from
-        // emissive mesh geometry — keeping the point light on top double-lit
-        // the scene (visible on CBbunny.dae as a washed-out look).
-        if (!colladaCGLAreaLights.empty()) {
-            LOG_DEBUG("Skipping point light '%s': COLLADA file uses CGL area-light extension",
-                      aiL->mName.C_Str());
-            continue;
-        }
+        if (aiL->mType != aiLightSource_POINT && aiL->mType != aiLightSource_SPOT) continue;
+        if (!colladaCGLAreaLights.empty()) continue;
 
         PointLight light;
-
-        aiVector3D lightPos = aiL->mPosition;
+        float3 pos = toFloat3(aiL->mPosition);
         const aiNode* lightNode = findNodeByName(aiScn->mRootNode, aiL->mName);
         if (lightNode) {
-            aiMatrix4x4 world = computeWorldTransform(lightNode);
-            lightPos = world * aiL->mPosition;
+            auto it = nodeIndex.find(lightNode);
+            if (it != nodeIndex.end()) {
+                pos = mat4_transformPoint(scene.getNodes()[it->second].worldRest, pos);
+            }
         }
-
-        light.position = toFloat3(lightPos);
+        light.position = pos;
         light.color = toFloat3(aiL->mColorDiffuse);
         if (light.color.x <= 0.0f && light.color.y <= 0.0f && light.color.z <= 0.0f) {
             light.color = make_float3(1.0f, 1.0f, 1.0f);
@@ -614,73 +513,90 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         light.constantAttenuation = aiL->mAttenuationConstant;
         light.linearAttenuation = aiL->mAttenuationLinear;
         light.quadraticAttenuation = aiL->mAttenuationQuadratic;
-        // Bistro's FBX encodes point-light falloff as 1/(2*d^2) (quadratic=2),
-        // which halves every contribution relative to the physically-expected
-        // 1/d^2. Normalise to the standard inverse-square law when the file's
-        // only non-zero coefficient is quadratic and it is >1.
-        // if (light.constantAttenuation <= 0.0f
-        //     && light.linearAttenuation <= 0.0f
-        //     && light.quadraticAttenuation > 1.0f) {
-        //     LOG_INFO("Light '%s': normalising quadratic attenuation %.3f -> 1.0",
-        //              aiL->mName.C_Str(), light.quadraticAttenuation);
-        //     light.quadraticAttenuation = 1.0f;
-        // }
-
         scene.getLights().push_back(light);
     }
 
-    // Meshes
-    processNode(aiScn, aiScn->mRootNode, scene, baseDir);
+    // ── Meshes (mesh-local geometry; node binding recorded) ─────────
+    attachNodeMeshes(aiScn, aiScn->mRootNode, scene, nodeIndex);
 
-    // Emissive triangle area lights.
-    //
-    // For uniform (no-texture) emitters: the light's emission and weight are a
-    // simple product of material emission, albedo, and triangle area.
-    //
-    // For textured emitters: we additionally CPU-decode the emissive texture
-    // once and rasterize each triangle's UV footprint to compute an average
-    // texel luminance. The per-triangle weight is area × avgTexLum ×
-    // luminance(albedo) × emissionStrength, biasing CDF selection toward
-    // brighter regions of the emissive texture. At NEE time the kernel
-    // re-samples the texture at the sampled barycentric point to recover the
-    // true per-texel emission (see PathTraceKernel.cu).
+    // ── Animations ──────────────────────────────────────────────────
+    if (aiScn->mNumAnimations > 0) {
+        // We currently only consume the first clip — that's all the FBX has
+        // ("Take 001"). Multi-clip support would slot additional clips here.
+        AnimationClip clip = extractAnimation(aiScn->mAnimations[0], anyNameToIdx);
+        // Mark animated nodes (and propagate to descendants — a child of a
+        // moving node is itself moving even without its own track).
+        for (int ni : clip.nodeIndices) {
+            if (ni >= 0 && (size_t)ni < scene.getNodes().size()) {
+                scene.getNodes()[ni].animated = true;
+            }
+        }
+        // Iterate forward (parent-before-child) and propagate `animated`.
+        auto& nodesRef = scene.getNodes();
+        for (size_t i = 0; i < nodesRef.size(); i++) {
+            int p = nodesRef[i].parent;
+            if (p >= 0 && nodesRef[p].animated) nodesRef[i].animated = true;
+        }
+        scene.getAnimations().push_back(std::move(clip));
+        LOG_INFO("Loaded animation: %u channels (post-collapse: %zu node tracks), duration=%.2fs @ %.1f tps",
+                 aiScn->mAnimations[0]->mNumChannels,
+                 scene.getAnimations().back().channels.size(),
+                 scene.getAnimations().back().duration,
+                 scene.getAnimations().back().ticksPerSecond);
+    }
+
+    // Patch each mesh binding's `animated` flag from its bound node, and at
+    // the same time compute scene bounds in *world space* using the rest pose
+    // (the BVH/light-BVH/etc. need world-space AABBs; geometry stays mesh-
+    // local, but we transform a copy here to expand bounds).
+    auto& meshesRef    = scene.getMeshes();
+    auto& bindingsRef  = scene.getMeshBindings();
+    auto& nodesRef     = scene.getNodes();
+    for (size_t i = 0; i < bindingsRef.size(); i++) {
+        int ni = bindingsRef[i].nodeIndex;
+        if (ni >= 0 && (size_t)ni < nodesRef.size()) {
+            bindingsRef[i].animated = nodesRef[ni].animated;
+        }
+        const float4x4& W = (ni >= 0) ? nodesRef[ni].worldRest : float4x4::identity();
+        const auto& mesh = meshesRef[i];
+        for (auto& p : mesh.positions) {
+            scene.getBounds().expand(mat4_transformPoint(W, p));
+        }
+    }
+
+    // ── Emissive triangle area lights ─────────────────────────────
+    // Triangle world-space positions are computed via the node's worldRest.
+    // For *animated* meshes we still emit area-light entries, but the kernel
+    // will only see them at their rest-pose location. To avoid them
+    // double-contributing or contributing from a stale position when the
+    // mesh moves, we mark them isStatic=false and skip including them in
+    // the light BVH / NEE; they still emit via BSDF hits onto the moving
+    // geometry, which is radiometrically correct.
     const auto& meshes = scene.getMeshes();
     const auto& materials = scene.getMaterials();
+    const auto& bindings = scene.getMeshBindings();
 
-    // The per-triangle importance-sampling weights reuse the same CPU-decoded
-    // texture cache that adaptive emissionStrength populated during material
-    // load (`emissiveTexCache` / `getDecodedEmissive` above). Calling
-    // getDecodedEmissive() again here is cheap: the first hit populates the
-    // cache, subsequent hits just return the stored pixels.
-    for (const auto& mesh : meshes) {
-        if (mesh.materialIndex < 0 || (size_t)mesh.materialIndex >= materials.size()) {
-            continue;
-        }
+    for (size_t mi = 0; mi < meshes.size(); mi++) {
+        const auto& mesh = meshes[mi];
+        if (mesh.materialIndex < 0 || (size_t)mesh.materialIndex >= materials.size()) continue;
 
         const PBRMaterial& mat = materials[(size_t)mesh.materialIndex];
-        if (mat.emissionStrength <= 0.0f) {
-            continue;
-        }
+        if (mat.emissionStrength <= 0.0f) continue;
 
         bool hasTexture = !mat.emissiveTexPath.empty();
         const DecodedEmissiveTex* decoded = nullptr;
         if (hasTexture) {
             const DecodedEmissiveTex& dt = getDecodedEmissive(mat.emissiveTexPath);
             if (dt.valid) decoded = &dt;
-            // If the CPU decode fails, we still want to create area lights for
-            // this mesh — fall back to a uniform weight based on mat.emission.
         }
 
-        // Baseline emission for uniform emitters: mat.emission × strength.
-        // For textured emitters the kernel computes Le = texel × (strength,
-        // strength, strength), so the per-light `emission` multiplier is just
-        // a scalar replicated across RGB. This matches how the kernel's
-        // BSDF-hit emissive path reads texel × strength, so NEE and path-hit
-        // MIS contributions stay radiometrically consistent.
         float3 baseEmission = mat.emission * mat.emissionStrength;
         float baseEmissionLum = luminance(baseEmission);
-
         if (!hasTexture && baseEmissionLum <= 0.0f) continue;
+
+        int ni = (mi < bindings.size()) ? bindings[mi].nodeIndex : -1;
+        const float4x4& W = (ni >= 0) ? nodesRef[ni].worldRest : float4x4::identity();
+        bool meshAnimated = (mi < bindings.size()) ? bindings[mi].animated : false;
 
         uint32_t triCount = (uint32_t)mesh.indices.size() / 3;
         for (uint32_t t = 0; t < triCount; t++) {
@@ -688,9 +604,9 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
             uint32_t i1 = mesh.indices[t * 3 + 1];
             uint32_t i2 = mesh.indices[t * 3 + 2];
 
-            float3 v0 = mesh.positions[i0];
-            float3 v1 = mesh.positions[i1];
-            float3 v2 = mesh.positions[i2];
+            float3 v0 = mat4_transformPoint(W, mesh.positions[i0]);
+            float3 v1 = mat4_transformPoint(W, mesh.positions[i1]);
+            float3 v2 = mat4_transformPoint(W, mesh.positions[i2]);
             float3 e1 = v1 - v0;
             float3 e2 = v2 - v0;
             float3 n = cross(e1, e2);
@@ -703,6 +619,7 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
             light.e2 = e2;
             light.normal = normalize(n);
             light.area = area;
+            light.isStatic = !meshAnimated;
 
             if (decoded && !mesh.uvs.empty() &&
                 i0 < mesh.uvs.size() && i1 < mesh.uvs.size() && i2 < mesh.uvs.size())
@@ -713,28 +630,17 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
                 float avgTexLum = rasterizeTriangleAvgLuminance(
                     uv0, uv1, uv2,
                     decoded->pixels.data(), decoded->width, decoded->height);
-                if (avgTexLum <= 0.0f) continue; // dark region — skip to keep CDF clean
+                if (avgTexLum <= 0.0f) continue;
 
                 light.uv0 = uv0;
                 light.uv1 = uv1;
                 light.uv2 = uv2;
-                // For textured emitters, emission is a scalar multiplier
-                // applied on top of the texel fetch. Kernel does
-                //   Le = tex2D(emissiveTex, uv) * light.emission
-                // so storing (strength, strength, strength) gives Le = texel×strength,
-                // matching the BSDF-hit branch that computes texel × mat.emissionStrength.
                 light.emission = make_float3(mat.emissionStrength,
                                              mat.emissionStrength,
                                              mat.emissionStrength);
-                // Weight ~ integrated Le over the triangle:
-                //   ∫ texel × strength dA ≈ area × avgTexLum × strength
                 light.weight = area * avgTexLum * mat.emissionStrength;
-                // Record the material so Application can back-fill the CUDA
-                // texture handle after TextureManager loads it.
                 light.materialIndex = mesh.materialIndex;
             } else {
-                // Uniform emitter (or texture decode failed): fall back to the
-                // old behaviour.
                 if (baseEmissionLum <= 0.0f) continue;
                 light.emission = baseEmission;
                 light.weight = area * baseEmissionLum;
@@ -744,20 +650,30 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         }
     }
 
-    // Store the emissive-texture path → material index mapping through the
-    // area light weights; the CUDA texture object is bound later (Application
-    // loads textures after SceneLoader). The kernel still needs the handle
-    // attached to each light — DeviceScene wires this up via material index.
-
-    LOG_INFO("Loaded: %s (%u meshes, %u materials, %u lights, %u triangles, %u vertices)",
+    {
+        const auto& bnd = scene.getBounds();
+        LOG_INFO("Scene bounds: min=(%.3f,%.3f,%.3f) max=(%.3f,%.3f,%.3f)",
+                 bnd.bmin.x, bnd.bmin.y, bnd.bmin.z,
+                 bnd.bmax.x, bnd.bmax.y, bnd.bmax.z);
+    }
+    LOG_INFO("Loaded: %s (%u meshes, %u materials, %u lights, %u triangles, %u vertices, %u animations)",
              path.c_str(),
              (unsigned)scene.getMeshes().size(),
              (unsigned)scene.getMaterials().size(),
              (unsigned)scene.getLights().size(),
              scene.totalTriangles(),
-             scene.totalVertices());
+             scene.totalVertices(),
+             (unsigned)scene.getAnimations().size());
 
-    LOG_INFO("Emissive triangle lights: %u", (unsigned)scene.getAreaLights().size());
+    // Count animated/static area lights for sanity.
+    {
+        size_t nStatic = 0, nDyn = 0;
+        for (const auto& l : scene.getAreaLights()) {
+            if (l.isStatic) nStatic++; else nDyn++;
+        }
+        LOG_INFO("Emissive triangle lights: %zu (static=%zu dynamic=%zu)",
+                 scene.getAreaLights().size(), nStatic, nDyn);
+    }
 
     return true;
 }

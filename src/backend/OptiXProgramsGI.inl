@@ -264,7 +264,18 @@ extern "C" __global__ void __raygen__restir_gi_init_candidates()
         surf.valid       = 1.0f;
         surf.specProb    = gi_optix::giComputeSpecProb(N, surf.viewDir, albedo, mat.metallic);
 
-        float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hitPos);
+        float3 hitPosPrevGI = hitPos;
+        if (scene.d_positionsPrev) {
+            uint32_t triIdx2 = rp.primIdx;
+            uint32_t pi0 = scene.d_indices[triIdx2 * 3 + 0];
+            uint32_t pi1 = scene.d_indices[triIdx2 * 3 + 1];
+            uint32_t pi2 = scene.d_indices[triIdx2 * 3 + 2];
+            float bU = rp.baryU, bV = rp.baryV, bW = 1.0f - bU - bV;
+            hitPosPrevGI = scene.d_positionsPrev[pi0] * bW
+                         + scene.d_positionsPrev[pi1] * bU
+                         + scene.d_positionsPrev[pi2] * bV;
+        }
+        float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hitPosPrevGI);
         surf.prevPixel  = make_float2((clipPrev.x + 1.0f) * 0.5f * (float)params.width,
                                        (1.0f - clipPrev.y) * 0.5f * (float)params.height);
 

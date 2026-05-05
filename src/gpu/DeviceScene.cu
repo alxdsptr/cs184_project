@@ -1,70 +1,132 @@
 #include "gpu/DeviceScene.h"
 #include "scene/Scene.h"
+#include "core/Math.h"
 #include "util/CudaCheck.h"
 #include "util/Log.h"
 #include "accel/LightBVH.h"
 
+// Apply a host float4x4 to a float3 (treated as a point with implicit w=1).
+static float3 transformPos(const float4x4& M, float3 p) {
+    return mat4_transformPoint(M, p);
+}
+
+// Apply the cofactor (inverse-transpose) of M's upper-3x3 to a normal, then
+// normalize. Used to bake worldRest into rest-pose normals.
+static float3 transformNormal(const float4x4& M, float3 n) {
+    float a00 = M.m[0][0], a01 = M.m[0][1], a02 = M.m[0][2];
+    float a10 = M.m[1][0], a11 = M.m[1][1], a12 = M.m[1][2];
+    float a20 = M.m[2][0], a21 = M.m[2][1], a22 = M.m[2][2];
+    float c00 =  (a11 * a22 - a12 * a21);
+    float c01 = -(a10 * a22 - a12 * a20);
+    float c02 =  (a10 * a21 - a11 * a20);
+    float c10 = -(a01 * a22 - a02 * a21);
+    float c11 =  (a00 * a22 - a02 * a20);
+    float c12 = -(a00 * a21 - a01 * a20);
+    float c20 =  (a01 * a12 - a02 * a11);
+    float c21 = -(a00 * a12 - a02 * a10);
+    float c22 =  (a00 * a11 - a01 * a10);
+    float x = c00*n.x + c01*n.y + c02*n.z;
+    float y = c10*n.x + c11*n.y + c12*n.z;
+    float z = c20*n.x + c21*n.y + c22*n.z;
+    float L = sqrtf(x*x + y*y + z*z);
+    if (L > 1e-12f) { float inv = 1.0f/L; x *= inv; y *= inv; z *= inv; }
+    else { x = n.x; y = n.y; z = n.z; }
+    return make_float3(x, y, z);
+}
+
+// Apply cofactor of upper-3x3 to a tangent (then renormalize the .xyz part;
+// .w handedness is preserved).
+static float4 transformTangent(const float4x4& M, float4 t) {
+    // Use plain rotation (upper-3x3) for tangents; for non-uniform scale this
+    // is approximate, but FBX rigid-body keyframes here are uniform-scale.
+    float x = M.m[0][0]*t.x + M.m[0][1]*t.y + M.m[0][2]*t.z;
+    float y = M.m[1][0]*t.x + M.m[1][1]*t.y + M.m[1][2]*t.z;
+    float z = M.m[2][0]*t.x + M.m[2][1]*t.y + M.m[2][2]*t.z;
+    float L = sqrtf(x*x + y*y + z*z);
+    if (L > 1e-12f) { float inv = 1.0f/L; x *= inv; y *= inv; z *= inv; }
+    return make_float4(x, y, z, t.w);
+}
+
 void DeviceScene::upload(const Scene& scene) {
     free(); // release any prior data
 
-    const auto& meshes = scene.getMeshes();
+    const auto& meshes    = scene.getMeshes();
     const auto& materials = scene.getMaterials();
-    const auto& lights = scene.getLights();
-    const auto& areaLights = scene.getAreaLights();
+    const auto& lights    = scene.getLights();
+    const auto& areaLights= scene.getAreaLights();
+    const auto& bindings  = scene.getMeshBindings();
+    const auto& nodes     = scene.getNodes();
 
-    // Small POD copied by value into launch params each frame.
     m_data.medium = scene.getMedium();
 
-    // Count totals
     uint32_t totalVerts = 0, totalTris = 0;
     for (auto& m : meshes) {
         totalVerts += (uint32_t)m.positions.size();
         totalTris  += (uint32_t)m.indices.size() / 3;
     }
-
     m_data.totalVertices  = totalVerts;
     m_data.totalTriangles = totalTris;
     m_data.materialCount  = (uint32_t)materials.size();
     m_data.pointLightCount = (uint32_t)lights.size();
     m_data.areaLightCount = (uint32_t)areaLights.size();
 
-    // Flatten all meshes into contiguous arrays
-    std::vector<float3>   allPositions;
-    std::vector<float3>   allNormals;
+    // Flatten — same merged-buffer layout the rest of the renderer expects.
+    // Geometry is baked to *world space* using each mesh's node->worldRest;
+    // for static meshes that's the final pose, for animated meshes it's the
+    // pose at t=0 (the rest pose). The pose-update kernel will overwrite the
+    // animated-vertex slots with the per-frame world-space pose.
+    std::vector<float3>   posWorldRest;          // baked for static; rest pose for animated
+    std::vector<float3>   normalsWorldRest;
     std::vector<float4>   allTangents;
     std::vector<float2>   allUVs;
     std::vector<uint32_t> allIndices;
-    std::vector<int>      allMatIndices; // per-triangle
-    std::vector<int>      allAreaLightIndices; // per-triangle
+    std::vector<int>      allMatIndices;
+    std::vector<int>      allAreaLightIndices;
+    std::vector<uint32_t> perVertexMeshIndex;    // staticSentinel or mesh index
 
-    allPositions.reserve(totalVerts);
-    allNormals.reserve(totalVerts);
+    posWorldRest.reserve(totalVerts);
+    normalsWorldRest.reserve(totalVerts);
     allTangents.reserve(totalVerts);
     allUVs.reserve(totalVerts);
     allIndices.reserve(totalTris * 3);
     allMatIndices.reserve(totalTris);
     allAreaLightIndices.reserve(totalTris);
+    perVertexMeshIndex.reserve(totalVerts);
+
+    bool sceneHasAnimation = scene.hasAnimation();
+    uint32_t animatedMeshCount = 0;
+    uint32_t animatedVertexCount = 0;
 
     uint32_t vertexOffset = 0;
     uint32_t areaLightIndex = 0;
-    for (auto& mesh : meshes) {
-        const auto& mat = materials[(size_t)mesh.materialIndex];
+    const uint32_t kStaticSentinel = 0xFFFFFFFFu;
+
+    for (size_t mi = 0; mi < meshes.size(); mi++) {
+        const auto& mesh = meshes[mi];
+        const auto& mat  = materials[(size_t)mesh.materialIndex];
         bool emissiveMesh = mat.emissionStrength > 0.0f &&
                             (mat.emission.x > 0.0f || mat.emission.y > 0.0f || mat.emission.z > 0.0f);
 
-        for (auto& p : mesh.positions) allPositions.push_back(p);
+        int ni = (mi < bindings.size()) ? bindings[mi].nodeIndex : -1;
+        const float4x4& W = (ni >= 0 && (size_t)ni < nodes.size())
+                                ? nodes[(size_t)ni].worldRest
+                                : float4x4::identity();
+        bool meshAnimated = (mi < bindings.size()) ? bindings[mi].animated : false;
 
+        // Positions (mesh-local -> world space at rest pose).
+        for (auto& p : mesh.positions) posWorldRest.push_back(transformPos(W, p));
+
+        // Normals — same transform, cofactor + renormalize.
         if (!mesh.normals.empty()) {
-            for (auto& n : mesh.normals) allNormals.push_back(n);
+            for (auto& n : mesh.normals) normalsWorldRest.push_back(transformNormal(W, n));
         } else {
             for (size_t j = 0; j < mesh.positions.size(); j++)
-                allNormals.push_back(make_float3(0, 1, 0));
+                normalsWorldRest.push_back(make_float3(0, 1, 0));
         }
 
-        // Tangents: w=0 marks "no tangent" so the kernel can fall back to
-        // the geometric normal when a mesh lacks UVs/tangents.
+        // Tangents — rotate by upper-3x3.
         if (!mesh.tangents.empty()) {
-            for (auto& t : mesh.tangents) allTangents.push_back(t);
+            for (auto& t : mesh.tangents) allTangents.push_back(transformTangent(W, t));
         } else {
             for (size_t j = 0; j < mesh.positions.size(); j++)
                 allTangents.push_back(make_float4(1, 0, 0, 0));
@@ -77,15 +139,21 @@ void DeviceScene::upload(const Scene& scene) {
                 allUVs.push_back(make_float2(0, 0));
         }
 
+        // Per-vertex mesh index for the pose-update kernel.
+        uint32_t pvIdx = meshAnimated ? (uint32_t)mi : kStaticSentinel;
+        for (size_t j = 0; j < mesh.positions.size(); j++) {
+            perVertexMeshIndex.push_back(pvIdx);
+        }
+        if (meshAnimated) {
+            animatedMeshCount++;
+            animatedVertexCount += (uint32_t)mesh.positions.size();
+        }
+
         uint32_t triCount = (uint32_t)mesh.indices.size() / 3;
-        for (auto idx : mesh.indices)
-            allIndices.push_back(idx + vertexOffset);
+        for (auto idx : mesh.indices) allIndices.push_back(idx + vertexOffset);
         for (uint32_t t = 0; t < triCount; t++) {
             allMatIndices.push_back(mesh.materialIndex);
             if (emissiveMesh && areaLightIndex < areaLights.size()) {
-                // Check if this triangle matches the next area light (non-degenerate).
-                // SceneLoader skips degenerate triangles (area <= 1e-8), so we must
-                // replicate that check to keep indices in sync.
                 uint32_t li0 = mesh.indices[t * 3 + 0];
                 uint32_t li1 = mesh.indices[t * 3 + 1];
                 uint32_t li2 = mesh.indices[t * 3 + 2];
@@ -108,41 +176,75 @@ void DeviceScene::upload(const Scene& scene) {
         vertexOffset += (uint32_t)mesh.positions.size();
     }
 
-    // Upload positions
-    CUDA_CHECK(cudaMalloc(&m_data.d_positions, totalVerts * sizeof(float3)));
-    CUDA_CHECK(cudaMemcpy(m_data.d_positions, allPositions.data(),
-                           totalVerts * sizeof(float3), cudaMemcpyHostToDevice));
+    // ── Pose update setup (animation only) ────────────────────────────
+    // When the scene has any animated meshes, allocate PoseUpdate buffers
+    // and have m_data.d_positions / d_normals / d_positionsPrev *alias* into
+    // them (so the existing flat-buffer reads in the OptiX/CUDA kernels see
+    // the pose-update output without any code change). The rest-pose host
+    // arrays we just built become the kernel's d_positionsRest / d_normalsRest.
+    bool useAnimation = sceneHasAnimation && animatedMeshCount > 0;
+    if (useAnimation) {
+        poseUpdateAlloc(m_pose, totalVerts, (uint32_t)meshes.size());
+        m_pose.animatedVertexCount = animatedVertexCount;
 
-    // Upload normals
-    CUDA_CHECK(cudaMalloc(&m_data.d_normals, totalVerts * sizeof(float3)));
-    CUDA_CHECK(cudaMemcpy(m_data.d_normals, allNormals.data(),
-                           totalVerts * sizeof(float3), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(m_pose.d_positionsRest, posWorldRest.data(),
+                              totalVerts * sizeof(float3), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(m_pose.d_normalsRest, normalsWorldRest.data(),
+                              totalVerts * sizeof(float3), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(m_pose.d_perVertexMeshIndex, perVertexMeshIndex.data(),
+                              totalVerts * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        // Seed the curr/prev buffers to the rest pose so the very first
+        // launch sees something sensible (kernel's firstFrame=true will
+        // overwrite the animated slots; static slots keep these values).
+        CUDA_CHECK(cudaMemcpy(m_pose.d_positionsCurr, posWorldRest.data(),
+                              totalVerts * sizeof(float3), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(m_pose.d_normalsCurr, normalsWorldRest.data(),
+                              totalVerts * sizeof(float3), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(m_pose.d_positionsPrev, posWorldRest.data(),
+                              totalVerts * sizeof(float3), cudaMemcpyHostToDevice));
 
-    // Upload tangents
+        // Alias rendering pointers into pose buffers (DeviceScene does NOT
+        // free these — m_pose owns them).
+        m_data.d_positions     = m_pose.d_positionsCurr;
+        m_data.d_normals       = m_pose.d_normalsCurr;
+        m_data.d_positionsPrev = m_pose.d_positionsPrev;
+        m_ownsPositions = false;
+        m_ownsNormals   = false;
+    } else {
+        // No animation — original layout. Allocate and own d_positions /
+        // d_normals directly.
+        CUDA_CHECK(cudaMalloc(&m_data.d_positions, totalVerts * sizeof(float3)));
+        CUDA_CHECK(cudaMemcpy(m_data.d_positions, posWorldRest.data(),
+                              totalVerts * sizeof(float3), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&m_data.d_normals, totalVerts * sizeof(float3)));
+        CUDA_CHECK(cudaMemcpy(m_data.d_normals, normalsWorldRest.data(),
+                              totalVerts * sizeof(float3), cudaMemcpyHostToDevice));
+        m_data.d_positionsPrev = nullptr;  // motion vectors fall back to static reprojection
+        m_ownsPositions = true;
+        m_ownsNormals   = true;
+    }
+
     CUDA_CHECK(cudaMalloc(&m_data.d_tangents, totalVerts * sizeof(float4)));
     CUDA_CHECK(cudaMemcpy(m_data.d_tangents, allTangents.data(),
-                           totalVerts * sizeof(float4), cudaMemcpyHostToDevice));
+                          totalVerts * sizeof(float4), cudaMemcpyHostToDevice));
 
-    // Upload UVs
     CUDA_CHECK(cudaMalloc(&m_data.d_uvs, totalVerts * sizeof(float2)));
     CUDA_CHECK(cudaMemcpy(m_data.d_uvs, allUVs.data(),
-                           totalVerts * sizeof(float2), cudaMemcpyHostToDevice));
+                          totalVerts * sizeof(float2), cudaMemcpyHostToDevice));
 
-    // Upload indices
     CUDA_CHECK(cudaMalloc(&m_data.d_indices, totalTris * 3 * sizeof(uint32_t)));
     CUDA_CHECK(cudaMemcpy(m_data.d_indices, allIndices.data(),
-                           totalTris * 3 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+                          totalTris * 3 * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
-    // Upload per-triangle material indices
     CUDA_CHECK(cudaMalloc(&m_data.d_materialIndices, totalTris * sizeof(int)));
     CUDA_CHECK(cudaMemcpy(m_data.d_materialIndices, allMatIndices.data(),
-                           totalTris * sizeof(int), cudaMemcpyHostToDevice));
+                          totalTris * sizeof(int), cudaMemcpyHostToDevice));
 
     CUDA_CHECK(cudaMalloc(&m_data.d_triangleAreaLightIndex, totalTris * sizeof(int)));
     CUDA_CHECK(cudaMemcpy(m_data.d_triangleAreaLightIndex, allAreaLightIndices.data(),
-                           totalTris * sizeof(int), cudaMemcpyHostToDevice));
+                          totalTris * sizeof(int), cudaMemcpyHostToDevice));
 
-    // Upload materials (convert PBRMaterial -> GPUMaterial)
+    // Materials.
     std::vector<GPUMaterial> gpuMats(materials.size());
     for (size_t i = 0; i < materials.size(); i++) {
         auto& src = materials[i];
@@ -167,10 +269,9 @@ void DeviceScene::upload(const Scene& scene) {
         dst.emissiveTex      = src.emissiveTexObj;
         dst.specularGlossTex = src.specularGlossTexObj;
     }
-
     CUDA_CHECK(cudaMalloc(&m_data.d_materials, materials.size() * sizeof(GPUMaterial)));
     CUDA_CHECK(cudaMemcpy(m_data.d_materials, gpuMats.data(),
-                           materials.size() * sizeof(GPUMaterial), cudaMemcpyHostToDevice));
+                          materials.size() * sizeof(GPUMaterial), cudaMemcpyHostToDevice));
 
     if (!lights.empty()) {
         std::vector<GPUPointLight> gpuLights(lights.size());
@@ -182,16 +283,23 @@ void DeviceScene::upload(const Scene& scene) {
             gpuLights[i].linearAttenuation = lights[i].linearAttenuation;
             gpuLights[i].quadraticAttenuation = lights[i].quadraticAttenuation;
         }
-
         CUDA_CHECK(cudaMalloc(&m_data.d_pointLights, lights.size() * sizeof(GPUPointLight)));
         CUDA_CHECK(cudaMemcpy(m_data.d_pointLights, gpuLights.data(),
-                               lights.size() * sizeof(GPUPointLight), cudaMemcpyHostToDevice));
+                              lights.size() * sizeof(GPUPointLight), cudaMemcpyHostToDevice));
     }
 
+    // Area lights — GPU array carries every light (so BSDF-hit emissive
+    // lookup works for both static and dynamic emitters), but the light BVH
+    // only spans the static subset (dynamic emitters move every frame; their
+    // BVH bounds would be stale).
     if (!areaLights.empty()) {
         std::vector<GPUAreaLight> gpuAreaLights(areaLights.size());
-        std::vector<float> cdf(areaLights.size());
-        float totalWeight = 0.0f;
+        // CDF over the *static* subset only — used as a fallback when the
+        // light BVH descent fails (and as the basis for total-weight
+        // bookkeeping during NEE PDF). Total weight is the sum across static
+        // emitters; dynamic emitters don't contribute to NEE.
+        std::vector<float> cdf(areaLights.size(), 0.0f);
+        float totalStaticWeight = 0.0f;
         for (size_t i = 0; i < areaLights.size(); i++) {
             const auto& src = areaLights[i];
             auto& dst = gpuAreaLights[i];
@@ -201,33 +309,36 @@ void DeviceScene::upload(const Scene& scene) {
             dst.normal = src.normal;
             dst.emission = src.emission;
             dst.area = src.area;
-            dst.weight = src.weight;
+            // For dynamic emitters, zero the weight so the NEE CDF / light
+            // BVH can't pick them. They still contribute via BSDF hits.
+            dst.weight = src.isStatic ? src.weight : 0.0f;
             dst.uv0 = src.uv0;
             dst.uv1 = src.uv1;
             dst.uv2 = src.uv2;
             dst.emissiveTex = src.emissiveTexObj;
-            totalWeight += src.weight;
-            cdf[i] = totalWeight;
+            totalStaticWeight += dst.weight;
+            cdf[i] = totalStaticWeight;
         }
 
-        if (totalWeight > 0.0f) {
-            for (auto& value : cdf) {
-                value /= totalWeight;
-            }
-            m_data.areaLightTotalWeight = totalWeight;
+        if (totalStaticWeight > 0.0f) {
+            for (auto& value : cdf) value /= totalStaticWeight;
+            m_data.areaLightTotalWeight = totalStaticWeight;
 
             CUDA_CHECK(cudaMalloc(&m_data.d_areaLights, areaLights.size() * sizeof(GPUAreaLight)));
             CUDA_CHECK(cudaMemcpy(m_data.d_areaLights, gpuAreaLights.data(),
-                                   areaLights.size() * sizeof(GPUAreaLight), cudaMemcpyHostToDevice));
+                                  areaLights.size() * sizeof(GPUAreaLight), cudaMemcpyHostToDevice));
 
             CUDA_CHECK(cudaMalloc(&m_data.d_areaLightCDF, areaLights.size() * sizeof(float)));
             CUDA_CHECK(cudaMemcpy(m_data.d_areaLightCDF, cdf.data(),
-                                   areaLights.size() * sizeof(float), cudaMemcpyHostToDevice));
+                                  areaLights.size() * sizeof(float), cudaMemcpyHostToDevice));
 
-            // Build the Light BVH over the GPU area lights. Each light's AABB
-            // is the bbox of its triangle; weights match the CDF weights so
-            // the BVH's summed weights are identical to what the NEE path
-            // expects (sum == areaLightTotalWeight at the root).
+            // Light BVH — only over static emitters. We still feed all area-
+            // light slots, but with zeroed weights for dynamic ones. The
+            // builder will produce a tree where dynamic emitters are
+            // effectively unsamplable (zero summed weight on their leaves).
+            // For our scene this works out cleanly: the FBX has static logo
+            // geometry that's emissive AND animated piping/lights — only the
+            // static portion drives NEE.
             std::vector<AABB>  lightBounds(areaLights.size());
             std::vector<float> lightWeights(areaLights.size());
             for (size_t i = 0; i < areaLights.size(); i++) {
@@ -238,7 +349,7 @@ void DeviceScene::upload(const Scene& scene) {
                 AABB b;
                 b.expand(v0); b.expand(v1); b.expand(v2);
                 lightBounds[i]  = b;
-                lightWeights[i] = src.weight;
+                lightWeights[i] = src.isStatic ? src.weight : 0.0f;
             }
 
             LightBVH builder;
@@ -246,8 +357,6 @@ void DeviceScene::upload(const Scene& scene) {
                                               lightWeights.data(),
                                               (uint32_t)areaLights.size());
 
-            // Inverse map: original light index -> ordered slot (needed for
-            // BSDF-hit MIS PDF lookup against a specific emissive triangle).
             std::vector<uint32_t> lightIndexToSlot(areaLights.size(), 0);
             for (uint32_t slot = 0; slot < lbvh.orderedLightIndices.size(); slot++) {
                 lightIndexToSlot[lbvh.orderedLightIndices[slot]] = slot;
@@ -276,13 +385,31 @@ void DeviceScene::upload(const Scene& scene) {
         }
     }
 
-    LOG_INFO("GPU upload: %u vertices, %u triangles, %u materials, %u lights, %u area lights",
-             totalVerts, totalTris, (uint32_t)materials.size(), (uint32_t)lights.size(), (uint32_t)areaLights.size());
+    LOG_INFO("GPU upload: %u vertices, %u triangles, %u materials, %u lights, %u area lights, animation=%s (animated meshes=%u verts=%u)",
+             totalVerts, totalTris,
+             (uint32_t)materials.size(), (uint32_t)lights.size(), (uint32_t)areaLights.size(),
+             useAnimation ? "yes" : "no",
+             animatedMeshCount, animatedVertexCount);
+}
+
+void DeviceScene::refreshAnimationPointers() {
+    if (m_pose.vertexCount == 0) return;
+    // d_positions/d_normals/d_positionsPrev all alias into m_pose buffers,
+    // which keep the same address across pose updates — nothing to do.
+    m_data.d_positions     = m_pose.d_positionsCurr;
+    m_data.d_normals       = m_pose.d_normalsCurr;
+    m_data.d_positionsPrev = m_pose.d_positionsPrev;
 }
 
 void DeviceScene::free() {
-    if (m_data.d_positions)       { cudaFree(m_data.d_positions); }
-    if (m_data.d_normals)         { cudaFree(m_data.d_normals); }
+    if (m_ownsPositions && m_data.d_positions) { cudaFree(m_data.d_positions); }
+    if (m_ownsNormals   && m_data.d_normals)   { cudaFree(m_data.d_normals); }
+    m_data.d_positions = nullptr;
+    m_data.d_normals = nullptr;
+    m_data.d_positionsPrev = nullptr;
+    m_ownsPositions = true;
+    m_ownsNormals = true;
+
     if (m_data.d_tangents)        { cudaFree(m_data.d_tangents); }
     if (m_data.d_uvs)             { cudaFree(m_data.d_uvs); }
     if (m_data.d_indices)         { cudaFree(m_data.d_indices); }
@@ -293,8 +420,11 @@ void DeviceScene::free() {
     if (m_data.d_areaLightCDF)    { cudaFree(m_data.d_areaLightCDF); }
     if (m_data.d_triangleAreaLightIndex) { cudaFree(m_data.d_triangleAreaLightIndex); }
     if (m_data.d_bvhNodes)        { cudaFree(m_data.d_bvhNodes); }
-    if (m_data.d_lightBVHNodes)     { cudaFree(m_data.d_lightBVHNodes); }
+    if (m_data.d_lightBVHNodes)   { cudaFree(m_data.d_lightBVHNodes); }
     if (m_data.d_lightOrderedIndices){ cudaFree(m_data.d_lightOrderedIndices); }
     if (m_data.d_lightIndexToSlot)   { cudaFree(m_data.d_lightIndexToSlot); }
+
+    poseUpdateFree(m_pose);
+
     m_data = DeviceSceneData{};
 }

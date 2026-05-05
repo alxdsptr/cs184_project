@@ -2,6 +2,7 @@
 #include "gpu/AreaLightGPU.h"
 #include "gpu/MaterialGPU.h"
 #include "gpu/LightGPU.h"
+#include "gpu/PoseUpdate.h"
 #include "core/VolumeMedium.h"
 #include "accel/BVHNode.h"
 #include "accel/LightBVHNode.h"
@@ -10,6 +11,14 @@
 struct DeviceSceneData {
     float3*      d_positions      = nullptr;
     float3*      d_normals        = nullptr;
+    // World-space positions from the previous animation frame, populated by
+    // the pose-update kernel when an animation is playing. Closest-hit
+    // programs reproject these via camera.prevViewProjMatrix to compute
+    // motion vectors that account for *moving geometry*, not just camera
+    // motion. Null when no animation is active — callers fall back to
+    // reprojecting the current hit pos through the prev camera matrix
+    // (correct only for static geometry).
+    float3*      d_positionsPrev  = nullptr;
     float4*      d_tangents       = nullptr; // xyz = tangent, w = bitangent sign
     float2*      d_uvs            = nullptr;
     uint32_t*    d_indices         = nullptr;
@@ -120,6 +129,28 @@ public:
     void free();
     DeviceSceneData getData() const { return m_data; }
 
+    // Animation hooks. When the scene has no animations, `pose()` returns a
+    // PoseUpdateData with vertexCount == 0 and the renderer should not call
+    // any of the pose-update entry points — d_positions is owned by
+    // DeviceScene directly, and motion vectors fall back to camera-only
+    // reprojection of the (static) world hit position.
+    bool hasAnimation() const { return m_pose.vertexCount > 0; }
+    PoseUpdateData& pose() { return m_pose; }
+    const PoseUpdateData& pose() const { return m_pose; }
+
+    // After uploading deltas via poseUpdateUploadDeltas + launching the
+    // pose-update kernel, call this to refresh d_positions / d_normals /
+    // d_positionsPrev in m_data. (They alias into m_pose's buffers when
+    // animation is active, so the addresses don't actually change — this
+    // function is a no-op when hasAnimation() is true; it exists for
+    // symmetry with eventual layouts where the renderer might double-
+    // buffer.) Currently the OptiX backend just reads m_data.d_positions
+    // directly each frame.
+    void refreshAnimationPointers();
+
 private:
     DeviceSceneData m_data;
+    PoseUpdateData  m_pose; // empty when !hasAnimation
+    bool m_ownsPositions = true;  // false when d_positions aliases m_pose
+    bool m_ownsNormals   = true;
 };
