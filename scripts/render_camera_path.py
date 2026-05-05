@@ -461,6 +461,18 @@ def parse_args() -> argparse.Namespace:
                    help="Renderer pipeline (default native)")
     p.add_argument("--sg", default=None, help="--sg passthrough (off|heuristic|fbx-c4d|fbx-ue)")
 
+    # ReSTIR toggles. Defaults match pathtracer's defaults (DI on, GI/PT off);
+    # passing nothing is identical to omitting the flag.
+    #   --restir-di / --no-restir-di   → (default on)  --no-restir
+    #   --restir-gi / --no-restir-gi   → (default off) --restir-gi / --no-restir-gi
+    #   --restir-pt / --no-restir-pt   → (default off) --restir-pt / --no-restir-pt
+    p.add_argument("--restir-di", action=argparse.BooleanOptionalAction, default=None,
+                   help="ReSTIR DI (default: on inside pathtracer). --no-restir-di disables.")
+    p.add_argument("--restir-gi", action=argparse.BooleanOptionalAction, default=None,
+                   help="ReSTIR GI (default: off inside pathtracer).")
+    p.add_argument("--restir-pt", action=argparse.BooleanOptionalAction, default=None,
+                   help="ReSTIR PT (default: off inside pathtracer).")
+
     # Build/exe layout.
     project_root = Path(__file__).resolve().parents[1]
     p.add_argument("--exe", type=Path,
@@ -507,6 +519,9 @@ def run_replay_subprocess(cfg: "RenderConfig", recording: Path, frames_dir: Path
         cmd += ["--sg", cfg.sg]
     cmd += cfg.extra_args
 
+    if not quiet:
+        print('Running command:', ' '.join(cmd))
+
     stdout = subprocess.DEVNULL if quiet else None
     stderr = subprocess.DEVNULL if quiet else None
     proc = subprocess.run(cmd, cwd=str(cfg.run_dir), stdout=stdout, stderr=stderr)
@@ -518,11 +533,34 @@ def run_replay_subprocess(cfg: "RenderConfig", recording: Path, frames_dir: Path
     return len(sorted(frames_dir.glob("frame_*.png")))
 
 
+def restir_flags(args: argparse.Namespace) -> list[str]:
+    """Translate --restir-{di,gi,pt} tri-states into pathtracer CLI flags.
+    None = leave default; True/False = pass the explicit on/off flag."""
+    flags: list[str] = []
+    if args.restir_di is False:
+        flags.append("--no-restir")
+    # No "--restir" flag exists — DI is on by default in pathtracer, and
+    # passing --restir-di on the script CLI is just an explicit no-op.
+    if args.restir_gi is True:
+        flags.append("--restir-gi")
+    elif args.restir_gi is False:
+        flags.append("--no-restir-gi")
+    if args.restir_pt is True:
+        flags.append("--restir-pt")
+    elif args.restir_pt is False:
+        flags.append("--no-restir-pt")
+    return flags
+
+
 def main() -> int:
     args = parse_args()
 
     project_root = Path(__file__).resolve().parents[1]
     base_dir = project_root  # for resolving relative keyframe paths
+
+    # Fold ReSTIR toggles into args.extra so every pathtracer invocation
+    # picks them up (recording-replay subprocess + per-keyframe subprocess).
+    args.extra = list(args.extra or []) + restir_flags(args)
 
     keyframes: list[CameraPose] = []
     interp = "linear"
