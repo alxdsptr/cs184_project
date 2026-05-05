@@ -1165,7 +1165,8 @@ void Application::runReplay() {
     float renderAspect = m_height > 0 ? (float)m_width / (float)m_height : 1.0f;
 
     const uint32_t spp = m_replayOpts.sppPerPose > 0 ? m_replayOpts.sppPerPose : 1;
-    LOG_INFO("Replay: %zu pose(s) (stride=%u → %zu frames), spp=%u, out=%s",
+    LOG_INFO("Replay: %zu pose(s) rendered, save stride=%u → %zu PNG(s), "
+             "spp=%u, out=%s",
              poses.size(), m_replayOpts.stride,
              (poses.size() + m_replayOpts.stride - 1) / m_replayOpts.stride,
              spp, m_replayOpts.outDir.c_str());
@@ -1173,10 +1174,25 @@ void Application::runReplay() {
     const auto totalStart = std::chrono::steady_clock::now();
     uint32_t saved = 0;
 
-    // Diagnostic: log the loop entry to confirm we're actually iterating.
-    LOG_INFO("Replay: entering pose loop (poses.size=%zu, stride=%u)",
-             poses.size(), m_replayOpts.stride);
-    for (size_t i = 0; i < poses.size(); i += m_replayOpts.stride) {
+    // ── History policy ──────────────────────────────────────────────────
+    // Hard-reset NRD/DLSS/ReSTIR history exactly once, before pose 0
+    // (we *are* teleporting from the startup pose to pose[0]). After that:
+    //   - Walk EVERY recorded pose (no stride skipping at the C++ layer),
+    //     using advanceFrame() + setPosePreserveHistory() so each frame's
+    //     motion vectors are (pose[i-1] → pose[i]) instead of zero. Stride
+    //     skipping was producing huge motion-vector jumps between saved
+    //     frames and starving NRD/DLSS of continuous reprojection.
+    //   - Save a PNG only on stride-multiples — stride is a "decimate
+    //     output" knob, not a "skip pose" knob.
+    //   - resetAccumulation() between poses so the path-trace sample
+    //     averaging starts fresh per pose (radiance from a different
+    //     viewpoint can't be pixel-averaged), but ReSTIR/NRD/DLSS history
+    //     survives — that's exactly what motion vectors are for.
+    m_renderer.resetAccumulation();
+    m_renderer.invalidateReSTIRHistory();
+    m_renderer.markPipelineNeedsReset();
+
+    for (size_t i = 0; i < poses.size(); ++i) {
         // glfwWindowShouldClose was here — but the replay window is hidden
         // and on Windows the close-state can transiently flip even without a
         // visible window, racing the loop entry. Replay is a closed-loop
@@ -1184,35 +1200,27 @@ void Application::runReplay() {
         // saveToPNG / for-loop bound terminate cleanly.
         const ReplayPose& p = poses[i];
 
-        // Inject pose. Aspect is overridden so headless render dimensions
-        // dictate the projection regardless of what was recorded.
-        m_camera.setPose(p.position, p.yawDeg, p.pitchDeg, p.fovDeg,
-                         renderAspect, p.nearPlane, p.farPlane);
-
-        // Path-tracer accumulation must reset per pose (different viewpoints
-        // can't be averaged together — that's the same invariant that drives
-        // resetAccumulation on m_camera.hasMoved() in the live loop).
-        m_renderer.resetAccumulation();
-
-        // BUT: ReSTIR / NRD / DLSS / DLSS-RR temporal histories should
-        // survive pose-to-pose because their reprojection logic is driven
-        // by motion vectors — that is the entire point of those passes.
-        // We previously called invalidateReSTIRHistory() and
-        // markPipelineNeedsReset() here, which made every replay frame look
-        // like a teleport: ReSTIR reservoirs M-clamped to 1, NRD's RELAX
-        // dropped its history (reset=true), DLSS-SR/RR reset their internal
-        // accumulators. The result was a "first frame" quality every frame —
-        // exactly the "severe noise during motion" symptom that DLSS-SR and
-        // DLSS-RR exhibited on replay videos. Only mark a true pipeline
-        // reset on the very first replay pose; from there on out the
-        // recording is just a continuous camera path.
         if (i == 0) {
-            m_renderer.invalidateReSTIRHistory();
-            m_renderer.markPipelineNeedsReset();
+            // Teleport from startup pose; intentionally zero motion vectors
+            // (the one-shot pipeline reset above will be consumed this frame).
+            m_camera.setPose(p.position, p.yawDeg, p.pitchDeg, p.fovDeg,
+                             renderAspect, p.nearPlane, p.farPlane);
+        } else {
+            // Snapshot the previous pose's matrices as "prev", then update
+            // current to pose[i] without clobbering them. NRD/DLSS now see
+            // real motion (pose[i-1] → pose[i]).
+            m_camera.advanceFrame();
+            m_camera.setPosePreserveHistory(p.position, p.yawDeg, p.pitchDeg,
+                                            p.fovDeg, renderAspect,
+                                            p.nearPlane, p.farPlane);
+            // Path-trace accumulator can't average across viewpoints; restart
+            // sample count at each pose. Does NOT touch denoiser history.
+            m_renderer.resetAccumulation();
         }
 
-        // Pump until we've rendered the requested spp at this pose.
-        if (saved < 2) LOG_INFO("Replay: pose %zu, before pump (sc=%u, spp=%u)", i, m_renderer.getSampleCount(), spp);
+        // Render `spp` samples at this pose. After each sub-frame call
+        // advanceFrame() so subsequent sub-frames at the same pose see
+        // prev == current (zero motion), which is correct for a static cam.
         while (m_renderer.getSampleCount() < spp) {
             uchar4* d_pbo = (uchar4*)m_display.mapForCUDA();
             renderSceneSample(d_pbo, true);
@@ -1221,9 +1229,11 @@ void Application::runReplay() {
             m_camera.advanceFrame();
             m_frameIndex++;
         }
-        if (saved < 2) LOG_INFO("Replay: pose %zu, pump done (sc=%u)", i, m_renderer.getSampleCount());
-        CUDA_CHECK(cudaDeviceSynchronize());
 
+        const bool isOutputFrame = (i % m_replayOpts.stride == 0);
+        if (!isOutputFrame) continue;
+
+        CUDA_CHECK(cudaDeviceSynchronize());
         std::ostringstream name;
         name << m_replayOpts.outDir << "/frame_" << std::setw(6)
              << std::setfill('0') << saved << ".png";

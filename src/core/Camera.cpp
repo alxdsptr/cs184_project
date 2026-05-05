@@ -207,6 +207,23 @@ void Camera::setPose(float3 position, float yawDeg, float pitchDeg,
     m_moved = true;
 }
 
+void Camera::setPosePreserveHistory(float3 position, float yawDeg, float pitchDeg,
+                                    float fovDeg, float aspect,
+                                    float nearPlane, float farPlane) {
+    m_position  = position;
+    m_yaw       = yawDeg;
+    m_pitch     = pitchDeg;
+    m_fovDeg    = fovDeg;
+    m_aspect    = aspect;
+    m_nearPlane = nearPlane;
+    m_farPlane  = farPlane;
+    rebuildMatrices();
+    // Deliberately leave m_prev* alone — caller already snapshotted prev via
+    // advanceFrame(). DLSS/NRD motion vectors will be (prev → new) instead of
+    // (new → new), which is what we want during replay.
+    m_moved = true;
+}
+
 bool Camera::loadFromFile(const std::string& path) {
     std::ifstream in(path);
     if (!in.is_open()) {
