@@ -10,6 +10,7 @@ void DeviceScene::upload(const Scene& scene) {
     const auto& meshes = scene.getMeshes();
     const auto& materials = scene.getMaterials();
     const auto& lights = scene.getLights();
+    const auto& directionalLights = scene.getDirectionalLights();
     const auto& areaLights = scene.getAreaLights();
 
     // Small POD copied by value into launch params each frame.
@@ -26,6 +27,7 @@ void DeviceScene::upload(const Scene& scene) {
     m_data.totalTriangles = totalTris;
     m_data.materialCount  = (uint32_t)materials.size();
     m_data.pointLightCount = (uint32_t)lights.size();
+    m_data.directionalLightCount = (uint32_t)directionalLights.size();
     m_data.areaLightCount = (uint32_t)areaLights.size();
 
     // Flatten all meshes into contiguous arrays
@@ -188,6 +190,20 @@ void DeviceScene::upload(const Scene& scene) {
                                lights.size() * sizeof(GPUPointLight), cudaMemcpyHostToDevice));
     }
 
+    if (!directionalLights.empty()) {
+        std::vector<GPUDirectionalLight> gpuDirectionalLights(directionalLights.size());
+        for (size_t i = 0; i < directionalLights.size(); i++) {
+            gpuDirectionalLights[i].direction = directionalLights[i].direction;
+            gpuDirectionalLights[i].color = directionalLights[i].color;
+        }
+
+        CUDA_CHECK(cudaMalloc(&m_data.d_directionalLights,
+                              directionalLights.size() * sizeof(GPUDirectionalLight)));
+        CUDA_CHECK(cudaMemcpy(m_data.d_directionalLights, gpuDirectionalLights.data(),
+                              directionalLights.size() * sizeof(GPUDirectionalLight),
+                              cudaMemcpyHostToDevice));
+    }
+
     if (!areaLights.empty()) {
         std::vector<GPUAreaLight> gpuAreaLights(areaLights.size());
         std::vector<float> cdf(areaLights.size());
@@ -289,6 +305,7 @@ void DeviceScene::free() {
     if (m_data.d_materials)       { cudaFree(m_data.d_materials); }
     if (m_data.d_materialIndices) { cudaFree(m_data.d_materialIndices); }
     if (m_data.d_pointLights)     { cudaFree(m_data.d_pointLights); }
+    if (m_data.d_directionalLights) { cudaFree(m_data.d_directionalLights); }
     if (m_data.d_areaLights)      { cudaFree(m_data.d_areaLights); }
     if (m_data.d_areaLightCDF)    { cudaFree(m_data.d_areaLightCDF); }
     if (m_data.d_triangleAreaLightIndex) { cudaFree(m_data.d_triangleAreaLightIndex); }

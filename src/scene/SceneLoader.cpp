@@ -573,6 +573,38 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
                   aiL->mColorDiffuse.r, aiL->mColorDiffuse.g, aiL->mColorDiffuse.b,
                   aiL->mAttenuationConstant, aiL->mAttenuationLinear, aiL->mAttenuationQuadratic);
 
+        if (aiL->mType == aiLightSource_DIRECTIONAL) {
+            DirectionalLight light;
+
+            aiVector3D lightDir = aiL->mDirection;
+            const aiNode* lightNode = findNodeByName(aiScn->mRootNode, aiL->mName);
+            if (lightNode) {
+                aiMatrix4x4 world = computeWorldTransform(lightNode);
+                aiMatrix3x3 rotation(world);
+                lightDir = rotation * lightDir;
+            }
+
+            if (lightDir.SquareLength() > 1e-12f) {
+                light.direction = normalize(-toFloat3(lightDir));
+            } else {
+                light.direction = make_float3(0.0f, -1.0f, 0.0f);
+            }
+
+            light.color = toFloat3(aiL->mColorDiffuse);
+            light.color *= 0.15f; // Temporarily downscaling for BistroExterior.fbx
+            if (light.color.x <= 0.0f && light.color.y <= 0.0f && light.color.z <= 0.0f) {
+                light.color = make_float3(1.0f, 1.0f, 1.0f);
+            }
+
+            LOG_INFO("  Resolved directional light '%s' -> direction=(%.4f,%.4f,%.4f) color=(%.4f,%.4f,%.4f)",
+                     aiL->mName.C_Str(),
+                     light.direction.x, light.direction.y, light.direction.z,
+                     light.color.x, light.color.y, light.color.z);
+
+            scene.getDirectionalLights().push_back(light);
+            continue;
+        }
+
         // Currently only point and spot lights are supported (treat spot as point)
         if (aiL->mType != aiLightSource_POINT && aiL->mType != aiLightSource_SPOT) {
             LOG_WARN("Skipping unsupported light type %d for %s",

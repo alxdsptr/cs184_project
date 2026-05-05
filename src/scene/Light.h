@@ -9,3 +9,8 @@ struct PointLight {
     float  linearAttenuation    = 0.0f;
     float  quadraticAttenuation = 0.0f;
 };
+
+struct DirectionalLight {
+    float3 direction = make_float3(0.0f, -1.0f, 0.0f);
+    float3 color     = make_float3(1.0f, 1.0f, 1.0f);
+};

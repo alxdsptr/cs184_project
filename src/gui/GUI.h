@@ -6,6 +6,7 @@
 struct GLFWwindow;
 class VulkanDisplay;
 struct CameraParams;
+struct VolumeMedium;
 
 class GUI {
 public:
@@ -25,6 +26,9 @@ public:
                 float& exposure, int& toneMappingMode,
                 float& moveSpeed,
                 char* envMapPathBuf, size_t envMapPathBufSize, bool& loadEnvMapRequested,
+                // Optional volumetric medium controls. Pass nullptr to hide
+                // the section entirely.
+                VolumeMedium* medium = nullptr,
                 int* renderMode = nullptr,
                 int* dlssQuality = nullptr,
                 uint32_t renderResW = 0,
