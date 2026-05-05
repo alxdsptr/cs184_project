@@ -1356,11 +1356,12 @@ extern "C" __global__ void __raygen__path_trace_split()
                 handle, ray.origin, ray.direction, ray.tmin, ray.tmax);
             bool didHit = (rp.hit != 0);
 
-            // Volume transmittance over the segment. The split kernel
-            // intentionally skips in-scatter sampling (NRD's split outputs
-            // don't have a clean bucket for scattered radiance); we only
-            // apply ratio-tracked attenuation so geometry behind fog reads
-            // correctly under NRD/DLSS-RR.
+            // ── Participating-medium integrator (NRD/DLSS-RR-compatible) ──
+            // See PathTraceKernelSplit.cu for the bucket-routing rationale:
+            // single-scatter NEE goes into the emissive bucket so NRD's
+            // diff/spec demodulation invariant holds, and DLSS-RR sees the
+            // in-scatter via its noisy-color input. Scatter terminates the
+            // path (single-scatter only).
             {
                 float segmentDistance = didHit ? rp.tHit : ray.tmax;
                 if (scene.medium.enabled && scene.medium.majorantSigmaT > 0.0f &&
@@ -1370,6 +1371,102 @@ extern "C" __global__ void __raygen__path_trace_split()
                     if (volumeIntersect(ray.origin, ray.direction, ray.tmin, segmentDistance,
                                         scene.medium, tEnter, tExit))
                     {
+                        float tScatter;
+                        bool scattered = volumeDeltaTrack(
+                            ray.origin, ray.direction, tEnter, tExit,
+                            scene.medium, rng, tScatter);
+                        if (scattered) {
+                            float3 mediumPos = ray.origin + ray.direction * tScatter;
+                            float3 wo = -ray.direction;
+                            float3 ssAlbedo = mediumSingleScatterAlbedo(scene.medium);
+                            float3 inScatter = make_float3(0.0f, 0.0f, 0.0f);
+
+                            // Area lights — picked CDF entry, MIS with phase function.
+                            if (scene.d_areaLights && scene.areaLightCount > 0 &&
+                                scene.d_areaLightCDF && scene.areaLightTotalWeight > 0.0f)
+                            {
+                                uint32_t li = sampleAreaLightIndex(
+                                    scene.d_areaLightCDF, scene.areaLightCount,
+                                    pcg32_float(rng));
+                                GPUAreaLight light = scene.d_areaLights[li];
+                                float r1 = pcg32_float(rng), r2 = pcg32_float(rng);
+                                float su = sqrtf(r1);
+                                float b0 = 1.0f - su;
+                                float b1 = su * (1.0f - r2);
+                                float b2 = su * r2;
+                                float3 lp = light.v0 * b0
+                                           + (light.v0 + light.e1) * b1
+                                           + (light.v0 + light.e2) * b2;
+                                float3 toL = lp - mediumPos;
+                                float d2 = fmaxf(dot(toL, toL), 1e-6f);
+                                float d = sqrtf(d2);
+                                float3 Ld = toL * (1.0f / d);
+                                float lNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
+                                if (lNdot > 0.0f) {
+                                    float3 shadowTransmittance = traceShadowRay(
+                                        handle, mediumPos, Ld, 0.001f, fmaxf(d - 0.002f, 0.001f));
+                                    float3 volumetricST = volumeShadowTransmittance(
+                                        mediumPos, Ld, d, scene.medium, rng);
+                                    shadowTransmittance = shadowTransmittance * volumetricST;
+                                    float slum = 0.2126f*shadowTransmittance.x + 0.7152f*shadowTransmittance.y + 0.0722f*shadowTransmittance.z;
+                                    if (slum > 1e-6f) {
+                                        float pTri = light.weight / scene.areaLightTotalWeight;
+                                        float pArea = pTri / fmaxf(light.area, 1e-7f);
+                                        float pdfOmega = pArea * d2 / fmaxf(lNdot, 1e-7f);
+                                        float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
+                                        float w = powerHeuristic(pdfOmega, phase);
+                                        float3 Le = sampleAreaLightLe(light, b0, b1, b2);
+                                        inScatter += shadowTransmittance * Le * (phase / fmaxf(pdfOmega, 1e-7f)) * w;
+                                    }
+                                }
+                            }
+
+                            // Point lights.
+                            if (scene.d_pointLights && scene.pointLightCount > 0) {
+                                for (uint32_t li = 0; li < scene.pointLightCount; li++) {
+                                    GPUPointLight light = scene.d_pointLights[li];
+                                    float3 toL = light.position - mediumPos;
+                                    float d2 = fmaxf(dot(toL, toL), 1e-6f);
+                                    float d = sqrtf(d2);
+                                    float3 Ld = toL * (1.0f / d);
+                                    float3 shadowTransmittance = traceShadowRay(
+                                        handle, mediumPos, Ld, 0.001f, fmaxf(d - 0.002f, 0.001f));
+                                    float3 volumetricST = volumeShadowTransmittance(
+                                        mediumPos, Ld, d, scene.medium, rng);
+                                    shadowTransmittance = shadowTransmittance * volumetricST;
+                                    float slum = 0.2126f*shadowTransmittance.x + 0.7152f*shadowTransmittance.y + 0.0722f*shadowTransmittance.z;
+                                    if (slum < 1e-6f) continue;
+                                    float attenDen = light.constantAttenuation + light.linearAttenuation * d + light.quadraticAttenuation * d2;
+                                    float atten = 1.0f / fmaxf(attenDen, 1e-4f);
+                                    float3 Li = light.color * (light.intensity * atten);
+                                    float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
+                                    inScatter += shadowTransmittance * Li * phase;
+                                }
+                            }
+
+                            // Directional lights.
+                            if (scene.d_directionalLights && scene.directionalLightCount > 0) {
+                                for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
+                                    GPUDirectionalLight light = scene.d_directionalLights[li];
+                                    float3 Ld = light.direction;
+                                    float3 shadowTransmittance = traceShadowRay(
+                                        handle, mediumPos, Ld, 0.001f, 1e30f);
+                                    float3 volumetricST = volumeShadowTransmittance(
+                                        mediumPos, Ld, 1e30f, scene.medium, rng);
+                                    shadowTransmittance = shadowTransmittance * volumetricST;
+                                    float slum = 0.2126f*shadowTransmittance.x + 0.7152f*shadowTransmittance.y + 0.0722f*shadowTransmittance.z;
+                                    if (slum < 1e-6f) continue;
+                                    float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
+                                    inScatter += shadowTransmittance * light.color * phase;
+                                }
+                            }
+
+                            // Route into the emissive bucket. Path terminates.
+                            float3 contrib = throughput * ssAlbedo * inScatter;
+                            emissiveContrib += clampFirefly_split(contrib, 10.0f);
+                            break;
+                        }
+                        // No scatter — ratio-track transmittance for surface span.
                         float3 T = volumeRatioTrack(
                             ray.origin, ray.direction, tEnter, tExit,
                             scene.medium, rng);
