@@ -13,6 +13,8 @@
 #include "gpu/NRDHelpers.cuh"
 #include "core/Math.h"
 #include "core/Halton.h"
+#include "core/VolumeMedium.h"
+#include "core/VolumeDevice.cuh"
 #include "gpu/AreaLightGPU.h"
 #include "gpu/LightGPU.h"
 #include "gpu/MaterialGPU.h"
@@ -353,6 +355,135 @@ extern "C" __global__ void __raygen__path_trace()
                 handle, ray.origin, ray.direction, ray.tmin, ray.tmax);
 
             bool didHit = (rp.hit != 0);
+
+            // ── Participating-medium integrator ──────────────────────
+            // Bounded heterogeneous volume integration via delta tracking with
+            // ratio tracking for through-transmittance. See core/VolumeDevice.cuh
+            // for the algorithm details. Skipped entirely when the medium is
+            // disabled or the majorant is zero — non-volumetric scenes pay only
+            // a single branch.
+            {
+                float tMaxSegment = didHit ? rp.tHit : ray.tmax;
+                if (scene.medium.enabled && scene.medium.majorantSigmaT > 0.0f) {
+                    float tEnter, tExit;
+                    if (volumeIntersect(ray.origin, ray.direction, ray.tmin, tMaxSegment,
+                                        scene.medium, tEnter, tExit))
+                    {
+                        float tHit = 0.0f;
+                        bool scattered = volumeDeltaTrack(
+                            ray.origin, ray.direction, tEnter, tExit,
+                            scene.medium, rng, tHit);
+                        if (scattered) {
+                            float3 mediumPos = ray.origin + ray.direction * tHit;
+                            float3 wo = -ray.direction;
+                            // σ_s/σ_t single-scatter albedo. Beer-Lambert
+                            // transmittance up to tHit is handled inside the
+                            // delta-tracking acceptance probability — do NOT
+                            // multiply throughput by an explicit transmittance.
+                            throughput = throughput * mediumSingleScatterAlbedo(scene.medium);
+
+                            // Single-scatter NEE: area lights.
+                            if (scene.d_areaLights && scene.areaLightCount > 0 &&
+                                scene.d_areaLightCDF && scene.areaLightTotalWeight > 0.0f)
+                            {
+                                uint32_t li = sampleAreaLightIndex(
+                                    scene.d_areaLightCDF, scene.areaLightCount,
+                                    pcg32_float(rng));
+                                GPUAreaLight light = scene.d_areaLights[li];
+                                float r1 = pcg32_float(rng), r2 = pcg32_float(rng);
+                                float su = sqrtf(r1);
+                                float b0 = 1.0f - su;
+                                float b1 = su * (1.0f - r2);
+                                float b2 = su * r2;
+                                float3 lp = light.v0 * b0
+                                           + (light.v0 + light.e1) * b1
+                                           + (light.v0 + light.e2) * b2;
+                                float3 toL = lp - mediumPos;
+                                float d2 = fmaxf(dot(toL, toL), 1e-6f);
+                                float d = sqrtf(d2);
+                                float3 Ld = toL * (1.0f / d);
+                                float lNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
+                                if (lNdot > 0.0f) {
+                                    float3 shadowTransmittance = traceShadowRay(
+                                        handle, mediumPos, Ld, 0.001f, fmaxf(d - 0.002f, 0.001f));
+                                    float3 volumetricST = volumeShadowTransmittance(
+                                        mediumPos, Ld, d, scene.medium, rng);
+                                    shadowTransmittance = shadowTransmittance * volumetricST;
+                                    float slum = 0.2126f*shadowTransmittance.x + 0.7152f*shadowTransmittance.y + 0.0722f*shadowTransmittance.z;
+                                    if (slum > 1e-6f) {
+                                        float pTri = light.weight / scene.areaLightTotalWeight;
+                                        float pArea = pTri / fmaxf(light.area, 1e-7f);
+                                        float pdfOmega = pArea * d2 / fmaxf(lNdot, 1e-7f);
+                                        float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
+                                        float w = powerHeuristic(pdfOmega, phase);
+                                        float3 Le = sampleAreaLightLe(light, b0, b1, b2);
+                                        radiance += throughput * shadowTransmittance * Le * (phase / fmaxf(pdfOmega, 1e-7f)) * w;
+                                    }
+                                }
+                            }
+
+                            // Single-scatter NEE: point lights.
+                            if (scene.d_pointLights && scene.pointLightCount > 0) {
+                                for (uint32_t li = 0; li < scene.pointLightCount; li++) {
+                                    GPUPointLight light = scene.d_pointLights[li];
+                                    float3 toL = light.position - mediumPos;
+                                    float d2 = fmaxf(dot(toL, toL), 1e-6f);
+                                    float d = sqrtf(d2);
+                                    float3 Ld = toL * (1.0f / d);
+                                    float3 shadowTransmittance = traceShadowRay(
+                                        handle, mediumPos, Ld, 0.001f, fmaxf(d - 0.002f, 0.001f));
+                                    float3 volumetricST = volumeShadowTransmittance(
+                                        mediumPos, Ld, d, scene.medium, rng);
+                                    shadowTransmittance = shadowTransmittance * volumetricST;
+                                    float slum = 0.2126f*shadowTransmittance.x + 0.7152f*shadowTransmittance.y + 0.0722f*shadowTransmittance.z;
+                                    if (slum < 1e-6f) continue;
+                                    float attenDen = light.constantAttenuation + light.linearAttenuation * d + light.quadraticAttenuation * d2;
+                                    float atten = 1.0f / fmaxf(attenDen, 1e-4f);
+                                    float3 Li = light.color * (light.intensity * atten);
+                                    float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
+                                    radiance += throughput * shadowTransmittance * Li * phase;
+                                }
+                            }
+
+                            // Single-scatter NEE: directional lights.
+                            if (scene.d_directionalLights && scene.directionalLightCount > 0) {
+                                for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
+                                    GPUDirectionalLight light = scene.d_directionalLights[li];
+                                    float3 Ld = light.direction;
+                                    float3 shadowTransmittance = traceShadowRay(
+                                        handle, mediumPos, Ld, 0.001f, 1e30f);
+                                    // Volume shadow extends from scatter point
+                                    // toward infinity along Ld; ratio tracking
+                                    // clips to the bounding box automatically.
+                                    float3 volumetricST = volumeShadowTransmittance(
+                                        mediumPos, Ld, 1e30f, scene.medium, rng);
+                                    shadowTransmittance = shadowTransmittance * volumetricST;
+                                    float slum = 0.2126f*shadowTransmittance.x + 0.7152f*shadowTransmittance.y + 0.0722f*shadowTransmittance.z;
+                                    if (slum < 1e-6f) continue;
+                                    float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
+                                    radiance += throughput * shadowTransmittance * light.color * phase;
+                                }
+                            }
+
+                            // Continue from the scatter point in a phase-sampled direction.
+                            float3 newDir = phaseHGSample(wo, scene.medium.anisotropy, rng);
+                            ray.origin = mediumPos;
+                            ray.direction = newDir;
+                            ray.tmin = 0.001f;
+                            ray.tmax = 1e30f;
+                            lastBounceDelta = false;
+                            continue;
+                        }
+                        // No scatter inside the volume — apply ratio-tracked
+                        // transmittance. The before/after-volume spans are
+                        // vacuum, so they contribute 1.
+                        float3 T = volumeRatioTrack(
+                            ray.origin, ray.direction, tEnter, tExit,
+                            scene.medium, rng);
+                        throughput = throughput * T;
+                    }
+                }
+            }
 
             if (!didHit) {
                 if (enableEnvironment) {
@@ -705,6 +836,10 @@ extern "C" __global__ void __raygen__path_trace()
                     float shadowTmax = fmaxf(dist - 0.002f, 0.001f);
                     float3 shadowTransmittance = traceShadowRay(
                         handle, shadowOrigin, Ld, 0.001f, shadowTmax);
+                    // Volumetric attenuation along the surface→area-light shadow.
+                    float3 volumetricST = volumeShadowTransmittance(
+                        shadowOrigin, Ld, dist, scene.medium, rng);
+                    shadowTransmittance = shadowTransmittance * volumetricST;
                     float shadowLum = 0.2126f * shadowTransmittance.x +
                                       0.7152f * shadowTransmittance.y +
                                       0.0722f * shadowTransmittance.z;
@@ -770,6 +905,10 @@ extern "C" __global__ void __raygen__path_trace()
                     float shadowTmax = fmaxf(dist - 0.002f, 0.001f);
                     float3 shadowTransmittancePL = traceShadowRay(
                         handle, shadowOrigin, Ld, 0.001f, shadowTmax);
+                    // Volumetric attenuation along the surface→point-light shadow.
+                    float3 volumetricSTPL = volumeShadowTransmittance(
+                        shadowOrigin, Ld, dist, scene.medium, rng);
+                    shadowTransmittancePL = shadowTransmittancePL * volumetricSTPL;
                     float shadowLumPL = 0.2126f * shadowTransmittancePL.x +
                                         0.7152f * shadowTransmittancePL.y +
                                         0.0722f * shadowTransmittancePL.z;
@@ -795,8 +934,14 @@ extern "C" __global__ void __raygen__path_trace()
                     float NdotL = fmaxf(dot(N, Ld), 0.0f);
                     if (NdotL <= 0.0f) continue;
 
+                    float3 shadowOriginDL = hit.position + N * 0.001f;
                     float3 shadowTransmittanceDL = traceShadowRay(
-                        handle, hit.position + N * 0.001f, Ld, 0.001f, 1e30f);
+                        handle, shadowOriginDL, Ld, 0.001f, 1e30f);
+                    // Ratio-track through the volume to the bounding-box exit
+                    // along Ld. For unbounded media this gracefully skips.
+                    float3 volumetricDL = volumeShadowTransmittance(
+                        shadowOriginDL, Ld, 1e30f, scene.medium, rng);
+                    shadowTransmittanceDL = shadowTransmittanceDL * volumetricDL;
                     float shadowLumDL = 0.2126f * shadowTransmittanceDL.x +
                                         0.7152f * shadowTransmittanceDL.y +
                                         0.0722f * shadowTransmittanceDL.z;
@@ -1211,6 +1356,28 @@ extern "C" __global__ void __raygen__path_trace_split()
                 handle, ray.origin, ray.direction, ray.tmin, ray.tmax);
             bool didHit = (rp.hit != 0);
 
+            // Volume transmittance over the segment. The split kernel
+            // intentionally skips in-scatter sampling (NRD's split outputs
+            // don't have a clean bucket for scattered radiance); we only
+            // apply ratio-tracked attenuation so geometry behind fog reads
+            // correctly under NRD/DLSS-RR.
+            {
+                float segmentDistance = didHit ? rp.tHit : ray.tmax;
+                if (scene.medium.enabled && scene.medium.majorantSigmaT > 0.0f &&
+                    segmentDistance > 0.0f)
+                {
+                    float tEnter, tExit;
+                    if (volumeIntersect(ray.origin, ray.direction, ray.tmin, segmentDistance,
+                                        scene.medium, tEnter, tExit))
+                    {
+                        float3 T = volumeRatioTrack(
+                            ray.origin, ray.direction, tEnter, tExit,
+                            scene.medium, rng);
+                        throughput = throughput * T;
+                    }
+                }
+            }
+
             if (!didHit) {
                 if (enableEnvironment) {
                     bool shForThisBounce = (bounce > 0) && !lastBounceDelta;
@@ -1498,6 +1665,9 @@ extern "C" __global__ void __raygen__path_trace_split()
                     float3 shadowOrigin = hit.position + N * 0.001f;
                     float shadowTmax = fmaxf(d - 0.002f, 0.001f);
                     float3 st = traceShadowRay(handle, shadowOrigin, Ld, 0.001f, shadowTmax);
+                    float3 volumetricST = volumeShadowTransmittance(
+                        shadowOrigin, Ld, d, scene.medium, rng);
+                    st = st * volumetricST;
                     float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
                     if (slum > 1e-6f) {
                         float3 V = -ray.direction;
@@ -1557,6 +1727,9 @@ extern "C" __global__ void __raygen__path_trace_split()
                     float3 shadowOrigin = hit.position + N * 0.001f;
                     float shadowTmax = fmaxf(d - 0.002f, 0.001f);
                     float3 st = traceShadowRay(handle, shadowOrigin, Ld, 0.001f, shadowTmax);
+                    float3 volumetricSTPL = volumeShadowTransmittance(
+                        shadowOrigin, Ld, d, scene.medium, rng);
+                    st = st * volumetricSTPL;
                     float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
                     if (slum < 1e-6f) continue;
                     float attenDen = light.constantAttenuation
@@ -1586,7 +1759,11 @@ extern "C" __global__ void __raygen__path_trace_split()
                     float NdotL = fmaxf(dot(N, Ld), 0.0f);
                     if (NdotL <= 0.0f) continue;
 
-                    float3 st = traceShadowRay(handle, hit.position + N * 0.001f, Ld, 0.001f, 1e30f);
+                    float3 shadowOriginDL = hit.position + N * 0.001f;
+                    float3 st = traceShadowRay(handle, shadowOriginDL, Ld, 0.001f, 1e30f);
+                    float3 volumetricDL = volumeShadowTransmittance(
+                        shadowOriginDL, Ld, 1e30f, scene.medium, rng);
+                    st = st * volumetricDL;
                     float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
                     if (slum < 1e-6f) continue;
 

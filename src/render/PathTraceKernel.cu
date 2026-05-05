@@ -531,6 +531,42 @@ __global__ void pathTraceKernel(
                             }
                         }
 
+                        // Single-scatter NEE: directional lights.
+                        if (scene.d_directionalLights && scene.directionalLightCount > 0) {
+                            for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
+                                GPUDirectionalLight light = scene.d_directionalLights[li];
+                                float3 Ld = light.direction;
+                                bool occluded = false;
+                                float3 st = make_float3(1, 1, 1);
+                                if (scene.d_bvhNodes && scene.totalTriangles > 0) {
+                                    Ray sr; sr.origin = mediumPos; sr.direction = Ld;
+                                    sr.tmin = 0.001f; sr.tmax = 1e30f;
+                                    for (int sStep = 0; sStep < 8; sStep++) {
+                                        HitRecord sh; sh.t = sr.tmax;
+                                        if (!bvh_closestHit(sr, scene.d_bvhNodes, scene.bvhRootIndex,
+                                                            scene.d_positions, scene.d_indices, scene.d_materialIndices, sh)) break;
+                                        GPUMaterial sm;
+                                        if (sh.materialIndex >= 0 && (uint32_t)sh.materialIndex < scene.materialCount)
+                                            sm = scene.d_materials[sh.materialIndex];
+                                        else { occluded = true; break; }
+                                        if (sm.transmission > 0.0f) {
+                                            float sl = 0.2126f*sm.albedo.x + 0.7152f*sm.albedo.y + 0.0722f*sm.albedo.z;
+                                            if (sl < 0.9f) st = st * sm.albedo;
+                                            sr.origin = sh.position + Ld * 0.002f;
+                                            sr.tmax = 1e30f;
+                                        } else { occluded = true; break; }
+                                    }
+                                }
+                                float3 volumetricST = volumeShadowTransmittance(
+                                    mediumPos, Ld, 1e30f, scene.medium, rng);
+                                st = st * volumetricST;
+                                float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
+                                if (occluded || slum < 1e-6f) continue;
+                                float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
+                                radiance += throughput * st * light.color * phase;
+                            }
+                        }
+
                         // Continue from the scatter point in a phase-sampled direction.
                         float3 newDir = phaseHGSample(wo, scene.medium.anisotropy, rng);
                         ray.origin = mediumPos;
@@ -1345,6 +1381,10 @@ __global__ void pathTraceKernel(
                     }
                 }
 
+                float3 shadowOriginDL = hit.position + N * 0.001f;
+                float3 volumetricDL = volumeShadowTransmittance(
+                    shadowOriginDL, Ld, 1e30f, scene.medium, rng);
+                shadowTransmittanceDL = shadowTransmittanceDL * volumetricDL;
                 float shadowLumDL = 0.2126f * shadowTransmittanceDL.x + 0.7152f * shadowTransmittanceDL.y + 0.0722f * shadowTransmittanceDL.z;
                 if (occluded || shadowLumDL < 1e-6f) continue;
 

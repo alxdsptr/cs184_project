@@ -9,6 +9,8 @@
 #include "gpu/Random.h"
 #include "gpu/BRDF.h"
 #include "util/CudaCheck.h"
+#include "core/VolumeMedium.h"
+#include "core/VolumeDevice.cuh"
 
 #include <cuda_fp16.h>
 
@@ -287,6 +289,27 @@ __global__ void pathTraceKernelSplit(
                 ray, scene.d_bvhNodes, scene.bvhRootIndex,
                 scene.d_positions, scene.d_indices, scene.d_materialIndices,
                 hit);
+        }
+
+        // Volume transmittance over the segment. The split kernel skips
+        // in-scatter sampling (NRD's diff/spec/emissive split has no clean
+        // bucket for scattered radiance) and only applies ratio-tracked
+        // attenuation so geometry behind fog reads correctly under NRD/DLSS-RR.
+        {
+            float segmentDistance = didHit ? hit.t : ray.tmax;
+            if (scene.medium.enabled && scene.medium.majorantSigmaT > 0.0f &&
+                segmentDistance > 0.0f)
+            {
+                float tEnter, tExit;
+                if (volumeIntersect(ray.origin, ray.direction, ray.tmin, segmentDistance,
+                                    scene.medium, tEnter, tExit))
+                {
+                    float3 T = volumeRatioTrack(
+                        ray.origin, ray.direction, tEnter, tExit,
+                        scene.medium, rng);
+                    throughput = throughput * T;
+                }
+            }
         }
 
         if (!didHit) {
@@ -571,6 +594,10 @@ __global__ void pathTraceKernelSplit(
                         } else { occluded = true; break; }
                     }
                 }
+                float3 shadowOriginA = hit.position + N * 0.001f;
+                float3 volumetricST = volumeShadowTransmittance(
+                    shadowOriginA, Ld, d, scene.medium, rng);
+                st = st * volumetricST;
                 float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
                 if (!occluded && slum > 1e-6f) {
                     float3 V = -ray.direction;
@@ -653,6 +680,10 @@ __global__ void pathTraceKernelSplit(
                         } else { occ = true; break; }
                     }
                 }
+                float3 shadowOriginP = hit.position + N * 0.001f;
+                float3 volumetricSTPL = volumeShadowTransmittance(
+                    shadowOriginP, Ld, d, scene.medium, rng);
+                st = st * volumetricSTPL;
                 float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
                 if (occ || slum < 1e-6f) continue;
                 float attenDen = light.constantAttenuation + light.linearAttenuation*d + light.quadraticAttenuation*d2;
@@ -700,6 +731,10 @@ __global__ void pathTraceKernelSplit(
                         } else { occ = true; break; }
                     }
                 }
+                float3 shadowOriginD = hit.position + N * 0.001f;
+                float3 volumetricSTDL = volumeShadowTransmittance(
+                    shadowOriginD, Ld, 1e30f, scene.medium, rng);
+                st = st * volumetricSTDL;
                 float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
                 if (occ || slum < 1e-6f) continue;
                 float3 brdf;
