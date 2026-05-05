@@ -141,7 +141,8 @@ def _drawtext_path(p: Path) -> str:
 
 def assemble_grid(variant_dirs: list[tuple[Variant, Path]], out_path: Path,
                   fps: float, width: int, height: int,
-                  font_path: Path | None, no_labels: bool) -> None:
+                  font_path: Path | None, no_labels: bool,
+                  crf: int, preset: str, max_fps: float | None) -> None:
     """Build a grid video with one cell per variant. Each cell is labeled."""
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg not found in PATH")
@@ -171,30 +172,38 @@ def assemble_grid(variant_dirs: list[tuple[Variant, Path]], out_path: Path,
         scale = f"[{i}:v]scale={cell_w}:{cell_h}:flags=lanczos"
         if do_labels:
             label = variant.label.replace("\\", r"\\").replace("'", r"\'")
+            # Note: padded the label with spaces instead of using `boxborderw`,
+            # which only exists on newer ffmpeg builds (older drawtext rejects
+            # it as "Option 'boxborderw' not found").
             chains.append(
                 f"{scale},"
-                f"drawtext={drawtext_font}text='{label}':"
-                f"x=20:y=20:fontsize=28:fontcolor=white:box=1:boxcolor=0x00000080:boxborderw=8"
+                f"drawtext={drawtext_font}text=' {label} ':"
+                f"x=20:y=20:fontsize=28:fontcolor=white:box=1:boxcolor=0x00000080"
                 f"[v{i}]"
             )
         else:
             chains.append(f"{scale}[v{i}]")
 
+    # Build the grid using only hstack/vstack (xstack isn't available on
+    # older ffmpeg builds, including the one bundled with conda's
+    # py310 env). Each row is an hstack; rows are vstack'd together.
     if n == 1:
         chains.append("[v0]copy[out]")
     else:
-        # xstack layout cells: each cell's top-left is expressed as
-        # "x_y" where x and y are sums of widths/heights of *prior* inputs in
-        # the same row/column. e.g. for a 2x2 grid: 0_0 | w0_0 | 0_h0 | w0_h0.
-        layout_parts: list[str] = []
-        for i in range(n):
-            cx = i % cols
-            cy = i // cols
-            x_expr = "0" if cx == 0 else "+".join(f"w{k}" for k in range(cx))
-            y_expr = "0" if cy == 0 else "+".join(f"h{k * cols}" for k in range(cy))
-            layout_parts.append(f"{x_expr}_{y_expr}")
-        inputs = "".join(f"[v{i}]" for i in range(n))
-        chains.append(f"{inputs}xstack=inputs={n}:layout={'|'.join(layout_parts)}[out]")
+        row_labels: list[str] = []
+        for r in range(rows):
+            row_inputs = [f"[v{r * cols + c}]" for c in range(cols)
+                          if r * cols + c < n]
+            if len(row_inputs) == 1:
+                row_label = row_inputs[0].strip("[]")
+            else:
+                row_label = f"row{r}"
+                chains.append(f"{''.join(row_inputs)}hstack=inputs={len(row_inputs)}[{row_label}]")
+            row_labels.append(f"[{row_label}]")
+        if rows == 1:
+            chains.append(f"{row_labels[0]}copy[out]")
+        else:
+            chains.append(f"{''.join(row_labels)}vstack=inputs={rows}[out]")
 
     filter_complex = ";".join(chains)
     args += [
@@ -202,10 +211,14 @@ def assemble_grid(variant_dirs: list[tuple[Variant, Path]], out_path: Path,
         "-map", "[out]",
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
-        "-crf", "18",
-        "-preset", "medium",
-        str(out_path),
+        "-crf", str(crf),
+        "-preset", preset,
     ]
+    # Cap output framerate. Recordings often run at 60-100+ fps which makes
+    # huge files for tiny visual gain — 30 fps is plenty for the eye.
+    if max_fps is not None and fps > max_fps:
+        args += ["-r", str(max_fps)]
+    args.append(str(out_path))
     print(f"\n[ffmpeg] composing {n} variants -> {out_path} ({cols}x{rows})")
     print(f"  $ {' '.join(args)}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -216,7 +229,8 @@ def assemble_grid(variant_dirs: list[tuple[Variant, Path]], out_path: Path,
 # Per-variant solo encode (handy for inspecting a single variant)
 # ---------------------------------------------------------------------------
 
-def assemble_solo(frames_dir: Path, out_path: Path, fps: float) -> None:
+def assemble_solo(frames_dir: Path, out_path: Path, fps: float,
+                  crf: int, preset: str, max_fps: float | None) -> None:
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg not found in PATH")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -226,9 +240,12 @@ def assemble_solo(frames_dir: Path, out_path: Path, fps: float) -> None:
         "-i", str(frames_dir / "frame_%06d.png"),
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
-        "-crf", "18",
-        str(out_path),
+        "-crf", str(crf),
+        "-preset", preset,
     ]
+    if max_fps is not None and fps > max_fps:
+        args += ["-r", str(max_fps)]
+    args.append(str(out_path))
     subprocess.run(args, check=True)
 
 
@@ -291,6 +308,16 @@ def parse_args() -> argparse.Namespace:
                    help="Font file for cell labels. Auto-detects Arial / DejaVu Sans if omitted.")
     p.add_argument("--no-labels", action="store_true",
                    help="Skip the drawtext label overlay (useful if ffmpeg has no usable font)")
+    p.add_argument("--crf", type=int, default=23,
+                   help="x264 CRF (lower = bigger/sharper, higher = smaller). "
+                        "Default 23 (visually transparent at this resolution). Try 26-28 for tiny files.")
+    p.add_argument("--preset", default="slow",
+                   choices=["ultrafast", "superfast", "veryfast", "faster", "fast",
+                            "medium", "slow", "slower", "veryslow"],
+                   help="x264 preset; slower = better compression at the same CRF. Default 'slow'.")
+    p.add_argument("--max-fps", type=float, default=30.0,
+                   help="Cap output framerate. Recordings often run at >60 fps which bloats the file; "
+                        "30 fps is plenty for the eye. Pass 0 to disable the cap.")
     p.add_argument("--keep-existing", action="store_true",
                    help="Skip rendering a variant if its output dir already has frames")
     p.add_argument("--solo", action="store_true",
@@ -390,15 +417,18 @@ def main() -> int:
         print("[warn] variants produced different frame counts; xstack will use the shortest stream",
               file=sys.stderr)
 
+    max_fps = args.max_fps if args.max_fps and args.max_fps > 0 else None
     assemble_grid(variant_dirs, out_path, fps,
                   args.resolution[0], args.resolution[1],
-                  args.font, args.no_labels)
-    print(f"\nWrote {out_path}")
+                  args.font, args.no_labels,
+                  args.crf, args.preset, max_fps)
+    size_mb = out_path.stat().st_size / (1024 * 1024)
+    print(f"\nWrote {out_path}  ({size_mb:.1f} MiB)")
 
     if args.solo:
         for v, out_dir in variant_dirs:
             solo_out = out_path.with_name(f"{out_path.stem}_{v.name}.mp4")
-            assemble_solo(out_dir, solo_out, fps)
+            assemble_solo(out_dir, solo_out, fps, args.crf, args.preset, max_fps)
             print(f"Wrote {solo_out}")
 
     return 0
