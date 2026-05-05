@@ -310,8 +310,12 @@ extern "C" __global__ void __raygen__path_trace()
     const bool dlssPublish = (params.gbuffer.hdrColor != 0);
 
     for (uint32_t s = 0; s < samplesPerPixel; s++) {
+        // Mix frameIndex so replay (which resets sampleIndex per pose) doesn't
+        // generate identical noise patterns frame-to-frame — DLSS / DLSS-RR /
+        // NRD need uncorrelated noise to temporally accumulate.
+        uint32_t seedSalt = params.sampleIndex + camera.frameIndex * 0x9E3779B9u;
         uint32_t rng = pcg32_seed(pixelIdx * 0x9E3779B9u + s,
-                                  params.sampleIndex * 0x85EBCA6Bu + s);
+                                  seedSalt * 0x85EBCA6Bu + s);
 
         // ReSTIR (DI / GI / PT) reservoirs were generated against the surface
         // hit by the unjittered camera ray (only camera.jitterOffset, no
@@ -1310,8 +1314,12 @@ extern "C" __global__ void __raygen__path_trace_split()
     float  outPrimaryMetallic  = 0.0f;
 
     for (uint32_t s = 0; s < samplesPerPixel; s++) {
+        // Mix frameIndex so replay (which resets sampleIndex per pose) doesn't
+        // generate identical noise patterns frame-to-frame — DLSS-RR / NRD
+        // need uncorrelated noise to temporally accumulate.
+        uint32_t seedSalt = params.sampleIndex + camera.frameIndex * 0x9E3779B9u;
         uint32_t rng = pcg32_seed(pixelIdx * 0x9E3779B9u + s,
-                                  params.sampleIndex * 0x85EBCA6Bu + s);
+                                  seedSalt * 0x85EBCA6Bu + s);
 
         // NRD/DLSS require the ray-gen sub-pixel offset to exactly match
         // `camera.jitterOffset` (Halton). See PathTraceKernelSplit.cu for
