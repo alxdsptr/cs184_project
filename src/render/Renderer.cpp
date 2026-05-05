@@ -229,6 +229,7 @@ void Renderer::renderFrame(
 
         m_lastCamera = camera;
         m_lastCameraValid = true;
+        m_lastCameraMoved = cameraMoved;
         m_frameIndex = frameIndex;
         if (display && display != m_display) {
             display->setPrePresentRecorder(&Renderer::prePresentTrampoline, this);
@@ -337,6 +338,7 @@ void Renderer::renderFrame(
     // jitter for NRDOnly) so NRD sees the same jitter the ray-gen used.
     m_lastCamera = cameraForSplit;
     m_lastCameraValid = true;
+    m_lastCameraMoved = cameraMoved;
     m_frameIndex = frameIndex;
     // Register the pre-present hook idempotently.
     if (display && display != m_display) {
