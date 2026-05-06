@@ -223,65 +223,97 @@ __device__ inline bool ptSampleBsdfDir(
 __device__ inline float3 ptDirectLightingAtVertex(
     const DeviceSceneData& scene, const ReSTIRSurface& s, uint32_t& rng)
 {
-    if (!scene.d_areaLights || scene.areaLightCount == 0 ||
-        !scene.d_lightBVHNodes) return make_float3(0, 0, 0);
-    if (!scene.d_bvhNodes || scene.totalTriangles == 0)
-        return make_float3(0, 0, 0);
+    float3 Li = make_float3(0.0f, 0.0f, 0.0f);
+    if (!scene.d_bvhNodes || scene.totalTriangles == 0) return Li;
 
-    uint32_t slot = 0;
-    float    pSelect = 0.0f;
-    if (!lightBVH_sample(scene.d_lightBVHNodes, scene.lightBVHRootIndex,
-                         s.position, pcg32_float(rng), slot, pSelect) ||
-        !(pSelect > 0.0f))
-        return make_float3(0, 0, 0);
-    uint32_t lightIdx = scene.d_lightOrderedIndices[slot];
-    GPUAreaLight light = scene.d_areaLights[lightIdx];
+    // ── Area-light NEE via light BVH ──────────────────────────────────────
+    do {
+        if (!scene.d_areaLights || scene.areaLightCount == 0 ||
+            !scene.d_lightBVHNodes) break;
 
-    float r1 = pcg32_float(rng), r2 = pcg32_float(rng);
-    float su = sqrtf(r1);
-    float b0 = 1.0f - su;
-    float b1 = su * (1.0f - r2);
-    float b2 = su * r2;
-    float3 lp = light.v0 * b0 + (light.v0 + light.e1) * b1
-              + (light.v0 + light.e2) * b2;
-    float3 toL = lp - s.position;
-    float  d2  = fmaxf(dot(toL, toL), 1e-6f);
-    float  d   = sqrtf(d2);
-    float3 L   = toL * (1.0f / d);
-    float NdotL = fmaxf(dot(s.normal, L), 0.0f);
-    float lightCos = fmaxf(dot(light.normal, -L), 0.0f);
-    if (NdotL <= 0.0f || lightCos <= 0.0f) return make_float3(0, 0, 0);
+        uint32_t slot = 0;
+        float    pSelect = 0.0f;
+        if (!lightBVH_sample(scene.d_lightBVHNodes, scene.lightBVHRootIndex,
+                             s.position, pcg32_float(rng), slot, pSelect) ||
+            !(pSelect > 0.0f))
+            break;
+        uint32_t lightIdx = scene.d_lightOrderedIndices[slot];
+        GPUAreaLight light = scene.d_areaLights[lightIdx];
 
-    float3 shadowOrigin = s.position + s.normal * 0.001f;
-    if (bvh_anyHit(shadowOrigin, lp,
-                   scene.d_bvhNodes, scene.bvhRootIndex,
-                   scene.d_positions, scene.d_indices))
-        return make_float3(0, 0, 0);
+        float r1 = pcg32_float(rng), r2 = pcg32_float(rng);
+        float su = sqrtf(r1);
+        float b0 = 1.0f - su;
+        float b1 = su * (1.0f - r2);
+        float b2 = su * r2;
+        float3 lp = light.v0 * b0 + (light.v0 + light.e1) * b1
+                  + (light.v0 + light.e2) * b2;
+        float3 toL = lp - s.position;
+        float  d2  = fmaxf(dot(toL, toL), 1e-6f);
+        float  d   = sqrtf(d2);
+        float3 L   = toL * (1.0f / d);
+        float NdotL = fmaxf(dot(s.normal, L), 0.0f);
+        float lightCos = fmaxf(dot(light.normal, -L), 0.0f);
+        if (NdotL <= 0.0f || lightCos <= 0.0f) break;
 
-    float3 Le;
-    if (light.emissiveTex == 0) {
-        Le = light.emission;
-    } else {
-        float texU = light.uv0.x * b0 + light.uv1.x * b1 + light.uv2.x * b2;
-        float texV = light.uv0.y * b0 + light.uv1.y * b1 + light.uv2.y * b2;
-        float4 et = tex2D<float4>(light.emissiveTex, texU, texV);
-        Le = make_float3(et.x, et.y, et.z) * light.emission;
+        float3 shadowOrigin = s.position + s.normal * 0.001f;
+        if (bvh_anyHit(shadowOrigin, lp,
+                       scene.d_bvhNodes, scene.bvhRootIndex,
+                       scene.d_positions, scene.d_indices))
+            break;
+
+        float3 Le;
+        if (light.emissiveTex == 0) {
+            Le = light.emission;
+        } else {
+            float texU = light.uv0.x * b0 + light.uv1.x * b1 + light.uv2.x * b2;
+            float texV = light.uv0.y * b0 + light.uv1.y * b1 + light.uv2.y * b2;
+            float4 et = tex2D<float4>(light.emissiveTex, texU, texV);
+            Le = make_float3(et.x, et.y, et.z) * light.emission;
+        }
+
+        float3 brdf = restirEvalBrdf(s, L);
+        float pTri  = pSelect;
+        float pArea = pTri / fmaxf(light.area, 1e-7f);
+        float pdfOmega = pArea * d2 / fmaxf(lightCos, 1e-7f);
+        float3 areaLi = brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f));
+        // Source-side firefly clamp at the indirect bounce. Mirrors the GI
+        // path's clamp in giDirectLightingAtSample. See ReSTIRGI.cu for the
+        // rationale; in short: a grazing NEE-firefly stored in `sampleRadiance`
+        // would get propagated forward for ~mCap frames by the temporal pass.
+        // 25 luminance is tighter than GI's 50 because PT's path postfix can
+        // multiply Li through several throughput stages (random-walk bounces).
+        float lumLi = restirLuminance(areaLi);
+        const float liCap = 25.0f;
+        if (lumLi > liCap) areaLi = areaLi * (liCap / lumLi);
+        Li = Li + areaLi;
+    } while (0);
+
+    // ── Directional-light NEE ─────────────────────────────────────────────
+    // Delta direction → no MIS weighting and no 1/pdfOmega blow-up, so no
+    // source-side firefly clamp is needed. Synthetic far target lets us
+    // reuse bvh_anyHit's target-position interface for an "infinite" ray.
+    // Point lights are intentionally omitted (matches the OptiX kernel's
+    // area-vs-point exclusivity: directional always runs, point only runs
+    // when there are no area lights).
+    if (scene.d_directionalLights && scene.directionalLightCount > 0) {
+        float3 shadowOrigin = s.position + s.normal * 0.001f;
+        for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
+            GPUDirectionalLight light = scene.d_directionalLights[li];
+            float3 Ld = light.direction;
+            float NdotL = fmaxf(dot(s.normal, Ld), 0.0f);
+            if (NdotL <= 0.0f) continue;
+
+            float3 shadowTarget = shadowOrigin + Ld * 1.0e10f;
+            if (bvh_anyHit(shadowOrigin, shadowTarget,
+                           scene.d_bvhNodes, scene.bvhRootIndex,
+                           scene.d_positions, scene.d_indices))
+                continue;
+
+            float3 brdf = restirEvalBrdf(s, Ld);
+            Li = Li + brdf * light.color * NdotL;
+        }
     }
 
-    float3 brdf = restirEvalBrdf(s, L);
-    float pTri  = pSelect;
-    float pArea = pTri / fmaxf(light.area, 1e-7f);
-    float pdfOmega = pArea * d2 / fmaxf(lightCos, 1e-7f);
-    float3 Li = brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f));
-    // Source-side firefly clamp at the indirect bounce. Mirrors the GI
-    // path's clamp in giDirectLightingAtSample. See ReSTIRGI.cu for the
-    // rationale; in short: a grazing NEE-firefly stored in `sampleRadiance`
-    // would get propagated forward for ~mCap frames by the temporal pass.
-    // 25 luminance is tighter than GI's 50 because PT's path postfix can
-    // multiply Li through several throughput stages (random-walk bounces).
-    float lumLi = restirLuminance(Li);
-    const float liCap = 25.0f;
-    if (lumLi > liCap) Li = Li * (liCap / lumLi);
     return Li;
 }
 

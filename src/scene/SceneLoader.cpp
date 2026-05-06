@@ -492,8 +492,65 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         const aiLight* aiL = aiScn->mLights[i];
         if (!aiL) continue;
 
-        if (aiL->mType != aiLightSource_POINT && aiL->mType != aiLightSource_SPOT) continue;
-        if (!colladaCGLAreaLights.empty()) continue;
+        LOG_DEBUG("Light[%u] '%s': type=%d color=(%.2f,%.2f,%.2f) atten=(%.4f,%.4f,%.4f)",
+                  i, aiL->mName.C_Str(), (int)aiL->mType,
+                  aiL->mColorDiffuse.r, aiL->mColorDiffuse.g, aiL->mColorDiffuse.b,
+                  aiL->mAttenuationConstant, aiL->mAttenuationLinear, aiL->mAttenuationQuadratic);
+
+        if (aiL->mType == aiLightSource_DIRECTIONAL) {
+            DirectionalLight light;
+
+            aiVector3D lightDir = aiL->mDirection;
+            const aiNode* lightNode = findNodeByName(aiScn->mRootNode, aiL->mName);
+            if (lightNode) {
+                aiMatrix4x4 world = computeWorldTransform(lightNode);
+                aiMatrix3x3 rotation(world);
+                lightDir = rotation * lightDir;
+            }
+
+            if (lightDir.SquareLength() > 1e-12f) {
+                light.direction = normalize(-toFloat3(lightDir));
+            } else {
+                light.direction = make_float3(0.0f, -1.0f, 0.0f);
+            }
+
+            light.color = toFloat3(aiL->mColorDiffuse);
+            light.color *= 0.15f; // Temporarily downscaling for BistroExterior.fbx
+            if (light.color.x <= 0.0f && light.color.y <= 0.0f && light.color.z <= 0.0f) {
+                light.color = make_float3(1.0f, 1.0f, 1.0f);
+            }
+
+            LOG_INFO("  Resolved directional light '%s' -> direction=(%.4f,%.4f,%.4f) color=(%.4f,%.4f,%.4f)",
+                     aiL->mName.C_Str(),
+                     light.direction.x, light.direction.y, light.direction.z,
+                     light.color.x, light.color.y, light.color.z);
+
+            scene.getDirectionalLights().push_back(light);
+            continue;
+        }
+
+        // Currently only point and spot lights are supported (treat spot as point)
+        if (aiL->mType != aiLightSource_POINT && aiL->mType != aiLightSource_SPOT) {
+            LOG_WARN("Skipping unsupported light type %d for %s",
+                     (int)aiL->mType, aiL->mName.C_Str());
+            continue;
+        }
+
+        // Skip lights that the COLLADA file marks as area lights via the CGL
+        // <extra> extension — those are provided by an emissive mesh elsewhere
+        // in the scene, and loading them here would double-count the emitter.
+        // If the file contains ANY CGL area-light markers we skip every point
+        // light in the file: name matching against Assimp's aiLight::mName is
+        // unreliable across Assimp versions (it may hold the light id, the
+        // instancing node's id, or the node's name), and .dae files that use
+        // the CGL extension are authored so the real illumination comes from
+        // emissive mesh geometry — keeping the point light on top double-lit
+        // the scene (visible on CBbunny.dae as a washed-out look).
+        if (!colladaCGLAreaLights.empty()) {
+            LOG_DEBUG("Skipping point light '%s': COLLADA file uses CGL area-light extension",
+                      aiL->mName.C_Str());
+            continue;
+        }
 
         PointLight light;
         float3 pos = toFloat3(aiL->mPosition);

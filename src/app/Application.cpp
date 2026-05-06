@@ -945,6 +945,7 @@ void Application::runGui() {
                 m_envMapPathBuf,
                 sizeof(m_envMapPathBuf),
                 envMapLoadRequested,
+                &m_medium,
                 modePtr, qualityPtr, rrW, rrH,
                 &m_debugNormalViz,
                 &m_enableNormalMap,
@@ -998,6 +999,17 @@ void Application::runGui() {
 #endif
 
         m_camera.setMoveSpeed(moveSpeed);
+        // Clamp medium parameters and refresh the cached majorant after any
+        // GUI-driven edits this frame.
+        m_medium.density       = fmaxf(m_medium.density, 0.0f);
+        m_medium.anisotropy    = fminf(fmaxf(m_medium.anisotropy, -0.99f), 0.99f);
+        m_medium.falloffHeight = fmaxf(m_medium.falloffHeight, 0.001f);
+        m_medium.fbmFrequency  = fmaxf(m_medium.fbmFrequency, 1e-5f);
+        m_medium.fbmOctaves    = m_medium.fbmOctaves < 1 ? 1
+                                : (m_medium.fbmOctaves > 8 ? 8 : m_medium.fbmOctaves);
+        m_medium.heightFBMMix  = fminf(fmaxf(m_medium.heightFBMMix, 0.0f), 1.0f);
+        m_medium.recomputeMajorant();
+        m_scene.getMedium() = m_medium;
         m_renderer.setExposure(exposure);
         if (toneMappingMode < (int)ToneMappingMode::None) {
             toneMappingMode = (int)ToneMappingMode::None;

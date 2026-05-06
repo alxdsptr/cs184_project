@@ -29,6 +29,8 @@ struct DeviceSceneData {
     uint32_t     materialCount     = 0;
     GPUPointLight* d_pointLights   = nullptr;
     uint32_t       pointLightCount = 0;
+    GPUDirectionalLight* d_directionalLights = nullptr;
+    uint32_t             directionalLightCount = 0;
     GPUAreaLight* d_areaLights     = nullptr;
     float*       d_areaLightCDF    = nullptr;
     uint32_t     areaLightCount    = 0;

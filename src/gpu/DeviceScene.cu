@@ -50,12 +50,13 @@ static float4 transformTangent(const float4x4& M, float4 t) {
 void DeviceScene::upload(const Scene& scene) {
     free(); // release any prior data
 
-    const auto& meshes    = scene.getMeshes();
-    const auto& materials = scene.getMaterials();
-    const auto& lights    = scene.getLights();
-    const auto& areaLights= scene.getAreaLights();
-    const auto& bindings  = scene.getMeshBindings();
-    const auto& nodes     = scene.getNodes();
+    const auto& meshes            = scene.getMeshes();
+    const auto& materials         = scene.getMaterials();
+    const auto& lights            = scene.getLights();
+    const auto& directionalLights = scene.getDirectionalLights();
+    const auto& areaLights        = scene.getAreaLights();
+    const auto& bindings          = scene.getMeshBindings();
+    const auto& nodes             = scene.getNodes();
 
     m_data.medium = scene.getMedium();
 
@@ -68,6 +69,7 @@ void DeviceScene::upload(const Scene& scene) {
     m_data.totalTriangles = totalTris;
     m_data.materialCount  = (uint32_t)materials.size();
     m_data.pointLightCount = (uint32_t)lights.size();
+    m_data.directionalLightCount = (uint32_t)directionalLights.size();
     m_data.areaLightCount = (uint32_t)areaLights.size();
 
     // Flatten — same merged-buffer layout the rest of the renderer expects.
@@ -288,6 +290,20 @@ void DeviceScene::upload(const Scene& scene) {
                               lights.size() * sizeof(GPUPointLight), cudaMemcpyHostToDevice));
     }
 
+    if (!directionalLights.empty()) {
+        std::vector<GPUDirectionalLight> gpuDirectionalLights(directionalLights.size());
+        for (size_t i = 0; i < directionalLights.size(); i++) {
+            gpuDirectionalLights[i].direction = directionalLights[i].direction;
+            gpuDirectionalLights[i].color = directionalLights[i].color;
+        }
+
+        CUDA_CHECK(cudaMalloc(&m_data.d_directionalLights,
+                              directionalLights.size() * sizeof(GPUDirectionalLight)));
+        CUDA_CHECK(cudaMemcpy(m_data.d_directionalLights, gpuDirectionalLights.data(),
+                              directionalLights.size() * sizeof(GPUDirectionalLight),
+                              cudaMemcpyHostToDevice));
+    }
+
     // Area lights — full set goes through both BSDF-hit emissive lookup AND
     // the NEE / light-BVH path. Animated lights get their world triangle and
     // BVH leaf AABBs refreshed each frame by the light-update + BVH-refit
@@ -451,6 +467,7 @@ void DeviceScene::free() {
     if (m_data.d_materials)       { cudaFree(m_data.d_materials); }
     if (m_data.d_materialIndices) { cudaFree(m_data.d_materialIndices); }
     if (m_data.d_pointLights)     { cudaFree(m_data.d_pointLights); }
+    if (m_data.d_directionalLights) { cudaFree(m_data.d_directionalLights); }
     if (m_data.d_areaLights)      { cudaFree(m_data.d_areaLights); }
     if (m_data.d_areaLightCDF)    { cudaFree(m_data.d_areaLightCDF); }
     if (m_data.d_triangleAreaLightIndex) { cudaFree(m_data.d_triangleAreaLightIndex); }

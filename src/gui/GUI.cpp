@@ -1,6 +1,7 @@
 #include "gui/GUI.h"
 #include "core/Camera.h"
 #include "core/Math.h"
+#include "core/VolumeMedium.h"
 #include "display/VulkanDisplay.h"
 #include "util/Log.h"
 
@@ -73,6 +74,7 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
                  float& exposure, int& toneMappingMode,
                  float& moveSpeed,
                  char* envMapPathBuf, size_t envMapPathBufSize, bool& loadEnvMapRequested,
+                 VolumeMedium* medium,
                  int* renderMode,
                  int* dlssQuality,
                  uint32_t renderResW,
@@ -122,6 +124,52 @@ bool GUI::render(float fps, uint32_t sampleCount, uint32_t width, uint32_t heigh
     ImGui::SliderFloat("Exposure", &exposure, 0.05f, 8.0f, "%.2f");
     const char* toneMappingItems[] = {"None", "Reinhard", "ACES"};
     ImGui::Combo("Mode", &toneMappingMode, toneMappingItems, IM_ARRAYSIZE(toneMappingItems));
+
+    if (medium) {
+        ImGui::Separator();
+        ImGui::Text("Volumetric Medium");
+
+        if (ImGui::Checkbox("Enable medium", &medium->enabled)) {
+            changed = true;
+        }
+
+        if (medium->enabled) {
+            bool any = false;
+            any |= ImGui::SliderFloat3("sigma_a", &medium->sigmaA.x, 0.0f, 1.0f, "%.3f");
+            any |= ImGui::SliderFloat3("sigma_s", &medium->sigmaS.x, 0.0f, 1.0f, "%.3f");
+            any |= ImGui::SliderFloat("density", &medium->density, 0.0f, 4.0f, "%.3f");
+            any |= ImGui::SliderFloat("anisotropy g", &medium->anisotropy, -0.99f, 0.99f, "%.2f");
+
+            const char* kindItems[] = {"Constant", "Height falloff", "FBM noise", "Height + FBM (smoke)"};
+            int kind = (int)medium->densityKind;
+            if (ImGui::Combo("Density kind", &kind, kindItems, IM_ARRAYSIZE(kindItems))) {
+                medium->densityKind = (uint32_t)kind;
+                any = true;
+            }
+
+            // Height-falloff parameters relevant to kinds 1 and 3.
+            if (kind == 1 || kind == 3) {
+                any |= ImGui::DragFloat("y base (floor)", &medium->yBase, 0.05f, -1000.0f, 1000.0f, "%.2f");
+                any |= ImGui::SliderFloat("falloff height", &medium->falloffHeight, 0.1f, 200.0f, "%.2f");
+            }
+            // FBM parameters relevant to kinds 2 and 3.
+            if (kind == 2 || kind == 3) {
+                any |= ImGui::SliderFloat("fbm frequency", &medium->fbmFrequency, 0.0001f, 1.0f, "%.4f", ImGuiSliderFlags_Logarithmic);
+                any |= ImGui::SliderInt("fbm octaves", &medium->fbmOctaves, 1, 8);
+            }
+            if (kind == 3) {
+                any |= ImGui::SliderFloat("height/FBM mix", &medium->heightFBMMix, 0.0f, 1.0f, "%.2f");
+            }
+
+            if (ImGui::CollapsingHeader("Bounds")) {
+                any |= ImGui::Checkbox("Bounded", &medium->bounded);
+                any |= ImGui::DragFloat3("bmin", &medium->bmin.x, 0.1f);
+                any |= ImGui::DragFloat3("bmax", &medium->bmax.x, 0.1f);
+            }
+
+            changed = changed || any;
+        }
+    }
 
     if (renderMode) {
         ImGui::Separator();
