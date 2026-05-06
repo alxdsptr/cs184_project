@@ -20,6 +20,18 @@ public:
     // linear and must not be gamma-corrected.
     cudaTextureObject_t loadTexture(const std::string& path, bool sRGB = false);
 
+    // Decode an LDR texture file into RGBA8 pixels on the CPU (no GPU work).
+    // Thread-safe — safe to call concurrently from worker threads to overlap
+    // I/O and software decompression on asset-heavy scenes. Returns false on
+    // failure (logs a warning).
+    static bool decodeTextureRGBA8(const std::string& path, TextureData& out);
+
+    // Upload an already-decoded RGBA8 image and create a CUDA texture object.
+    // Must be called from the main thread because it pushes into m_textures.
+    // `debugPath` is used only for logging.
+    cudaTextureObject_t uploadTexture(const TextureData& data, bool sRGB,
+                                      const std::string& debugPath);
+
     // Load HDR image (.hdr/.exr) as float4, create CUDA texture object
     // Returns 0 on failure. Also outputs width/height for importance sampling.
     cudaTextureObject_t loadHDRTexture(const std::string& path, int& outWidth, int& outHeight);

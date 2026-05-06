@@ -19,10 +19,13 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <sstream>
 #include <map>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #ifdef _WIN32
 // For GetModuleFileNameW — used in init() to resolve the .exe directory so
@@ -306,31 +309,93 @@ bool Application::loadScene(const std::string& path) {
     m_medium.recomputeMajorant();
     m_scene.getMedium() = m_medium;
 
-    // Load textures and bind CUDA texture objects per material.
-    // Cache key = (path, sRGB) since the same file may appear as both a
-    // colour texture (needs sRGB decode) and a data texture (must stay
-    // linear), and they need separate CUDA texture objects.
-    std::map<std::pair<std::string, bool>, cudaTextureObject_t> textureCache;
-    auto loadCachedTexture = [&](const std::string& texPath, bool sRGB) -> cudaTextureObject_t {
-        if (texPath.empty()) {
-            return 0;
+    // Load textures and bind CUDA texture objects per material. Done in two
+    // phases so the CPU-bound decode (stb_image / DDS BCn decompression) can
+    // overlap across all unique source files — on asset-heavy scenes (Bistro)
+    // this is the dominant cost of loadScene.
+    //   Phase 1: enumerate the unique image files referenced by any material.
+    //   Phase 2: decode them all in parallel into RGBA8 buffers in RAM.
+    //   Phase 3: on the main thread, upload each decoded buffer to a CUDA
+    //            array and create one cudaTextureObject_t per (path, sRGB)
+    //            pairing actually requested (the same image may need both an
+    //            sRGB and a linear binding).
+    auto& materials = m_scene.getMaterials();
+
+    // Enumerate (path, sRGB) requests as well as the deduped path set used
+    // for decoding. We dedup decoding by path alone since the decoded RGBA8
+    // bytes are identical regardless of how they will be sampled.
+    auto noteRequest = [](std::vector<std::pair<std::string, bool>>& reqs,
+                          std::unordered_set<std::string>& paths,
+                          const std::string& p, bool sRGB) {
+        if (p.empty()) return;
+        reqs.emplace_back(p, sRGB);
+        paths.insert(p);
+    };
+    std::vector<std::pair<std::string, bool>> requests;
+    std::unordered_set<std::string> uniquePaths;
+    for (const auto& mat : materials) {
+        noteRequest(requests, uniquePaths, mat.albedoTexPath,        true);
+        noteRequest(requests, uniquePaths, mat.normalTexPath,        false);
+        noteRequest(requests, uniquePaths, mat.metallicRoughTexPath, false);
+        noteRequest(requests, uniquePaths, mat.emissiveTexPath,      true);
+        if (mat.useSpecularGlossiness) {
+            noteRequest(requests, uniquePaths, mat.specularGlossTexPath, false);
         }
+    }
+
+    // Phase 2: parallel decode. Worker threads each strip-mine the unique-
+    // path list and write into pre-sized parallel vectors. We avoid sharing
+    // a std::unordered_map across threads (non-const operator[] is UB even
+    // when no insertion occurs) by indexing into a vector instead, then
+    // assembling the path→data map on the main thread once workers join.
+    std::vector<std::string> pathList(uniquePaths.begin(), uniquePaths.end());
+    std::vector<TextureData> decodedSlots(pathList.size());
+
+    if (!pathList.empty()) {
+        unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        unsigned numThreads = std::min((unsigned)pathList.size(), hw);
+        std::vector<std::future<void>> futures;
+        futures.reserve(numThreads);
+        for (unsigned t = 0; t < numThreads; t++) {
+            futures.emplace_back(std::async(std::launch::async, [t, numThreads, &pathList, &decodedSlots]() {
+                for (size_t i = t; i < pathList.size(); i += numThreads) {
+                    TextureManager::decodeTextureRGBA8(pathList[i], decodedSlots[i]);
+                }
+            }));
+        }
+        for (auto& f : futures) f.get();
+    }
+
+    std::unordered_map<std::string, TextureData*> decoded;
+    decoded.reserve(pathList.size());
+    for (size_t i = 0; i < pathList.size(); i++) {
+        decoded.emplace(pathList[i], &decodedSlots[i]);
+    }
+
+    // Phase 3: upload + create texture objects on the main thread. Same
+    // (path, sRGB) cache as before — the same file may appear both as an
+    // sRGB colour texture and as a linear data texture and they need
+    // distinct CUDA texture objects (different `texDesc.sRGB`).
+    std::map<std::pair<std::string, bool>, cudaTextureObject_t> textureCache;
+    auto getCachedTexture = [&](const std::string& texPath, bool sRGB) -> cudaTextureObject_t {
+        if (texPath.empty()) return 0;
         auto key = std::make_pair(texPath, sRGB);
         auto it = textureCache.find(key);
-        if (it != textureCache.end()) {
-            return it->second;
+        if (it != textureCache.end()) return it->second;
+        cudaTextureObject_t obj = 0;
+        auto dit = decoded.find(texPath);
+        if (dit != decoded.end() && !dit->second->pixels.empty()) {
+            obj = m_textures.uploadTexture(*dit->second, sRGB, texPath);
         }
-        cudaTextureObject_t obj = m_textures.loadTexture(texPath, sRGB);
         textureCache.emplace(key, obj);
         return obj;
     };
 
-    auto& materials = m_scene.getMaterials();
     for (auto& mat : materials) {
-        mat.albedoTexObj        = loadCachedTexture(mat.albedoTexPath,        /*sRGB=*/true);
-        mat.normalTexObj        = loadCachedTexture(mat.normalTexPath,        /*sRGB=*/false);
-        mat.metallicRoughTexObj = loadCachedTexture(mat.metallicRoughTexPath, /*sRGB=*/false);
-        mat.emissiveTexObj      = loadCachedTexture(mat.emissiveTexPath,      /*sRGB=*/true);
+        mat.albedoTexObj        = getCachedTexture(mat.albedoTexPath,        /*sRGB=*/true);
+        mat.normalTexObj        = getCachedTexture(mat.normalTexPath,        /*sRGB=*/false);
+        mat.metallicRoughTexObj = getCachedTexture(mat.metallicRoughTexPath, /*sRGB=*/false);
+        mat.emissiveTexObj      = getCachedTexture(mat.emissiveTexPath,      /*sRGB=*/true);
         // Specular-gloss texture: legacy FBX (.dds) authors F0 in linear, not
         // sRGB. Loading as sRGB pushes slightly chromatic dielectric F0s into
         // saturated colours after Fresnel boost (the "purple pipes" symptom).
@@ -343,11 +408,15 @@ bool Application::loadScene(const std::string& path) {
         // loading it in any other case is dead weight — which matters on
         // asset-heavy scenes like Bistro that push the 8 GB envelope.
         if (mat.useSpecularGlossiness) {
-            mat.specularGlossTexObj = loadCachedTexture(mat.specularGlossTexPath, /*sRGB=*/false);
+            mat.specularGlossTexObj = getCachedTexture(mat.specularGlossTexPath, /*sRGB=*/false);
         } else {
             mat.specularGlossTexObj = 0;
         }
     }
+    // Free decoded RGBA8 staging buffers — the bytes now live in CUDA arrays.
+    decoded.clear();
+    decodedSlots.clear();
+    decodedSlots.shrink_to_fit();
 
     // Back-fill emissive texture handles on area lights so NEE can fetch
     // per-texel emission for textured emitters.

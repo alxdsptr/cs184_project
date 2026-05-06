@@ -83,33 +83,50 @@ bool loadDDSWithGliRGBA8(
 }
 }
 
-cudaTextureObject_t TextureManager::loadTexture(const std::string& path, bool sRGB) {
-    if (path.empty()) return 0;
-
-    int w = 0, h = 0, c = 0;
-    std::vector<unsigned char> ddsPixels;
-    unsigned char* pixels = nullptr;
-    bool pixelsOwnedByStb = false;
+bool TextureManager::decodeTextureRGBA8(const std::string& path, TextureData& out) {
+    out.pixels.clear();
+    out.width = 0;
+    out.height = 0;
+    out.channels = 4;
+    if (path.empty()) return false;
 
     if (hasDdsExtension(path)) {
-        // Try BC1/BC3 software decompression first (gli::convert can't decompress these)
-        if (!scene_loader_util::decompressDDS(path, ddsPixels, w, h)) {
-            // Fall back to gli convert for uncompressed DDS formats
-            if (!loadDDSWithGliRGBA8(path, ddsPixels, w, h)) {
-                LOG_WARN("Failed to load DDS texture: %s", path.c_str());
-                return 0;
-            }
+        // Try BC1/BC3/BC5 software decompression first (gli::convert can't
+        // decompress these correctly — BC5 in particular gets swizzled).
+        if (scene_loader_util::decompressDDS(path, out.pixels, out.width, out.height)) {
+            return true;
         }
-        pixels = ddsPixels.data();
-    } else {
-        stbi_set_flip_vertically_on_load(0);
-        pixels = stbi_load(path.c_str(), &w, &h, &c, 4); // force RGBA
-        if (!pixels) {
-            LOG_WARN("Failed to load texture: %s", path.c_str());
-            return 0;
+        // Fall back to gli convert for uncompressed DDS formats.
+        if (loadDDSWithGliRGBA8(path, out.pixels, out.width, out.height)) {
+            return true;
         }
-        pixelsOwnedByStb = true;
+        LOG_WARN("Failed to load DDS texture: %s", path.c_str());
+        return false;
     }
+
+    // stbi_set_flip_vertically_on_load is a global; callers using the parallel
+    // decode path should set it to 0 once before launching workers (we do too,
+    // defensively, though the value is never changed elsewhere in the codebase).
+    stbi_set_flip_vertically_on_load(0);
+    int w = 0, h = 0, c = 0;
+    unsigned char* pixels = stbi_load(path.c_str(), &w, &h, &c, 4); // force RGBA
+    if (!pixels) {
+        LOG_WARN("Failed to load texture: %s", path.c_str());
+        return false;
+    }
+
+    out.width = w;
+    out.height = h;
+    size_t bytes = (size_t)w * (size_t)h * 4;
+    out.pixels.resize(bytes);
+    std::memcpy(out.pixels.data(), pixels, bytes);
+    stbi_image_free(pixels);
+    return true;
+}
+
+cudaTextureObject_t TextureManager::uploadTexture(const TextureData& data, bool sRGB,
+                                                  const std::string& debugPath) {
+    if (data.pixels.empty() || data.width <= 0 || data.height <= 0) return 0;
 
     cudaArray_t cuArray = nullptr;
 
@@ -123,15 +140,11 @@ cudaTextureObject_t TextureManager::loadTexture(const std::string& path, bool sR
     // linear-space radiance values back, so no shader changes are needed.
     // Memory savings: 4× (was float4 = 16 B/pixel, now uchar4 = 4 B/pixel).
     cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<uchar4>();
-    CUDA_CHECK(cudaMallocArray(&cuArray, &channelDesc, w, h));
+    CUDA_CHECK(cudaMallocArray(&cuArray, &channelDesc, data.width, data.height));
     CUDA_CHECK(cudaMemcpy2DToArray(
-        cuArray, 0, 0, pixels, w * 4, w * 4, h, cudaMemcpyHostToDevice));
-    if (pixelsOwnedByStb) {
-        stbi_image_free(pixels);
-    }
-    cudaTextureReadMode readMode = cudaReadModeNormalizedFloat;
+        cuArray, 0, 0, data.pixels.data(),
+        data.width * 4, data.width * 4, data.height, cudaMemcpyHostToDevice));
 
-    // Create texture object
     cudaResourceDesc resDesc{};
     resDesc.resType = cudaResourceTypeArray;
     resDesc.res.array.array = cuArray;
@@ -140,7 +153,7 @@ cudaTextureObject_t TextureManager::loadTexture(const std::string& path, bool sR
     texDesc.addressMode[0] = cudaAddressModeWrap;
     texDesc.addressMode[1] = cudaAddressModeWrap;
     texDesc.filterMode = cudaFilterModeLinear;
-    texDesc.readMode = readMode;
+    texDesc.readMode = cudaReadModeNormalizedFloat;
     texDesc.normalizedCoords = 1;
     texDesc.sRGB = sRGB ? 1 : 0;
 
@@ -148,8 +161,16 @@ cudaTextureObject_t TextureManager::loadTexture(const std::string& path, bool sR
     CUDA_CHECK(cudaCreateTextureObject(&texObj, &resDesc, &texDesc, nullptr));
 
     m_textures.push_back({cuArray, texObj});
-    LOG_DEBUG("Loaded texture: %s (%dx%d, sRGB=%d)", path.c_str(), w, h, (int)sRGB);
+    LOG_DEBUG("Loaded texture: %s (%dx%d, sRGB=%d)",
+              debugPath.c_str(), data.width, data.height, (int)sRGB);
     return texObj;
+}
+
+cudaTextureObject_t TextureManager::loadTexture(const std::string& path, bool sRGB) {
+    if (path.empty()) return 0;
+    TextureData data;
+    if (!decodeTextureRGBA8(path, data)) return 0;
+    return uploadTexture(data, sRGB, path);
 }
 
 cudaTextureObject_t TextureManager::loadHDRTexture(const std::string& path, int& outWidth, int& outHeight) {
