@@ -448,49 +448,20 @@ extern "C" __global__ void __raygen__path_trace()
             }
 
             // Glass / transmissive
-            bool handledAsGlass = false;
             if (mat.transmission > 0.0f) {
-                bool entering = hit.frontFace;
-                float3 Nglass = entering ? N : -N;
-                if (dot(Nglass, ray.direction) > 0.0f) Nglass = -Nglass;
-
-                float etaI = entering ? 1.0f : mat.ior;
-                float etaT = entering ? mat.ior : 1.0f;
-                float eta = etaI / etaT;
-                float cosThetaI = fmaxf(dot(-ray.direction, Nglass), 0.0f);
-                float Fr = fresnelDielectric(cosThetaI, eta);
-
-                float3 newDirGlass;
-                if (pcg32_float(rng) < Fr) {
-                    newDirGlass = ray.direction - Nglass * (2.0f * dot(ray.direction, Nglass));
-                    newDirGlass = normalize(newDirGlass);
-                } else {
-                    if (!refractDir(ray.direction, Nglass, eta, newDirGlass)) {
-                        newDirGlass = ray.direction - Nglass * (2.0f * dot(ray.direction, Nglass));
-                        newDirGlass = normalize(newDirGlass);
-                    }
-                }
-
-                if (!entering) {
-                    float albedoLum = 0.2126f * albedo.x + 0.7152f * albedo.y + 0.0722f * albedo.z;
-                    if (albedoLum < 0.9f) {
-                        throughput = throughput * albedo;
-                    }
-                }
-
-                float3 offsetN = (dot(newDirGlass, Nglass) > 0.0f) ? Nglass : -Nglass;
-                ray.origin    = hit.position + offsetN * 0.002f;
-                ray.direction = newDirGlass;
-                ray.tmin      = 0.001f;
-                ray.tmax      = 1e30f;
-
-                lastBounceDelta = true;   // glass is delta
-                prevSurfacePos = hit.position;
-                prevBsdfPdf = 1.0f;
+                GlassBounce gb = sampleGlassBounce(
+                    ray.direction, hit.position, N,
+                    hit.frontFace, mat.ior, albedo, rng);
+                throughput      = throughput * gb.throughputMul;
+                ray.origin      = gb.newOrigin;
+                ray.direction   = gb.newDir;
+                ray.tmin        = 0.001f;
+                ray.tmax        = 1e30f;
+                lastBounceDelta = true;
+                prevSurfacePos  = hit.position;
+                prevBsdfPdf     = 1.0f;
                 havePrevSurface = true;
-                handledAsGlass = true;
-            }
-            if (handledAsGlass) {
+
                 if (dot(N, ray.direction) > 0) N = -N;
                 if (bounce >= 6) {
                     if (pcg32_float(rng) > 0.9f) break;
@@ -1260,28 +1231,15 @@ extern "C" __global__ void __raygen__path_trace_split()
 
             // Glass / transmissive (delta BSDF — never affects bucket classification).
             if (mat.transmission > 0.0f) {
-                bool entering = hit.frontFace;
-                float3 Nglass = entering ? N : -N;
-                if (dot(Nglass, ray.direction) > 0.0f) Nglass = -Nglass;
-                float eta = (entering ? 1.0f : mat.ior) / (entering ? mat.ior : 1.0f);
-                float cosI = fmaxf(dot(-ray.direction, Nglass), 0.0f);
-                float Fr = fresnelDielectric(cosI, eta);
-                float3 newDir;
-                if (pcg32_float(rng) < Fr) {
-                    newDir = normalize(ray.direction - Nglass * (2.0f * dot(ray.direction, Nglass)));
-                } else if (!refractDir(ray.direction, Nglass, eta, newDir)) {
-                    newDir = normalize(ray.direction - Nglass * (2.0f * dot(ray.direction, Nglass)));
-                }
-                if (!entering) {
-                    float lum = 0.2126f*albedo.x + 0.7152f*albedo.y + 0.0722f*albedo.z;
-                    if (lum < 0.9f) throughput = throughput * albedo;
-                }
-                float3 off = (dot(newDir, Nglass) > 0.0f) ? Nglass : -Nglass;
-                ray.origin = hit.position + off * 0.002f;
-                ray.direction = newDir;
+                GlassBounce gb = sampleGlassBounce(
+                    ray.direction, hit.position, N,
+                    hit.frontFace, mat.ior, albedo, rng);
+                throughput      = throughput * gb.throughputMul;
+                ray.origin      = gb.newOrigin;
+                ray.direction   = gb.newDir;
                 ray.tmin = 0.001f; ray.tmax = 1e30f;
                 lastBounceDelta = true;
-                prevSurfacePos = hit.position; prevBsdfPdf = 1.0f; havePrevSurface = true;
+                prevSurfacePos  = hit.position; prevBsdfPdf = 1.0f; havePrevSurface = true;
                 if (bounce >= 6 && pcg32_float(rng) > 0.9f) break;
                 continue;
             }

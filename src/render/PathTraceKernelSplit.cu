@@ -362,28 +362,15 @@ __global__ void pathTraceKernelSplit(
 
         // Glass (delta BSDF) — skipped for classification, treated as specular.
         if (mat.transmission > 0.0f) {
-            bool entering = hit.frontFace;
-            float3 Nglass = entering ? N : -N;
-            if (dot(Nglass, ray.direction) > 0.0f) Nglass = -Nglass;
-            float eta = (entering ? 1.0f : mat.ior) / (entering ? mat.ior : 1.0f);
-            float cosI = fmaxf(dot(-ray.direction, Nglass), 0.0f);
-            float Fr = fresnelDielectric(cosI, eta);
-            float3 newDir;
-            if (pcg32_float(rng) < Fr) {
-                newDir = normalize(ray.direction - Nglass * (2.0f * dot(ray.direction, Nglass)));
-            } else if (!refractDir(ray.direction, Nglass, eta, newDir)) {
-                newDir = normalize(ray.direction - Nglass * (2.0f * dot(ray.direction, Nglass)));
-            }
-            if (!entering) {
-                float lum = 0.2126f*albedo.x + 0.7152f*albedo.y + 0.0722f*albedo.z;
-                if (lum < 0.9f) throughput = throughput * albedo;
-            }
-            float3 off = (dot(newDir, Nglass) > 0.0f) ? Nglass : -Nglass;
-            ray.origin = hit.position + off * 0.002f;
-            ray.direction = newDir;
+            GlassBounce gb = sampleGlassBounce(
+                ray.direction, hit.position, N,
+                hit.frontFace, mat.ior, albedo, rng);
+            throughput      = throughput * gb.throughputMul;
+            ray.origin      = gb.newOrigin;
+            ray.direction   = gb.newDir;
             ray.tmin = 0.001f; ray.tmax = 1e30f;
-            lastBounceDelta = true;   // glass is delta
-            prevSurfacePos = hit.position; prevBsdfPdf = 1.0f; havePrevSurface = true;
+            lastBounceDelta = true;
+            prevSurfacePos  = hit.position; prevBsdfPdf = 1.0f; havePrevSurface = true;
             if (bounce >= 6 && pcg32_float(rng) > 0.9f) break;
             continue;
         }

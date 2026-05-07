@@ -13,8 +13,10 @@
 
 #include "core/Math.h"
 #include "gpu/AreaLightGPU.h"
+#include "gpu/BRDF.h"
 #include "gpu/RayTypes.h"
 #include "gpu/MaterialGPU.h"
+#include "gpu/Random.h"
 #include "gpu/Sampling.h"
 #include "gpu/SHEnv.cuh"
 
@@ -418,6 +420,52 @@ __device__ inline float3 envBRDFApprox2(float3 F0, float alpha, float NoV) {
     return make_float3(F0.x * scale + bias,
                        F0.y * scale + bias,
                        F0.z * scale + bias);
+}
+
+// ── Glass / dielectric delta bounce ──────────────────────────
+// Picks reflection or refraction stochastically against exact dielectric
+// Fresnel; falls back to a mirror reflection on TIR. Applies a glass tint
+// (multiply throughput by albedo) only when *exiting* the medium and only if
+// the albedo is intentionally non-white — keeps clear glass clear.
+//
+// Caller is responsible for: ray.origin/direction/tmin/tmax updates, setting
+// `lastBounceDelta = true`, prevSurface bookkeeping, post-bounce RR, and any
+// aux-buffer N-flip after the bounce.
+struct GlassBounce {
+    float3 newDir;
+    float3 newOrigin;     // hit position offset 0.002 along the outgoing side
+    float3 throughputMul; // (1,1,1) on entry / near-white albedo, else albedo tint
+};
+
+__device__ inline GlassBounce sampleGlassBounce(
+    const float3& rayDir, const float3& hitPos, const float3& Nshade,
+    bool entering, float ior, const float3& albedo,
+    uint32_t& rng)
+{
+    float3 Nglass = entering ? Nshade : -Nshade;
+    if (dot(Nglass, rayDir) > 0.0f) Nglass = -Nglass;
+
+    float eta = (entering ? 1.0f : ior) / (entering ? ior : 1.0f);
+    float cosI = fmaxf(dot(-rayDir, Nglass), 0.0f);
+    float Fr = fresnelDielectric(cosI, eta);
+
+    float3 newDir;
+    if (pcg32_float(rng) < Fr) {
+        newDir = normalize(rayDir - Nglass * (2.0f * dot(rayDir, Nglass)));
+    } else if (!refractDir(rayDir, Nglass, eta, newDir)) {
+        newDir = normalize(rayDir - Nglass * (2.0f * dot(rayDir, Nglass)));
+    }
+
+    GlassBounce r;
+    r.newDir = newDir;
+    float3 off = (dot(newDir, Nglass) > 0.0f) ? Nglass : -Nglass;
+    r.newOrigin = hitPos + off * 0.002f;
+    r.throughputMul = make_float3(1.0f, 1.0f, 1.0f);
+    if (!entering) {
+        float lum = 0.2126f * albedo.x + 0.7152f * albedo.y + 0.0722f * albedo.z;
+        if (lum < 0.9f) r.throughputMul = albedo;
+    }
+    return r;
 }
 
 // Fetch Le at a barycentric point on an area light (texture-aware).

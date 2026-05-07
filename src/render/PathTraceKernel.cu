@@ -531,70 +531,25 @@ __global__ void pathTraceKernel(
         }
 
         // ── Glass / transmissive material ───────────────────────
-        bool handledAsGlass = false;
         if (mat.transmission > 0.0f) {
-            // Determine if we're entering or exiting the medium
-            bool entering = hit.frontFace;
-
-            // Nglass: the outward-facing normal (always points to the side the ray came from)
-            // For glass we did NOT flip N above, so use frontFace to orient it.
-            float3 Nglass = entering ? N : -N;
-            // Make sure Nglass faces the incoming ray
-            if (dot(Nglass, ray.direction) > 0.0f) Nglass = -Nglass;
-
-            float etaI = entering ? 1.0f : mat.ior;
-            float etaT = entering ? mat.ior : 1.0f;
-            float eta = etaI / etaT;
-
-            float cosThetaI = fmaxf(dot(-ray.direction, Nglass), 0.0f);
-
-            // Exact Fresnel for dielectrics
-            float Fr = fresnelDielectric(cosThetaI, eta);
-
-            float3 newDirGlass;
-            if (pcg32_float(rng) < Fr) {
-                // Reflection
-                newDirGlass = ray.direction - Nglass * (2.0f * dot(ray.direction, Nglass));
-                newDirGlass = normalize(newDirGlass);
-            } else {
-                // Refraction (Snell's law)
-                if (!refractDir(ray.direction, Nglass, eta, newDirGlass)) {
-                    // Total internal reflection fallback
-                    newDirGlass = ray.direction - Nglass * (2.0f * dot(ray.direction, Nglass));
-                    newDirGlass = normalize(newDirGlass);
-                }
-            }
-
-            // Glass tint: colored glass absorbs light based on albedo.
-            // Only apply tint when exiting the medium AND the color is
-            // intentionally non-white (skip near-white to keep clear glass clear).
-            if (!entering) {
-                float albedoLum = 0.2126f * albedo.x + 0.7152f * albedo.y + 0.0722f * albedo.z;
-                if (albedoLum < 0.9f) {
-                    throughput = throughput * albedo;
-                }
-            }
-
-            // Delta BSDF: throughput unchanged by pdf (delta distribution cancels)
-            // Offset origin in the direction of travel to avoid self-intersection
-            float3 offsetN = (dot(newDirGlass, Nglass) > 0.0f) ? Nglass : -Nglass;
-            ray.origin    = hit.position + offsetN * 0.002f;
-            ray.direction = newDirGlass;
-            ray.tmin      = 0.001f;
-            ray.tmax      = 1e30f;
-
-            lastBounceDelta = true;   // glass refraction/reflection is delta
-            prevSurfacePos = hit.position;
-            prevBsdfPdf = 1.0f;
+            GlassBounce gb = sampleGlassBounce(
+                ray.direction, hit.position, N,
+                hit.frontFace, mat.ior, albedo, rng);
+            throughput     = throughput * gb.throughputMul;
+            ray.origin     = gb.newOrigin;
+            ray.direction  = gb.newDir;
+            ray.tmin       = 0.001f;
+            ray.tmax       = 1e30f;
+            lastBounceDelta = true;
+            prevSurfacePos  = hit.position;
+            prevBsdfPdf     = 1.0f;
             havePrevSurface = true;
-            handledAsGlass = true;
-        }
-        if (handledAsGlass) {
-            // For glass, also flip N for aux buffers (ensure outward-facing for denoiser)
+
+            // Flip N outward for aux buffers (denoiser expects outward normal).
             if (dot(N, ray.direction) > 0) N = -N;
-            // Glass Russian roulette: only terminate after many bounces to
-            // prevent infinite TIR loops, but do NOT boost throughput (delta
-            // BSDF doesn't lose energy so boosting causes fireflies).
+            // Glass Russian roulette: terminate after many bounces to prevent
+            // infinite TIR loops; do NOT boost throughput (delta BSDF doesn't
+            // lose energy so boosting causes fireflies).
             if (bounce >= 6) {
                 if (pcg32_float(rng) > 0.9f) break;
             }
