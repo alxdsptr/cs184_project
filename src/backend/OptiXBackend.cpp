@@ -586,6 +586,31 @@ void OptiXBackend::buildAccelerationStructure(const Scene& scene) {
     buildGAS(data, /*allowUpdate=*/scene.hasAnimation());
 }
 
+void OptiXBackend::launchAndSync(
+    const LaunchParams& lp,
+    CUdeviceptr  raygenRecord,
+    uint32_t     width,
+    uint32_t     height,
+    bool         restoreRaygen)
+{
+    m_sbt.raygenRecord = raygenRecord;
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        (void*)m_dLaunchParams, &lp, sizeof(lp),
+        cudaMemcpyHostToDevice, m_stream));
+
+    OPTIX_CHECK_VOID(optixLaunch(
+        m_pipeline, m_stream,
+        m_dLaunchParams, sizeof(LaunchParams),
+        &m_sbt,
+        width, height, 1));
+    CUDA_CHECK(cudaStreamSynchronize(m_stream));
+
+    if (restoreRaygen) {
+        m_sbt.raygenRecord = m_dRaygenRecord;
+    }
+}
+
 void OptiXBackend::launchPathTrace(
     const DeviceSceneData& scene,
     const CameraParams& camera,
@@ -618,18 +643,8 @@ void OptiXBackend::launchPathTrace(
     lp.handle  = m_gasHandle;
 
     // Use the regular raygen (in case a previous call swapped to raygenSplit).
-    m_sbt.raygenRecord = m_dRaygenRecord;
-
-    CUDA_CHECK(cudaMemcpyAsync(
-        (void*)m_dLaunchParams, &lp, sizeof(lp),
-        cudaMemcpyHostToDevice, m_stream));
-
-    OPTIX_CHECK_VOID(optixLaunch(
-        m_pipeline, m_stream,
-        m_dLaunchParams, sizeof(LaunchParams),
-        &m_sbt,
-        width, height, 1));
-    CUDA_CHECK(cudaStreamSynchronize(m_stream));
+    // No restore — the next launch will set its own record.
+    launchAndSync(lp, m_dRaygenRecord, width, height, /*restoreRaygen=*/false);
 }
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
@@ -670,19 +685,9 @@ void OptiXBackend::launchPathTraceSplit(
     lp.enableEnvironment = enableEnvironment ? 1u : 0u;
     lp.handle      = m_gasHandle;
 
-    // Swap to the split raygen for this launch.
-    m_sbt.raygenRecord = m_dRaygenSplitRecord;
-
-    CUDA_CHECK(cudaMemcpyAsync(
-        (void*)m_dLaunchParams, &lp, sizeof(lp),
-        cudaMemcpyHostToDevice, m_stream));
-
-    OPTIX_CHECK_VOID(optixLaunch(
-        m_pipeline, m_stream,
-        m_dLaunchParams, sizeof(LaunchParams),
-        &m_sbt,
-        width, height, 1));
-    CUDA_CHECK(cudaStreamSynchronize(m_stream));
+    // Swap to the split raygen; like launchPathTrace, no restore — the next
+    // launch will set its own record (back to m_dRaygenRecord typically).
+    launchAndSync(lp, m_dRaygenSplitRecord, width, height, /*restoreRaygen=*/false);
 }
 #endif
 
@@ -718,22 +723,7 @@ bool OptiXBackend::launchReSTIRInitCandidatesOptiX(
     lp.restirSurfacesCurr   = static_cast<ReSTIRSurface*>(d_surfacesCurr);
     lp.restirNumCandidates  = numCandidates;
 
-    m_sbt.raygenRecord = m_dRaygenReSTIRRecord;
-
-    CUDA_CHECK(cudaMemcpyAsync(
-        (void*)m_dLaunchParams, &lp, sizeof(lp),
-        cudaMemcpyHostToDevice, m_stream));
-
-    OPTIX_CHECK_VOID(optixLaunch(
-        m_pipeline, m_stream,
-        m_dLaunchParams, sizeof(LaunchParams),
-        &m_sbt,
-        width, height, 1));
-    CUDA_CHECK(cudaStreamSynchronize(m_stream));
-
-    // Restore regular raygen so a subsequent launchPathTrace doesn't
-    // accidentally fire the ReSTIR raygen.
-    m_sbt.raygenRecord = m_dRaygenRecord;
+    launchAndSync(lp, m_dRaygenReSTIRRecord, width, height, /*restoreRaygen=*/true);
     return true;
 }
 
@@ -764,21 +754,7 @@ bool OptiXBackend::launchReSTIRVisibilityReuseOptiX(
         static_cast<const ReSTIRSurface*>(d_surfacesCurr));
     lp.restirNumCandidates  = 0;  // unused
 
-    m_sbt.raygenRecord = m_dRaygenReSTIRVisRecord;
-
-    CUDA_CHECK(cudaMemcpyAsync(
-        (void*)m_dLaunchParams, &lp, sizeof(lp),
-        cudaMemcpyHostToDevice, m_stream));
-
-    OPTIX_CHECK_VOID(optixLaunch(
-        m_pipeline, m_stream,
-        m_dLaunchParams, sizeof(LaunchParams),
-        &m_sbt,
-        width, height, 1));
-    CUDA_CHECK(cudaStreamSynchronize(m_stream));
-
-    // Restore regular raygen.
-    m_sbt.raygenRecord = m_dRaygenRecord;
+    launchAndSync(lp, m_dRaygenReSTIRVisRecord, width, height, /*restoreRaygen=*/true);
     return true;
 }
 
@@ -818,21 +794,7 @@ bool OptiXBackend::launchReSTIRGIInitCandidatesOptiX(
     lp.giEnableEnvironment = enableEnvironment ? 1u : 0u;
     lp.giNumCandidates    = numCandidates;
 
-    m_sbt.raygenRecord = m_dRaygenReSTIRGIRecord;
-
-    CUDA_CHECK(cudaMemcpyAsync(
-        (void*)m_dLaunchParams, &lp, sizeof(lp),
-        cudaMemcpyHostToDevice, m_stream));
-
-    OPTIX_CHECK_VOID(optixLaunch(
-        m_pipeline, m_stream,
-        m_dLaunchParams, sizeof(LaunchParams),
-        &m_sbt,
-        width, height, 1));
-    CUDA_CHECK(cudaStreamSynchronize(m_stream));
-
-    // Restore regular raygen.
-    m_sbt.raygenRecord = m_dRaygenRecord;
+    launchAndSync(lp, m_dRaygenReSTIRGIRecord, width, height, /*restoreRaygen=*/true);
     return true;
 }
 
@@ -875,20 +837,7 @@ bool OptiXBackend::launchReSTIRPTInitCandidatesOptiX(
     // the same field name keeps OptiXPrograms cleaner — no extra param).
     lp.giEnableEnvironment = enableEnvironment ? 1u : 0u;
 
-    m_sbt.raygenRecord = m_dRaygenReSTIRPTRecord;
-
-    CUDA_CHECK(cudaMemcpyAsync(
-        (void*)m_dLaunchParams, &lp, sizeof(lp),
-        cudaMemcpyHostToDevice, m_stream));
-
-    OPTIX_CHECK_VOID(optixLaunch(
-        m_pipeline, m_stream,
-        m_dLaunchParams, sizeof(LaunchParams),
-        &m_sbt,
-        width, height, 1));
-    CUDA_CHECK(cudaStreamSynchronize(m_stream));
-
-    m_sbt.raygenRecord = m_dRaygenRecord;
+    launchAndSync(lp, m_dRaygenReSTIRPTRecord, width, height, /*restoreRaygen=*/true);
     return true;
 }
 

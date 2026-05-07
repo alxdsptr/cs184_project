@@ -2,42 +2,65 @@
 // ReSTIR DI device-side helpers shared between the CUDA ReSTIR kernel
 // (render/ReSTIR.cu) and the OptiX raygen (backend/OptiXPrograms.cu).
 //
-// Contains the target-pdf evaluator, the reservoir streaming primitives
-// (Bitterli Alg. 2), and a tiny generateRay duplicate so the OptiX raygen
-// can cast a camera ray identical to the main kernel's.
+// Contains the target-pdf evaluator and the reservoir streaming primitives
+// (Bitterli Alg. 2). General BRDF / luminance / camera-ray helpers live in
+// render/PathTraceHelpers.cuh and are pulled in here so this header doesn't
+// re-define them.
 //
 // All functions are header-only `__device__ inline` so including this from
 // multiple translation units does not cause multiple-definition link errors
 // under nvrtc / optixir.
 
 #include "render/ReSTIR.h"
-#include "gpu/AreaLightGPU.h"
-#include "gpu/RayTypes.h"
-#include "core/Math.h"
+#include "render/PathTraceHelpers.cuh"
+#include "gpu/Random.h"
+#include "gpu/Sampling.h"
 
-#ifndef M_PI_F
-#define M_PI_F 3.14159265358979323846f
-#endif
-
-__device__ inline float restirLuminance(float3 c) {
-    return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
-}
-
-__device__ inline float restirGgxD(float NdotH, float roughness) {
-    float a  = roughness * roughness;
-    float a2 = a * a;
-    float denom = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
-    return a2 / (M_PI_F * denom * denom + 1e-14f);
-}
-__device__ inline float restirSmithG1(float NdotX, float alpha) {
-    float a2 = alpha * alpha;
-    float cos2 = NdotX * NdotX;
-    return 2.0f * NdotX / (NdotX + sqrtf(a2 + (1.0f - a2) * cos2) + 1e-7f);
-}
-__device__ inline float3 restirFresnelSchlick(float cosTheta, float3 F0) {
-    float t = 1.0f - fminf(fmaxf(cosTheta, 0.0f), 1.0f);
-    float t5 = t*t*t*t*t;
-    return F0 + (make_float3(1,1,1) - F0) * t5;
+// Sample a BSDF direction at a ReSTIR surface — shared by ReSTIR DI / GI / PT
+// initial-candidate generators (CUDA + OptiX). Mixture sampling between GGX
+// importance and cosine-hemisphere; pdf is evaluated with the same canonical
+// helpers the path tracer uses, so reservoirs from both backends remain
+// binary-compatible.
+__device__ inline bool restirSampleBsdfDir(
+    const ReSTIRSurface& s, uint32_t& rng,
+    float3& outDir, float& outPdf)
+{
+    bool pureDiffuse = (s.pureDiffuse != 0u);
+    float specProb = pureDiffuse ? 0.0f : s.specProb;
+    float u = pcg32_float(rng);
+    float3 dir;
+    if (!pureDiffuse && u < specProb) {
+        // GGX importance sample.
+        float a = s.roughness * s.roughness;
+        float u1 = pcg32_float(rng);
+        float u2 = pcg32_float(rng);
+        float cosTheta = sqrtf((1.0f - u1) / (1.0f + (a*a - 1.0f) * u1 + 1e-7f));
+        float sinTheta = sqrtf(fmaxf(0.0f, 1.0f - cosTheta * cosTheta));
+        float phi = 2.0f * M_PI_F * u2;
+        float3 localH = make_float3(sinTheta * cosf(phi), cosTheta, sinTheta * sinf(phi));
+        float3 T, B;
+        buildONB(s.normal, T, B);
+        float3 H = localToWorld(localH, T, s.normal, B);
+        // Reflect viewDir around H (V points AWAY from the surface; reflect
+        // the *incoming* direction = -V to get the outgoing scatter dir).
+        float3 inDir = -s.viewDir;
+        dir = inDir - H * (2.0f * dot(inDir, H));
+        dir = normalize(dir);
+    } else {
+        float u1 = pcg32_float(rng);
+        float u2 = pcg32_float(rng);
+        float dummy;
+        float3 local = sampleCosineHemisphere(u1, u2, dummy);
+        float3 T, B;
+        buildONB(s.normal, T, B);
+        dir = localToWorld(local, T, s.normal, B);
+    }
+    if (dot(s.normal, dir) <= 1e-6f) return false;
+    outDir = dir;
+    outPdf = pureDiffuse
+        ? bsdfDiffusePdf(dot(s.normal, dir))
+        : bsdfMixturePdf(s.normal, s.viewDir, dir, s.roughness, specProb);
+    return outPdf > 1e-7f;
 }
 
 __device__ inline float3 restirEvalBrdf(
@@ -52,10 +75,10 @@ __device__ inline float3 restirEvalBrdf(
     float NdotH = fmaxf(dot(s.normal, H), 0.0f);
     float LdotH = fmaxf(dot(L, H), 0.0f);
     float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), s.albedo, s.metallic);
-    float3 F = restirFresnelSchlick(LdotH, F0);
-    float Dt = restirGgxD(NdotH, s.roughness);
+    float3 F = fresnelSchlick_local(LdotH, F0);
+    float Dt = ggxD_local(NdotH, s.roughness);
     float alpha = s.roughness * s.roughness;
-    float Gt = restirSmithG1(NdotL, alpha) * restirSmithG1(NdotV, alpha);
+    float Gt = smithG1_GGX(NdotL, alpha) * smithG1_GGX(NdotV, alpha);
 
     float3 spec = F * (Dt * Gt / (4.0f * NdotL * NdotV + 1e-7f));
     float3 kd = (make_float3(1,1,1) - F) * (1.0f - s.metallic);
@@ -97,11 +120,11 @@ __device__ inline float restirEvalTargetPdf(
         float4 t = tex2D<float4>(light.emissiveTex, u, v);
         Le = make_float3(t.x, t.y, t.z) * light.emission;
     }
-    float Lum = restirLuminance(Le);
+    float Lum = luminance(Le);
     if (Lum <= 0.0f) return 0.0f;
 
     float3 brdf = restirEvalBrdf(s, L);
-    float  fLum = restirLuminance(brdf) * NdotL;
+    float  fLum = luminance(brdf) * NdotL;
     if (fLum <= 0.0f) return 0.0f;
 
     float geom = lightNdot / dist2;

@@ -1,11 +1,8 @@
 #include "render/ReSTIRGI.h"
 #include "render/ReSTIRGIDevice.cuh"
+#include "render/PathTraceHelpers.cuh"
 #include "backend/RayTracingBackend.h"
-#include "core/Math.h"
-#include "gpu/AreaLightGPU.h"
-#include "gpu/MaterialGPU.h"
 #include "gpu/Random.h"
-#include "gpu/Sampling.h"
 #include "accel/BVH.h"
 #include "accel/LightBVHSample.h"
 #include "util/CudaCheck.h"
@@ -38,140 +35,6 @@
 #endif
 
 namespace {
-
-// Identical math to the main kernel's generateRay (we can't share that
-// definition because PathTraceKernel.cu's helpers are static / TU-local).
-__device__ inline Ray giGenerateRay(
-    uint32_t x, uint32_t y, uint32_t width, uint32_t height,
-    const CameraParams& cam, float jitterX, float jitterY)
-{
-    float u = ((float)x + 0.5f + jitterX) / (float)width;
-    float v = ((float)y + 0.5f + jitterY) / (float)height;
-    float ndcX = 2.0f * u - 1.0f;
-    float ndcY = 1.0f - 2.0f * v;
-    float tanHalf = tanf(cam.fovYRadians * 0.5f);
-    float px = ndcX * cam.aspectRatio * tanHalf;
-    float py = ndcY * tanHalf;
-    float3 dir = normalize(cam.forward + cam.right * px + cam.up * py);
-    Ray ray;
-    ray.origin    = cam.position;
-    ray.direction = dir;
-    ray.tmin      = 0.001f;
-    ray.tmax      = 1e30f;
-    return ray;
-}
-
-// Cheap procedural sky fallback — only used when no env map is bound. Same
-// formula as the main kernel.
-__device__ inline float3 giProceduralSky(float3 dir) {
-    float t = 0.5f * (dir.y + 1.0f);
-    float3 skyTop = make_float3(0.5f, 0.7f, 1.0f);
-    float3 skyBot = make_float3(1.0f, 1.0f, 1.0f);
-    return lerp(skyBot, skyTop, t) * 0.8f;
-}
-
-__device__ inline float3 giSampleEnvironment(
-    float3 dir, cudaTextureObject_t envMap)
-{
-    if (envMap != 0) {
-        float theta = acosf(fminf(fmaxf(dir.y, -1.0f), 1.0f));
-        float phi   = atan2f(dir.z, dir.x);
-        float u = (phi + M_PI_F) * (0.5f / M_PI_F);
-        float v = theta / M_PI_F;
-        float4 texel = tex2D<float4>(envMap, u, v);
-        return make_float3(texel.x, texel.y, texel.z);
-    }
-    return giProceduralSky(dir);
-}
-
-// Material-aware specular-probability, evaluation, and PDF — matched to the
-// main path tracer's helpers (cf. PathTraceHelpers.cuh). Defined here as
-// __device__ to keep ReSTIR GI fully self-contained.
-__device__ inline float giComputeSpecProb(
-    const float3& N, const float3& V, const float3& albedo, float metallic)
-{
-    float NdotV = fmaxf(dot(N, V), 0.0f);
-    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, metallic);
-    float t = 1.0f - fminf(fmaxf(NdotV, 0.0f), 1.0f);
-    float t5 = t*t*t*t*t;
-    float3 F = F0 + (make_float3(1,1,1) - F0) * t5;
-    float specW  = restirLuminance(F);
-    float3 kd    = (make_float3(1,1,1) - F) * (1.0f - metallic);
-    float diffW  = restirLuminance(kd * albedo);
-    float p = specW / fmaxf(specW + diffW, 1e-7f);
-    return fminf(fmaxf(p, 0.1f), 0.9f);
-}
-
-__device__ inline float giDiffusePdf(float NdotL) {
-    return fmaxf(NdotL, 0.0f) * (1.0f / M_PI_F);
-}
-
-__device__ inline float giSpecularPdf(
-    const float3& N, const float3& V, const float3& L, float roughness)
-{
-    float3 H = normalize(V + L);
-    float NdotH = fmaxf(dot(N, H), 0.0f);
-    float VdotH = fmaxf(dot(V, H), 0.0f);
-    if (NdotH <= 0.0f || VdotH <= 0.0f) return 0.0f;
-    float a = roughness * roughness;
-    float a2 = a * a;
-    float denom = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
-    float D_val = a2 / (M_PI_F * denom * denom + 1e-14f);
-    return D_val * NdotH / (4.0f * VdotH + 1e-7f);
-}
-
-__device__ inline float giMixturePdf(
-    bool pureDiffuse,
-    const float3& N, const float3& V, const float3& L,
-    float roughness, float specProb)
-{
-    float diffPdf = giDiffusePdf(dot(N, L));
-    if (pureDiffuse) return diffPdf;
-    float specPdf = giSpecularPdf(N, V, L, roughness);
-    return specProb * specPdf + (1.0f - specProb) * diffPdf;
-}
-
-// Sample a BSDF direction at the visible point. Returns (newDir, pdf).
-__device__ inline bool giSampleBsdfDir(
-    const ReSTIRSurface& s, uint32_t& rng,
-    float3& outDir, float& outPdf)
-{
-    bool pureDiffuse = (s.pureDiffuse != 0u);
-    float specProb = pureDiffuse ? 0.0f : s.specProb;
-    float u = pcg32_float(rng);
-    float3 dir;
-    if (!pureDiffuse && u < specProb) {
-        // GGX importance sample.
-        float a = s.roughness * s.roughness;
-        float u1 = pcg32_float(rng);
-        float u2 = pcg32_float(rng);
-        float cosTheta = sqrtf((1.0f - u1) / (1.0f + (a*a - 1.0f) * u1 + 1e-7f));
-        float sinTheta = sqrtf(fmaxf(0.0f, 1.0f - cosTheta * cosTheta));
-        float phi = 2.0f * M_PI_F * u2;
-        float3 localH = make_float3(sinTheta * cosf(phi), cosTheta, sinTheta * sinf(phi));
-        float3 T, B;
-        buildONB(s.normal, T, B);
-        float3 H = localToWorld(localH, T, s.normal, B);
-        // Reflect viewDir around H (V points AWAY from the surface; reflect
-        // the *incoming* direction = -V to get the outgoing scatter dir).
-        float3 inDir = -s.viewDir;
-        dir = inDir - H * (2.0f * dot(inDir, H));
-        dir = normalize(dir);
-    } else {
-        float u1 = pcg32_float(rng);
-        float u2 = pcg32_float(rng);
-        float dummy;
-        float3 local = sampleCosineHemisphere(u1, u2, dummy);
-        float3 T, B;
-        buildONB(s.normal, T, B);
-        dir = localToWorld(local, T, s.normal, B);
-    }
-    if (dot(s.normal, dir) <= 1e-6f) return false;
-    outDir = dir;
-    outPdf = giMixturePdf(pureDiffuse, s.normal, s.viewDir, dir,
-                          s.roughness, specProb);
-    return outPdf > 1e-7f;
-}
 
 // Sample direct-lighting contributions at a sample point to seed Lo with
 // direct lighting at the indirect bounce: one NEE shadow ray for area lights
@@ -269,7 +132,7 @@ __device__ inline float3 giDirectLightingAtSample(
         // bound the temporal pass propagates the firefly forward for ~mCap
         // frames; the destination shade-pass clamp can't undo it cleanly
         // because the bright Lo also feeds the pHat used during merge MIS.
-        float lumLi = restirLuminance(areaLi);
+        float lumLi = luminance(areaLi);
         const float liCap = 50.0f;
         if (lumLi > liCap) areaLi = areaLi * (liCap / lumLi);
         Li = Li + areaLi;
@@ -346,7 +209,7 @@ __global__ void kReSTIRGI_InitCandidates(
 
     float jx = camera.jitterOffset.x;
     float jy = camera.jitterOffset.y;
-    Ray ray = giGenerateRay(x, y, width, height, camera, jx, jy);
+    Ray ray = generateRay(x, y, width, height, camera, jx, jy);
 
     GIReservoir r; giReservoirReset(r);
     ReSTIRSurface surf{};
@@ -398,7 +261,7 @@ __global__ void kReSTIRGI_InitCandidates(
     surf.pureDiffuse = mat.pureDiffuse ? 1u : 0u;
     surf.viewDir     = -ray.direction;
     surf.valid       = 1.0f;
-    surf.specProb    = giComputeSpecProb(N, surf.viewDir, albedo, mat.metallic);
+    surf.specProb    = computeSpecProb(N, surf.viewDir, albedo, mat.metallic);
 
     // Reprojection coordinate for next-frame temporal reuse.
     float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hit.position);
@@ -408,7 +271,7 @@ __global__ void kReSTIRGI_InitCandidates(
     // Sample a BSDF direction.
     float3 wi;
     float  pdfBsdf = 0.0f;
-    if (!giSampleBsdfDir(surf, rng, wi, pdfBsdf)) {
+    if (!restirSampleBsdfDir(surf, rng, wi, pdfBsdf)) {
         outReservoirs[pixelIdx] = r;
         outSurfaces[pixelIdx]   = surf;
         return;
@@ -437,8 +300,8 @@ __global__ void kReSTIRGI_InitCandidates(
 
     if (!didHit2) {
         if (enableEnvironment) {
-            float3 envColor = giSampleEnvironment(wi, scene.envMapTex);
-            float envLum = restirLuminance(envColor);
+            float3 envColor = sampleEnvironment(wi, scene.envMapTex);
+            float envLum = luminance(envColor);
             const float clampLum = 100.0f;
             if (envLum > clampLum) envColor = envColor * (clampLum / envLum);
             isEnvSample = true;
@@ -487,7 +350,7 @@ __global__ void kReSTIRGI_InitCandidates(
         samplePos    = hit2.position;
         sampleNormal = N2;
         isEnvSample  = false;
-        hasSample = (restirLuminance(Lo) > 0.0f);
+        hasSample = (luminance(Lo) > 0.0f);
         xrRoughness = fmaxf(mat2.roughness, 0.04f);
     }
 
@@ -706,7 +569,7 @@ __global__ void kReSTIRGI_Shade(
         // physical indirect bounce in normal scenes (1.0 ≈ matte white at
         // full sun). Earlier we used 8 here, which was a defensive over-
         // tightening that visibly desaturated/darkened ReSTIR GI output.
-        float lum = restirLuminance(L);
+        float lum = luminance(L);
         const float clampMax = 50.0f;
         if (lum > clampMax) L = L * (clampMax / lum);
         if (isnan(L.x) || isnan(L.y) || isnan(L.z) ||

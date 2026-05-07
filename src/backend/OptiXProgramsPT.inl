@@ -7,50 +7,7 @@
 
 namespace pt_optix {
 
-__device__ inline float ptComputeSpecProb(
-    const float3& N, const float3& V, const float3& albedo, float metallic)
-{
-    float NdotV = fmaxf(dot(N, V), 0.0f);
-    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, metallic);
-    float t = 1.0f - fminf(fmaxf(NdotV, 0.0f), 1.0f);
-    float t5 = t*t*t*t*t;
-    float3 F = F0 + (make_float3(1,1,1) - F0) * t5;
-    float specW  = restirLuminance(F);
-    float3 kd    = (make_float3(1,1,1) - F) * (1.0f - metallic);
-    float diffW  = restirLuminance(kd * albedo);
-    float p = specW / fmaxf(specW + diffW, 1e-7f);
-    return fminf(fmaxf(p, 0.1f), 0.9f);
-}
-
-__device__ inline float ptDiffusePdf(float NdotL) {
-    return fmaxf(NdotL, 0.0f) * (1.0f / M_PI_F);
-}
-
-__device__ inline float ptSpecularPdf(
-    const float3& N, const float3& V, const float3& L, float roughness)
-{
-    float3 H = normalize(V + L);
-    float NdotH = fmaxf(dot(N, H), 0.0f);
-    float VdotH = fmaxf(dot(V, H), 0.0f);
-    if (NdotH <= 0.0f || VdotH <= 0.0f) return 0.0f;
-    float a = roughness * roughness;
-    float a2 = a * a;
-    float denom = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
-    float D_val = a2 / (M_PI_F * denom * denom + 1e-14f);
-    return D_val * NdotH / (4.0f * VdotH + 1e-7f);
-}
-
-__device__ inline float ptMixturePdf(
-    bool pureDiffuse,
-    const float3& N, const float3& V, const float3& L,
-    float roughness, float specProb)
-{
-    float diffPdf = ptDiffusePdf(dot(N, L));
-    if (pureDiffuse) return diffPdf;
-    float specPdf = ptSpecularPdf(N, V, L, roughness);
-    return specProb * specPdf + (1.0f - specProb) * diffPdf;
-}
-
+// Build a ReSTIRSurface from raw shading attributes during the path postfix.
 __device__ inline ReSTIRSurface ptMakeSurface(
     const float3& pos, const float3& N, const float3& albedo,
     float roughness, float metallic, bool pureDiffuse, const float3& viewDir,
@@ -67,44 +24,6 @@ __device__ inline ReSTIRSurface ptMakeSurface(
     s.specProb    = specProb;
     s.valid       = 1.0f;
     return s;
-}
-
-__device__ inline bool ptSampleBsdfDir(
-    const ReSTIRSurface& s, uint32_t& rng,
-    float3& outDir, float& outPdf)
-{
-    bool pureDiffuse = (s.pureDiffuse != 0u);
-    float specProb = pureDiffuse ? 0.0f : s.specProb;
-    float u = pcg32_float(rng);
-    float3 dir;
-    if (!pureDiffuse && u < specProb) {
-        float a = s.roughness * s.roughness;
-        float u1 = pcg32_float(rng);
-        float u2 = pcg32_float(rng);
-        float cosTheta = sqrtf((1.0f - u1) / (1.0f + (a*a - 1.0f) * u1 + 1e-7f));
-        float sinTheta = sqrtf(fmaxf(0.0f, 1.0f - cosTheta * cosTheta));
-        float phi = 2.0f * M_PI_F * u2;
-        float3 localH = make_float3(sinTheta * cosf(phi), cosTheta, sinTheta * sinf(phi));
-        float3 T, B;
-        buildONB(s.normal, T, B);
-        float3 H = localToWorld(localH, T, s.normal, B);
-        float3 inDir = -s.viewDir;
-        dir = inDir - H * (2.0f * dot(inDir, H));
-        dir = normalize(dir);
-    } else {
-        float u1 = pcg32_float(rng);
-        float u2 = pcg32_float(rng);
-        float dummy;
-        float3 local = sampleCosineHemisphere(u1, u2, dummy);
-        float3 T, B;
-        buildONB(s.normal, T, B);
-        dir = localToWorld(local, T, s.normal, B);
-    }
-    if (dot(s.normal, dir) <= 1e-6f) return false;
-    outDir = dir;
-    outPdf = ptMixturePdf(pureDiffuse, s.normal, s.viewDir, dir,
-                          s.roughness, specProb);
-    return outPdf > 1e-7f;
 }
 
 // One NEE shadow-ray bounce at the given vertex via the OptiX shadow SBT.
@@ -151,7 +70,7 @@ __device__ inline float3 ptDirectLightingAtVertexOptiX(
         float3 origin = s.position + s.normal * 0.001f;
         float tmax = fmaxf(d - 0.002f, 0.001f);
         float3 trans = traceShadowRay(handle, origin, L, 1e-3f, tmax);
-        if (restirLuminance(trans) <= 1e-6f) break;
+        if (luminance(trans) <= 1e-6f) break;
 
         float3 Le;
         if (light.emissiveTex == 0) {
@@ -171,7 +90,7 @@ __device__ inline float3 ptDirectLightingAtVertexOptiX(
         // Source-side firefly clamp — see render/ReSTIRPT.cu and
         // OptiXProgramsGI.inl for the M7 flash-and-decay rationale.
         // Match the CUDA kernel's PT-tightened cap (25, vs GI's 50).
-        float lumLi = restirLuminance(areaLi);
+        float lumLi = luminance(areaLi);
         const float liCap = 25.0f;
         if (lumLi > liCap) areaLi = areaLi * (liCap / lumLi);
         Li = Li + areaLi;
@@ -188,7 +107,7 @@ __device__ inline float3 ptDirectLightingAtVertexOptiX(
             if (NdotL <= 0.0f) continue;
 
             float3 trans = traceShadowRay(handle, origin, Ld, 1e-3f, 1e30f);
-            if (restirLuminance(trans) <= 1e-6f) continue;
+            if (luminance(trans) <= 1e-6f) continue;
 
             float3 brdf = restirEvalBrdf(s, Ld);
             Li = Li + brdf * trans * light.color * NdotL;
@@ -266,7 +185,7 @@ __device__ inline float3 ptPathPostfixOptiX(
     uint32_t& rng)
 {
     float3 L = xrEmis;
-    float specProb_xr = ptComputeSpecProb(xrN, viewDir, xrAlbedo, xrMetallic);
+    float specProb_xr = computeSpecProb(xrN, viewDir, xrAlbedo, xrMetallic);
     ReSTIRSurface curr = ptMakeSurface(xrPos, xrN, xrAlbedo,
                                         xrRoughness, xrMetallic, xrPureDiffuse,
                                         viewDir, specProb_xr);
@@ -277,7 +196,7 @@ __device__ inline float3 ptPathPostfixOptiX(
     for (uint32_t i = 0; i < bounces; i++) {
         float3 wi;
         float  pdfBsdf = 0.0f;
-        if (!ptSampleBsdfDir(curr, rng, wi, pdfBsdf)) break;
+        if (!restirSampleBsdfDir(curr, rng, wi, pdfBsdf)) break;
 
         float3 brdf = restirEvalBrdf(curr, wi);
         float NdotL = fmaxf(dot(curr.normal, wi), 0.0f);
@@ -290,7 +209,7 @@ __device__ inline float3 ptPathPostfixOptiX(
         if (rp.hit == 0) {
             if (enableEnvironment) {
                 float3 envColor = sampleEnvironment(wi, scene.envMapTex);
-                float envLum = restirLuminance(envColor);
+                float envLum = luminance(envColor);
                 const float clampLum = 100.0f;
                 if (envLum > clampLum) envColor = envColor * (clampLum / envLum);
                 L = L + throughput * envColor;
@@ -307,7 +226,7 @@ __device__ inline float3 ptPathPostfixOptiX(
         L = L + throughput * hEmis;
 
         float3 nViewDir = -wi;
-        float specProb = ptComputeSpecProb(hN, nViewDir, hAlbedo, hMetallic);
+        float specProb = computeSpecProb(hN, nViewDir, hAlbedo, hMetallic);
         curr = ptMakeSurface(hPos, hN, hAlbedo, hRoughness, hMetallic, hPure,
                              nViewDir, specProb);
 
@@ -321,7 +240,7 @@ __device__ inline float3 ptPathPostfixOptiX(
         }
     }
 
-    float lum = restirLuminance(L);
+    float lum = luminance(L);
     const float clampMax = 200.0f;
     if (lum > clampMax) L = L * (clampMax / lum);
     return L;
@@ -384,7 +303,7 @@ extern "C" __global__ void __raygen__restir_pt_init_candidates()
     surf.pureDiffuse = hPure ? 1u : 0u;
     surf.viewDir     = -ray.direction;
     surf.valid       = 1.0f;
-    surf.specProb    = pt_optix::ptComputeSpecProb(hN, surf.viewDir, hAlbedo, hMetallic);
+    surf.specProb    = computeSpecProb(hN, surf.viewDir, hAlbedo, hMetallic);
 
     float3 hPosPrev = hPos;
     if (scene.d_positionsPrev) {
@@ -418,7 +337,7 @@ extern "C" __global__ void __raygen__restir_pt_init_candidates()
     for (uint32_t k = 0; k < numCandidates; k++) {
         float3 wi;
         float  pdfBsdf = 0.0f;
-        if (!pt_optix::ptSampleBsdfDir(surf, rng, wi, pdfBsdf)) {
+        if (!restirSampleBsdfDir(surf, rng, wi, pdfBsdf)) {
             r.M += 1.0f;   // failed attempt still counts toward |R|
             continue;
         }
@@ -436,7 +355,7 @@ extern "C" __global__ void __raygen__restir_pt_init_candidates()
         if (rp2.hit == 0) {
             if (enableEnvironment) {
                 float3 envColor = sampleEnvironment(wi, scene.envMapTex);
-                float envLum = restirLuminance(envColor);
+                float envLum = luminance(envColor);
                 const float clampLum = 100.0f;
                 if (envLum > clampLum) envColor = envColor * (clampLum / envLum);
                 isEnvCand   = true;
@@ -465,7 +384,7 @@ extern "C" __global__ void __raygen__restir_pt_init_candidates()
                 candNormal  = xN;
                 isEnvCand   = false;
                 candXrRough = xRoughness;
-                ok          = (restirLuminance(Lo) > 0.0f);
+                ok          = (luminance(Lo) > 0.0f);
             }
         }
 

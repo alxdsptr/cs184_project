@@ -11,26 +11,17 @@
 
 #include "backend/OptiXLaunchParams.h"
 #include "gpu/NRDHelpers.cuh"
-#include "core/Math.h"
 #include "core/Halton.h"
 #include "core/VolumeMedium.h"
 #include "core/VolumeDevice.cuh"
-#include "gpu/AreaLightGPU.h"
 #include "gpu/LightGPU.h"
-#include "gpu/MaterialGPU.h"
 #include "gpu/Random.h"
-#include "gpu/Sampling.h"
 #include "gpu/BRDF.h"
-#include "gpu/RayTypes.h"
-#include "gpu/SHEnv.cuh"
 #include "accel/LightBVHSample.h"
+#include "render/PathTraceHelpers.cuh"
 #include "render/ReSTIRDevice.cuh"
 #include "render/ReSTIRGIDevice.cuh"
 #include "render/VolumeNEE.cuh"
-
-#ifndef M_PI_F
-#define M_PI_F 3.14159265358979323846f
-#endif
 
 extern "C" __constant__ LaunchParams params;
 
@@ -98,190 +89,6 @@ static __forceinline__ __device__ float3 traceShadowRay(
         return make_float3(0.0f, 0.0f, 0.0f);
     }
     return make_float3(uintBitsToFloat(p0), uintBitsToFloat(p1), uintBitsToFloat(p2));
-}
-
-// ── Environment ──────────────────────────────────────────────
-static __forceinline__ __device__ float3 sampleEnvironment(float3 dir, cudaTextureObject_t envMap) {
-    if (envMap != 0) {
-        float theta = acosf(fminf(fmaxf(dir.y, -1.0f), 1.0f));
-        float phi   = atan2f(dir.z, dir.x);
-        float u = (phi + M_PI_F) * (0.5f / M_PI_F);
-        float v = theta / M_PI_F;
-        float4 texel = tex2D<float4>(envMap, u, v);
-        return make_float3(texel.x, texel.y, texel.z);
-    }
-    float t = 0.5f * (dir.y + 1.0f);
-    float3 skyTop = make_float3(0.5f, 0.7f, 1.0f);
-    float3 skyBot = make_float3(1.0f, 1.0f, 1.0f);
-    return lerp(skyBot, skyTop, t) * 0.8f;
-}
-
-static __forceinline__ __device__ float3 sampleEnvironmentForBounce(
-    float3 dir, cudaTextureObject_t envMap,
-    const float3* shCoeffs, bool useSH, bool isPrimary)
-{
-    if (useSH && shCoeffs && !isPrimary) {
-        return sh_evalRadiance(dir, shCoeffs);
-    }
-    return sampleEnvironment(dir, envMap);
-}
-
-// ── BSDF helpers (ported from PathTraceKernel.cu) ─────────────
-static __forceinline__ __device__ float ggxD_local(float NdotH, float roughness) {
-    float a  = roughness * roughness;
-    float a2 = a * a;
-    float denom = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
-    return a2 / (M_PI_F * denom * denom + 1e-14f);
-}
-static __forceinline__ __device__ float3 fresnelSchlick_local(float cosTheta, float3 F0) {
-    float t = 1.0f - fminf(fmaxf(cosTheta, 0.0f), 1.0f);
-    float t5 = t*t*t*t*t;
-    return F0 + (make_float3(1,1,1) - F0) * t5;
-}
-static __forceinline__ __device__ float smithG1_GGX(float NdotX, float alpha) {
-    float a2 = alpha * alpha;
-    float cos2 = NdotX * NdotX;
-    return 2.0f * NdotX / (NdotX + sqrtf(a2 + (1.0f - a2) * cos2) + 1e-7f);
-}
-static __forceinline__ __device__ float powerHeuristic(float pdfA, float pdfB) {
-    float a2 = pdfA * pdfA;
-    float b2 = pdfB * pdfB;
-    return a2 / fmaxf(a2 + b2, 1e-7f);
-}
-static __forceinline__ __device__ float bsdfDiffusePdf(float NdotL) {
-    return fmaxf(NdotL, 0.0f) * (1.0f / M_PI_F);
-}
-static __forceinline__ __device__ float bsdfSpecularPdf(
-    const float3& N, const float3& V, const float3& L, float roughness)
-{
-    float3 H = normalize(V + L);
-    float NdotH = fmaxf(dot(N, H), 0.0f);
-    float VdotH = fmaxf(dot(V, H), 0.0f);
-    if (NdotH <= 0.0f || VdotH <= 0.0f) return 0.0f;
-    float a = roughness * roughness;
-    float a2 = a * a;
-    float denom = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
-    float D_val = a2 / (M_PI_F * denom * denom + 1e-14f);
-    return D_val * NdotH / (4.0f * VdotH + 1e-7f);
-}
-static __forceinline__ __device__ float computeSpecProb(
-    const float3& N, const float3& V, const float3& albedo, float metallic)
-{
-    float NdotV = fmaxf(dot(N, V), 0.0f);
-    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, metallic);
-    float t = 1.0f - fminf(fmaxf(NdotV, 0.0f), 1.0f);
-    float t5 = t*t*t*t*t;
-    float3 F = F0 + (make_float3(1,1,1) - F0) * t5;
-    float specW = 0.2126f * F.x + 0.7152f * F.y + 0.0722f * F.z;
-    float3 kd = (make_float3(1,1,1) - F) * (1.0f - metallic);
-    float diffW = 0.2126f * (kd.x * albedo.x) + 0.7152f * (kd.y * albedo.y) + 0.0722f * (kd.z * albedo.z);
-    float p = specW / fmaxf(specW + diffW, 1e-7f);
-    return fminf(fmaxf(p, 0.1f), 0.9f);
-}
-static __forceinline__ __device__ float bsdfMixturePdf(
-    const float3& N, const float3& V, const float3& L, float roughness, float specProb)
-{
-    float diffusePdf = bsdfDiffusePdf(dot(N, L));
-    float specPdf = bsdfSpecularPdf(N, V, L, roughness);
-    return specProb * specPdf + (1.0f - specProb) * diffusePdf;
-}
-static __forceinline__ __device__ float3 bsdfEvaluate(
-    const float3& N, const float3& V, const float3& L,
-    const float3& albedo, float roughness, float metallic)
-{
-    float NdotL = fmaxf(dot(N, L), 0.0f);
-    float NdotV = fmaxf(dot(N, V), 0.0f);
-    if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0.0f, 0.0f, 0.0f);
-    float3 H = normalize(V + L);
-    float NdotH = fmaxf(dot(N, H), 0.0f);
-    float LdotH = fmaxf(dot(L, H), 0.0f);
-    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, metallic);
-    float3 F = fresnelSchlick_local(LdotH, F0);
-    float D_val = ggxD_local(NdotH, roughness);
-    float alpha = roughness * roughness;
-    float G_val = smithG1_GGX(NdotL, alpha) * smithG1_GGX(NdotV, alpha);
-    float3 specular = F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
-    float3 kd = (make_float3(1, 1, 1) - F) * (1.0f - metallic);
-    float3 diffuse = kd * albedo * (1.0f / M_PI_F);
-    return diffuse + specular;
-}
-
-// Material-aware wrappers — pureDiffuse materials bypass the Cook-Torrance
-// specular lobe entirely and behave as a pure Lambertian BRDF. Used for
-// legacy Collada Phong materials that only carry a <diffuse> term.
-static __forceinline__ __device__ float materialSpecProb(
-    const GPUMaterial& mat,
-    const float3& N, const float3& V, const float3& albedo)
-{
-    if (mat.pureDiffuse) return 0.0f;
-    return computeSpecProb(N, V, albedo, mat.metallic);
-}
-
-static __forceinline__ __device__ float materialMixturePdf(
-    const GPUMaterial& mat,
-    const float3& N, const float3& V, const float3& L,
-    float specProb)
-{
-    if (mat.pureDiffuse) return bsdfDiffusePdf(dot(N, L));
-    return bsdfMixturePdf(N, V, L, mat.roughness, specProb);
-}
-
-static __forceinline__ __device__ float3 materialBsdfEvaluate(
-    const GPUMaterial& mat,
-    const float3& N, const float3& V, const float3& L,
-    const float3& albedo)
-{
-    if (mat.pureDiffuse) {
-        float NdotL = fmaxf(dot(N, L), 0.0f);
-        float NdotV = fmaxf(dot(N, V), 0.0f);
-        if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0, 0, 0);
-        return albedo * (1.0f / M_PI_F);
-    }
-    return bsdfEvaluate(N, V, L, albedo, mat.roughness, mat.metallic);
-}
-
-// Texture-aware Le fetch at a barycentric point on an area light.
-static __forceinline__ __device__ float3 sampleAreaLightLe(
-    const GPUAreaLight& light, float b0, float b1, float b2)
-{
-    if (light.emissiveTex == 0) return light.emission;
-    float u = light.uv0.x * b0 + light.uv1.x * b1 + light.uv2.x * b2;
-    float v = light.uv0.y * b0 + light.uv1.y * b1 + light.uv2.y * b2;
-    float4 texel = tex2D<float4>(light.emissiveTex, u, v);
-    return make_float3(texel.x, texel.y, texel.z) * light.emission;
-}
-
-static __forceinline__ __device__ uint32_t sampleAreaLightIndex(
-    const float* cdf, uint32_t count, float target)
-{
-    uint32_t low = 0, high = count;
-    while (low < high) {
-        uint32_t mid = (low + high) / 2;
-        if (target <= cdf[mid]) high = mid;
-        else low = mid + 1;
-    }
-    return (low >= count) ? (count - 1) : low;
-}
-
-// ── Ray generation helper ─────────────────────────────────────
-static __forceinline__ __device__ Ray generateRay(
-    uint32_t x, uint32_t y, uint32_t width, uint32_t height,
-    const CameraParams& cam, float jitterX, float jitterY)
-{
-    float u = ((float)x + 0.5f + jitterX) / (float)width;
-    float v = ((float)y + 0.5f + jitterY) / (float)height;
-    float ndcX = 2.0f * u - 1.0f;
-    float ndcY = 1.0f - 2.0f * v;
-    float tanHalf = tanf(cam.fovYRadians * 0.5f);
-    float px = ndcX * cam.aspectRatio * tanHalf;
-    float py = ndcY * tanHalf;
-    float3 dir = normalize(cam.forward + cam.right * px + cam.up * py);
-    Ray ray;
-    ray.origin    = cam.position;
-    ray.direction = dir;
-    ray.tmin      = 0.001f;
-    ray.tmax      = 1e30f;
-    return ray;
 }
 
 // ── Raygen ────────────────────────────────────────────────────
@@ -2224,9 +2031,9 @@ extern "C" __global__ void __raygen__restir_init_candidates()
                 float t = 1.0f - fminf(fmaxf(NdotV, 0.0f), 1.0f);
                 float t5 = t*t*t*t*t;
                 float3 F = F0 + (make_float3(1,1,1) - F0) * t5;
-                float specW = restirLuminance(F);
+                float specW = luminance(F);
                 float3 kd = (make_float3(1,1,1) - F) * (1.0f - surf.metallic);
-                float diffW = restirLuminance(kd * surf.albedo);
+                float diffW = luminance(kd * surf.albedo);
                 float p = specW / fmaxf(specW + diffW, 1e-7f);
                 surf.specProb = fminf(fmaxf(p, 0.1f), 0.9f);
             }
@@ -2333,7 +2140,7 @@ extern "C" __global__ void __raygen__restir_visibility()
     // Treat fully-occluded (transmittance == 0) as a kill. Glass paths return
     // partial transmittance > 0; we keep those samples — they're what the
     // final-shading shadow ray will also accumulate against.
-    float lum = restirLuminance(transmittance);
+    float lum = luminance(transmittance);
     if (lum <= 1e-6f) {
         r.W = 0.0f;
         params.restirReservoirsCurr[pixelIdx] = r;

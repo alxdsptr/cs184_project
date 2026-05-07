@@ -1,9 +1,7 @@
 #include "render/ReSTIR.h"
 #include "render/ReSTIRDevice.cuh"  // shared target-pdf + reservoir primitives
+#include "render/PathTraceHelpers.cuh"
 #include "backend/RayTracingBackend.h"
-#include "core/Math.h"
-#include "gpu/AreaLightGPU.h"
-#include "gpu/MaterialGPU.h"
 #include "gpu/Random.h"
 #include "accel/BVH.h"
 #include "accel/LightBVHSample.h"
@@ -20,37 +18,13 @@
 //
 //   E[ f / target * W ]  =  integral( f )                       [RIS]
 //
-// where target(x) = restirLuminance(Le) * |f_r(wi)| * G(x,y) is evaluated without
+// where target(x) = luminance(Le) * |f_r(wi)| * G(x,y) is evaluated without
 // visibility — shadow ray is cast once at final shading.
 // ─────────────────────────────────────────────────────────────────────────
 
-// (BRDF + target-pdf helpers live in ReSTIRDevice.cuh so OptiX raygen can
-// share them verbatim.)
-
-// Duplicate of generateRay from PathTraceKernel.cu — that file's static
-// definitions aren't visible here. Keeping it identical in math so reservoirs
-// line up with the main kernel's ray (same jitter, same FOV).
-__device__ inline Ray generateRayReSTIR(
-    uint32_t x, uint32_t y, uint32_t width, uint32_t height,
-    const CameraParams& cam, float jitterX, float jitterY)
-{
-    float u = ((float)x + 0.5f + jitterX) / (float)width;
-    float v = ((float)y + 0.5f + jitterY) / (float)height;
-    float ndcX = 2.0f * u - 1.0f;
-    float ndcY = 1.0f - 2.0f * v;
-    float tanHalf = tanf(cam.fovYRadians * 0.5f);
-    float px = ndcX * cam.aspectRatio * tanHalf;
-    float py = ndcY * tanHalf;
-    float3 dir = normalize(cam.forward + cam.right * px + cam.up * py);
-    Ray ray;
-    ray.origin    = cam.position;
-    ray.direction = dir;
-    ray.tmin      = 0.001f;
-    ray.tmax      = 1e30f;
-    return ray;
-}
-
-// (Reservoir primitives live in ReSTIRDevice.cuh.)
+// BRDF / target-pdf helpers live in ReSTIRDevice.cuh; camera-ray and BSDF
+// helpers in PathTraceHelpers.cuh. Both shared with the OptiX raygen so the
+// CUDA and OptiX paths produce binary-compatible reservoirs.
 
 // ── Kernel 1: initial candidate generation ──────────────────────
 // For each pixel: cast the primary ray, resolve the material (a cut-down
@@ -83,7 +57,7 @@ __global__ void kReSTIR_InitCandidates(
 
     float jx = camera.jitterOffset.x;
     float jy = camera.jitterOffset.y;
-    Ray ray = generateRayReSTIR(x, y, width, height, camera, jx, jy);
+    Ray ray = generateRay(x, y, width, height, camera, jx, jy);
 
     // Primary hit — fall back to empty reservoir on miss.
     HitRecord hit;
@@ -143,9 +117,9 @@ __global__ void kReSTIR_InitCandidates(
             float t = 1.0f - fminf(fmaxf(NdotV, 0.0f), 1.0f);
             float t5 = t*t*t*t*t;
             float3 F = F0 + (make_float3(1,1,1) - F0) * t5;
-            float specW = restirLuminance(F);
+            float specW = luminance(F);
             float3 kd = (make_float3(1,1,1) - F) * (1.0f - surf.metallic);
-            float diffW = restirLuminance(kd * surf.albedo);
+            float diffW = luminance(kd * surf.albedo);
             float p = specW / fmaxf(specW + diffW, 1e-7f);
             surf.specProb = fminf(fmaxf(p, 0.1f), 0.9f);
         }

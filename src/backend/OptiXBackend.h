@@ -210,6 +210,18 @@ private:
     void freeGAS();
     void destroyAll();
 
+    // Common tail every launch wrapper runs: swap to `raygenRecord`, upload
+    // the LaunchParams, optixLaunch on (width, height, 1), block on the
+    // stream, then restore the regular raygen record. `restoreRaygen=false`
+    // skips the final restore — used by launchPathTrace / launchPathTraceSplit
+    // which set `m_sbt.raygenRecord` to their own record at the next launch.
+    void launchAndSync(
+        const struct LaunchParams& lp,
+        CUdeviceptr  raygenRecord,
+        uint32_t     width,
+        uint32_t     height,
+        bool         restoreRaygen);
+
     OptixDeviceContext      m_ctx            = nullptr;
     OptixModule             m_module         = nullptr;
     OptixProgramGroup       m_pgRaygen       = nullptr;

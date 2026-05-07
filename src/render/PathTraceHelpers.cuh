@@ -1,8 +1,15 @@
 #pragma once
-// Shared __device__ helpers previously defined inline in PathTraceKernel.cu.
-// Extracted so the split-output kernel can reuse them without relying on
-// separable device compilation. Contents are byte-identical to the originals;
-// PathTraceKernel.cu now includes this header to pick up the same definitions.
+// Canonical __device__ helpers used by every CUDA / OptiX rendering kernel
+// in src/render and src/backend: BT.709 luminance, BSDF (metallic-roughness +
+// specular-glossiness), MIS power heuristic, environment sampling, camera-ray
+// generation, and area-light helpers. Defined here once, header-only, so the
+// path tracer (PathTraceKernel.cu / PathTraceKernelSplit.cu), ReSTIR DI / GI /
+// PT (ReSTIR.cu / ReSTIRGI.cu / ReSTIRPT.cu), the volume integrator
+// (VolumeRender.cu / VolumeNEE.cuh), and the OptiX raygens (OptiXPrograms.cu)
+// all share a single source of truth.
+//
+// All functions are `__device__ inline` so multiple TUs can include this
+// header without ODR conflicts under nvrtc / optixir.
 
 #include "core/Math.h"
 #include "gpu/AreaLightGPU.h"
@@ -14,6 +21,13 @@
 #ifndef M_PI_F
 #  define M_PI_F 3.14159265358979323846f
 #endif
+
+// ── Color ────────────────────────────────────────────────────
+// BT.709 relative luminance. Shared by the path tracer, ReSTIR, and the
+// volume integrator — kept here so every call site uses the same coefficients.
+__device__ inline float luminance(float3 c) {
+    return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+}
 
 // ── Environment ──────────────────────────────────────────────
 __device__ inline float3 sampleEnvironment(float3 dir, cudaTextureObject_t envMap) {

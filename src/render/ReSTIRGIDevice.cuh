@@ -187,10 +187,10 @@ __device__ inline float giEvalTargetPdf(
         return 0.0f;
 
     float3 brdf = restirEvalBrdf(surf, wi);
-    float fLum  = restirLuminance(brdf);
+    float fLum  = luminance(brdf);
     if (fLum <= 0.0f) return 0.0f;
 
-    float Lum = restirLuminance(r.sampleRadiance);
+    float Lum = luminance(r.sampleRadiance);
     if (Lum <= 0.0f) return 0.0f;
 
     return fLum * Lum * cosQ;
@@ -218,8 +218,8 @@ __device__ inline bool giEvalTargetPdfVec(
     }
 
     float3 brdf = restirEvalBrdf(surf, wi);
-    float fLum  = restirLuminance(brdf);
-    float Lum   = restirLuminance(r.sampleRadiance);
+    float fLum  = luminance(brdf);
+    float Lum   = luminance(r.sampleRadiance);
     if (fLum <= 0.0f || Lum <= 0.0f) {
         outPHat = 0.0f;
         outFvec = make_float3(0, 0, 0);
