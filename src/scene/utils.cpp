@@ -824,7 +824,9 @@ std::string getTexturePath(const aiMaterial* mat, aiTextureType type, const std:
 
         for (const auto& candidate : candidates) {
             if (std::filesystem::exists(candidate)) {
-                std::string result = candidate.string();
+                std::error_code ec;
+                auto abs = std::filesystem::weakly_canonical(candidate, ec);
+                std::string result = (ec ? candidate : abs).string();
                 LOG_DEBUG("Resolved texture: %s -> %s", texturePath.c_str(), result.c_str());
                 return result;
             }

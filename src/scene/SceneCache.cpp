@@ -27,7 +27,7 @@ namespace {
 
 constexpr uint32_t kCacheMagic    = 0x314E4353; // 'SCN1' (little-endian on disk)
 constexpr uint32_t kCacheMagicEnd = 0x454E4353; // 'SCNE'
-constexpr uint32_t kCacheVersion  = 1;
+constexpr uint32_t kCacheVersion  = 2;
 
 // Compile-time sizeof fingerprint. Any struct field addition / reordering /
 // padding change flips this and silently invalidates every existing cache.
