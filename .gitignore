@@ -20,3 +20,8 @@ imgui.ini
 camera*.txt
 *.scenecache
 *.scenecache.tmp
+data/
+captures/
+results/
+__pycache__/
+diag/

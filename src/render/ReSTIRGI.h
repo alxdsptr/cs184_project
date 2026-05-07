@@ -163,12 +163,11 @@ private:
                                        // camera is moving; see runFrame().
     uint32_t m_motionMCap    = 10;    // applied while camera is moving
     uint32_t m_spatialMCap   = 500;   // higher cap once spatially fused
-    uint32_t m_numNeighbors  = 0;     // spatial reuse off by default
-                                       // (combined with temporal reuse it
-                                       // produces a stable but biased
-                                       // overexposure on glossy/reflective
-                                       // surfaces; revisit once we add
-                                       // visibility re-test in spatial)
+    uint32_t m_numNeighbors  = 3;     // spatial reuse with N=3 neighbors
+                                       // (matches DI default). Defensive
+                                       // pairwise MIS in gris_mergeMultiPair
+                                       // gates incoherent shifts via Jacobian
+                                       // rejection + cross-peer c evaluation.
     float    m_spatialRadius = 30.0f; // pixels
     bool     m_enabled       = false; // off by default — opt-in
 };

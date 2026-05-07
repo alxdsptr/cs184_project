@@ -397,6 +397,36 @@ __device__ inline bool gris_streamCandidate(
 //   Replaces dst's held sample, pHat, W per the GRIS-resampled Y, and sets
 //   dst.M = M_dst + Σ M_peer (post-cap by caller).
 // ─────────────────────────────────────────────────────────────────────────────
+// Helper: contribution of "technique k" to the MIS denominator for a sample
+// stored in `sample`, all expressed in dst's measure. This is the c_{←k}(y)
+// quantity in paper Eq. 38, in the convention where every candidate y has
+// already been brought to dst's measure (so the canonical gets c_{←dst} = pHat
+// with no Jacobian, and each peer's contribution is pHat-at-peer × the
+// shift-Jacobian that converts peer's measure to dst's). Returns 0 when the
+// shift is unconnectable, the BRDF kills the integrand, or the Jacobian is
+// outside the safe range (paper §5.4 explicitly forbids clamping these).
+__device__ inline float gris_cTermAtPeer(
+    const ReSTIRSurface& dstSurf,
+    const ReSTIRSurface& peerSurf_k,
+    const GIReservoir&   sample)
+{
+    if (!giShiftConnectable(peerSurf_k.position, peerSurf_k.normal,
+                             peerSurf_k.roughness, sample))
+        return 0.0f;
+
+    float3 wi_tmp;
+    GIReservoir tmp = sample;
+    float pHat_at_k = giEvalTargetPdf(peerSurf_k, tmp, wi_tmp);
+    if (!(pHat_at_k > 0.0f)) return 0.0f;
+
+    // Measure conversion peer_k → dst: |dω_peer_k / dω_dst|.
+    // giJacobian(qDst, qSrc, r) returns dω_qDst / dω_qSrc, so:
+    float jac_k_to_dst = giJacobian(peerSurf_k.position, dstSurf.position, sample);
+    if (!(jac_k_to_dst > 0.0f)) return 0.0f;
+
+    return pHat_at_k * jac_k_to_dst;
+}
+
 __device__ inline void gris_mergeMultiPair(
     GIReservoir& dst,
     const ReSTIRSurface& dstSurf,
@@ -405,51 +435,105 @@ __device__ inline void gris_mergeMultiPair(
     uint32_t numPeers,
     const float* u01s)
 {
-    // Talbot uniform MIS over (held + peers): m_i(y) = M_i / M for any y in
-    // technique i's support, where M = Mc + Σ M_peer. Trivially satisfies
-    // partition of unity Σ m_i(y) = 1, which is mandatory for unbiased
-    // estimation. (Earlier "defensive pairwise" formula here had broken
-    // partition of unity — Σ m_i collapsed to ~0.06 with N=3 peers,
-    // dimming the integrator by ~16×; advisor reviewed and confirmed.)
+    // Defensive pairwise MIS (Lin et al. 2022 §5.6, Eq. 38). For each candidate
+    // y_i (canonical y_R + each peer's y_i), the MIS weight is
+    //     m_i(y) = M_i · p_i(y in dst measure) / Σ_j M_j · p_j(y in dst measure)
+    // where, in our reconnection-shift convention with all y in dst's measure:
+    //     p_dst(y)    = p̂_at_dst(sample)
+    //     p_peer_k(y) = p̂_at_peer_k(sample) · |dω_peer_k / dω_dst|
+    //                 = giEvalTargetPdf(peerSurf[k], sample) · giJacobian(peer_k, dst, sample)
+    //
+    // The forward-shift Jacobian in the contribution weight w_i = m_i · p̂(y_i) · W_i · |∂T_{src→dst}/∂x|
+    // partly cancels with the same Jacobian inside m_i's own term, giving the
+    // simplified forms below:
+    //     w_canonical = Mc · held.pHat² · held.W / denom_R
+    //     w_peer_i    = M_i · src.pHat · pHatYi · W_i / denom_i
+    // (The denominators retain Jacobians because the cross-peer terms have a
+    // different shift direction than the candidate's own.)
+    //
+    // History: prior to this revision, gris_mergeMultiPair used Talbot uniform
+    // MIS (m_i = M_i / Σ M) — partition of unity is trivial but it ignores y,
+    // exposing per-sample variance as visible blob noise. The version BEFORE
+    // that attempted defensive pairwise but had a structural error in the
+    // denominator (using Mnon · c_li instead of Σ_k M_k · c_{←k}) which
+    // collapsed Σ m_i to ~0.06 with N=3 peers, dimming the integrator ~16×.
+    // This revision restores the proper Eq. 38 form with correct cross-peer
+    // shift evaluations.
+    //
+    // Cost per merge: canonical's denom needs N pHat-evals (one per peer);
+    // each peer's denom needs N-1 cross-peer pHat-evals (k≠i, k≠dst) plus the
+    // already-computed pHatYi and src.pHat. Total = N + N·(N-1) = O(N²).
+    // For temporal reuse (N=1), this is just one extra eval per pixel — almost
+    // free.
     GIReservoir held = dst;
     bool heldValid = (held.valid && held.pHat > 0.0f && held.W > 0.0f);
 
     float Mc = held.M;
-    float M  = Mc;
-    for (uint32_t i = 0; i < numPeers; i++) M += peers[i].M;
-    float invM = (M > 0.0f) ? (1.0f / M) : 0.0f;
+    float Mtotal = Mc;
+    for (uint32_t i = 0; i < numPeers; i++) Mtotal += peers[i].M;
 
     float wSum = 0.0f;
 
-    // Held canonical: m_dst = Mc/M, w_dst = m_dst · p̂(y_R) · W_R.
+    // ── Canonical (held) sample y_R ──────────────────────────────────────
     if (heldValid) {
-        float m_dst = Mc * invM;
-        float w_dst = m_dst * held.pHat * held.W;
-        if (!isfinite(w_dst) || !(w_dst > 0.0f)) {
-            w_dst = 0.0f;
-        } else if (w_dst > RESTIR_GI_MAX_MERGE_W) {
-            w_dst = RESTIR_GI_MAX_MERGE_W;
+        // denom_R = Mc · held.pHat + Σ_k M_k · c_{←peer_k}(y_R)
+        float denom = Mc * held.pHat;
+        for (uint32_t k = 0; k < numPeers; k++) {
+            const GIReservoir& peerK = peers[k];
+            if (!peerK.valid || peerK.M <= 0.0f) continue;
+            float c = gris_cTermAtPeer(dstSurf, peerSurf[k], held);
+            denom += peerK.M * c;
         }
-        if (w_dst > 0.0f) wSum += w_dst;
+        if (denom > 0.0f) {
+            float w_dst = (Mc * held.pHat) * (held.pHat * held.W) / denom;
+            if (!isfinite(w_dst) || !(w_dst > 0.0f)) {
+                w_dst = 0.0f;
+            } else if (w_dst > RESTIR_GI_MAX_MERGE_W) {
+                w_dst = RESTIR_GI_MAX_MERGE_W;
+            }
+            if (w_dst > 0.0f) wSum += w_dst;
+        }
     }
 
-    // Peer terms: m_peer = M_peer/M, w_peer = m_peer · p̂(y_i) · W_i · |J|.
+    // ── Each peer's sample y_i ──────────────────────────────────────────
     for (uint32_t i = 0; i < numPeers; i++) {
         const GIReservoir& src = peers[i];
+        const ReSTIRSurface& sI = peerSurf[i];
         if (!src.valid || src.M <= 0.0f) continue;
         if (!giShiftConnectable(dstSurf.position, dstSurf.normal,
                                  dstSurf.roughness, src)) continue;
 
         float3 wi;
-        GIReservoir tmp = src;
-        float pHatYi = giEvalTargetPdf(dstSurf, tmp, wi);
+        GIReservoir tmpSrc = src;
+        float pHatYi = giEvalTargetPdf(dstSurf, tmpSrc, wi);
         if (!(pHatYi > 0.0f)) continue;
 
-        float jac = giJacobian(dstSurf.position, src.visiblePos, src);
-        if (!(jac > 0.0f)) continue;
+        // jac_dst_from_i = dω_dst / dω_peer_i (forward shift, peer_i → dst).
+        // Used in the explicit w_i = m_i · pHatYi · W_i · jac formula but
+        // cancels in the simplified form.
+        float jac_dst_from_i = giJacobian(dstSurf.position, sI.position, src);
+        if (!(jac_dst_from_i > 0.0f)) continue;
 
-        float m_i = src.M * invM;
-        float w_i = m_i * pHatYi * src.W * jac;
+        // denom_i = Mc · pHatYi (k=dst term, no Jacobian)
+        //         + M_i · src.pHat / jac_dst_from_i  (k=i term: peer_i in its own measure,
+        //                                              converted to dst — equivalent to
+        //                                              src.pHat · giJacobian(peer_i, dst, src)
+        //                                              since jacobian pair are reciprocals)
+        //         + Σ_{k≠i} M_k · c_{←peer_k}(y_from_i)
+        float denom = Mc * pHatYi;
+        denom += src.M * (src.pHat / jac_dst_from_i);
+        for (uint32_t k = 0; k < numPeers; k++) {
+            if (k == i) continue;
+            const GIReservoir& peerK = peers[k];
+            if (!peerK.valid || peerK.M <= 0.0f) continue;
+            float c = gris_cTermAtPeer(dstSurf, peerSurf[k], src);
+            denom += peerK.M * c;
+        }
+        if (!(denom > 0.0f)) continue;
+
+        // Simplified w_i (Jacobians cancel between m_i numerator and outer
+        // forward-shift factor):
+        float w_i = (src.M * src.pHat) * (pHatYi * src.W) / denom;
         if (!isfinite(w_i) || !(w_i > 0.0f)) continue;
         if (w_i > RESTIR_GI_MAX_MERGE_W) w_i = RESTIR_GI_MAX_MERGE_W;
 
@@ -468,10 +552,9 @@ __device__ inline void gris_mergeMultiPair(
             dst.isEnv          = src.isEnv;
             dst.valid          = 1u;
         }
-        (void)peerSurf;
     }
 
-    dst.M = M;
+    dst.M = Mtotal;
     if (dst.valid && dst.pHat > 0.0f) {
         float W = wSum / dst.pHat;
         if (W > RESTIR_GI_MAX_W) W = RESTIR_GI_MAX_W;
@@ -516,59 +599,85 @@ __device__ inline void gris_mergeMultiPairVec(
     const float* u01s,
     float3& outShadeWeight)        // Σ m_i · F_vec(y_i) · W_i · |J|
 {
-    // Talbot uniform MIS — see gris_mergeMultiPair for rationale.
+    // Same defensive pairwise MIS as gris_mergeMultiPair (see that function for
+    // the math). This variant additionally accumulates the vector-valued
+    // resampling weight w_vec = m_i · F(y_i) · W_i · |J| (PT Enhanced §6.3),
+    // which after the same Jacobian cancellation simplifies to:
+    //     vecScale_canonical = Mc · held.pHat · held.W / denom_R
+    //     vecScale_peer_i    = M_i · src.pHat · src.W / denom_i
+    // The shade kernel then computes E[L] ≈ (Σ w_vec) / p̂(Y).
     GIReservoir held = dst;
     bool heldValid = (held.valid && held.pHat > 0.0f && held.W > 0.0f);
 
     float Mc = held.M;
-    float M  = Mc;
-    for (uint32_t i = 0; i < numPeers; i++) M += peers[i].M;
-    float invM = (M > 0.0f) ? (1.0f / M) : 0.0f;
+    float Mtotal = Mc;
+    for (uint32_t i = 0; i < numPeers; i++) Mtotal += peers[i].M;
 
     float wSum = 0.0f;
     float3 wVecSum = make_float3(0, 0, 0);
 
+    // ── Canonical (held) sample y_R ──────────────────────────────────────
     if (heldValid) {
-        float m_dst = Mc * invM;
         float3 wi_R, F_R;
         float pHatR_eval;
         if (giEvalTargetPdfVec(dstSurf, held, wi_R, pHatR_eval, F_R)) {
-            float w_dst = m_dst * held.pHat * held.W;
-            if (!isfinite(w_dst) || !(w_dst > 0.0f)) {
-                w_dst = 0.0f;
-            } else if (w_dst > RESTIR_GI_MAX_MERGE_W) {
-                w_dst = RESTIR_GI_MAX_MERGE_W;
+            float denom = Mc * held.pHat;
+            for (uint32_t k = 0; k < numPeers; k++) {
+                const GIReservoir& peerK = peers[k];
+                if (!peerK.valid || peerK.M <= 0.0f) continue;
+                float c = gris_cTermAtPeer(dstSurf, peerSurf[k], held);
+                denom += peerK.M * c;
             }
-            if (w_dst > 0.0f) {
-                wSum += w_dst;
-                float vecScale = m_dst * held.W;
-                wVecSum = wVecSum + F_R * vecScale;
+            if (denom > 0.0f) {
+                float w_dst = (Mc * held.pHat) * (held.pHat * held.W) / denom;
+                if (!isfinite(w_dst) || !(w_dst > 0.0f)) {
+                    w_dst = 0.0f;
+                } else if (w_dst > RESTIR_GI_MAX_MERGE_W) {
+                    w_dst = RESTIR_GI_MAX_MERGE_W;
+                }
+                if (w_dst > 0.0f) {
+                    wSum += w_dst;
+                    float vecScale = (Mc * held.pHat * held.W) / denom;
+                    wVecSum = wVecSum + F_R * vecScale;
+                }
             }
         }
     }
 
+    // ── Each peer's sample y_i ──────────────────────────────────────────
     for (uint32_t i = 0; i < numPeers; i++) {
         const GIReservoir& src = peers[i];
+        const ReSTIRSurface& sI = peerSurf[i];
         if (!src.valid || src.M <= 0.0f) continue;
         if (!giShiftConnectable(dstSurf.position, dstSurf.normal,
                                  dstSurf.roughness, src)) continue;
 
         float3 wi, F_i;
-        GIReservoir tmp = src;
+        GIReservoir tmpSrc = src;
         float pHatYi;
-        if (!giEvalTargetPdfVec(dstSurf, tmp, wi, pHatYi, F_i)) continue;
+        if (!giEvalTargetPdfVec(dstSurf, tmpSrc, wi, pHatYi, F_i)) continue;
         if (!(pHatYi > 0.0f)) continue;
 
-        float jac = giJacobian(dstSurf.position, src.visiblePos, src);
-        if (!(jac > 0.0f)) continue;
+        float jac_dst_from_i = giJacobian(dstSurf.position, sI.position, src);
+        if (!(jac_dst_from_i > 0.0f)) continue;
 
-        float m_i = src.M * invM;
-        float w_i = m_i * pHatYi * src.W * jac;
+        float denom = Mc * pHatYi;
+        denom += src.M * (src.pHat / jac_dst_from_i);
+        for (uint32_t k = 0; k < numPeers; k++) {
+            if (k == i) continue;
+            const GIReservoir& peerK = peers[k];
+            if (!peerK.valid || peerK.M <= 0.0f) continue;
+            float c = gris_cTermAtPeer(dstSurf, peerSurf[k], src);
+            denom += peerK.M * c;
+        }
+        if (!(denom > 0.0f)) continue;
+
+        float w_i = (src.M * src.pHat) * (pHatYi * src.W) / denom;
         if (!isfinite(w_i) || !(w_i > 0.0f)) continue;
         if (w_i > RESTIR_GI_MAX_MERGE_W) w_i = RESTIR_GI_MAX_MERGE_W;
 
         wSum += w_i;
-        float vecScale = m_i * src.W * jac;
+        float vecScale = (src.M * src.pHat * src.W) / denom;
         wVecSum = wVecSum + F_i * vecScale;
 
         float u = (u01s) ? u01s[i] : 0.5f;
@@ -584,10 +693,9 @@ __device__ inline void gris_mergeMultiPairVec(
             dst.isEnv          = src.isEnv;
             dst.valid          = 1u;
         }
-        (void)peerSurf;
     }
 
-    dst.M = M;
+    dst.M = Mtotal;
     if (dst.valid && dst.pHat > 0.0f) {
         float W = wSum / dst.pHat;
         if (W > RESTIR_GI_MAX_W) W = RESTIR_GI_MAX_W;
