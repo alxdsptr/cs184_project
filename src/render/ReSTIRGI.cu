@@ -222,46 +222,28 @@ __global__ void kReSTIRGI_InitCandidates(
                                 scene.d_positions, scene.d_indices,
                                 scene.d_materialIndices, hit);
     }
-    if (!didHit || hit.materialIndex < 0 ||
-        (uint32_t)hit.materialIndex >= scene.materialCount)
-    {
+    if (!didHit) {
+        outReservoirs[pixelIdx] = r;
+        outSurfaces[pixelIdx]   = surf;
+        return;
+    }
+    ReSTIRHitDecode hPrim = restirDecodeHit(
+        scene, (uint32_t)hit.primitiveIndex, hit.uv.x, hit.uv.y, ray.direction);
+    if (!hPrim.valid) {
         outReservoirs[pixelIdx] = r;
         outSurfaces[pixelIdx]   = surf;
         return;
     }
 
-    GPUMaterial mat = scene.d_materials[hit.materialIndex];
-    uint32_t i0 = scene.d_indices[hit.primitiveIndex * 3 + 0];
-    uint32_t i1 = scene.d_indices[hit.primitiveIndex * 3 + 1];
-    uint32_t i2 = scene.d_indices[hit.primitiveIndex * 3 + 2];
-    float b1 = hit.uv.x, b2 = hit.uv.y;
-    float b0 = 1.0f - b1 - b2;
-    float3 N = normalize(scene.d_normals[i0] * b0 +
-                         scene.d_normals[i1] * b1 +
-                         scene.d_normals[i2] * b2);
-    if (dot(N, ray.direction) > 0.0f) N = -N;
-
-    float2 uv = scene.d_uvs[i0] * b0 + scene.d_uvs[i1] * b1 + scene.d_uvs[i2] * b2;
-    float3 albedo = mat.albedo;
-    if (mat.albedoTex != 0) {
-        float4 t = tex2D<float4>(mat.albedoTex, uv.x, uv.y);
-        albedo = albedo * make_float3(t.x, t.y, t.z);
-    }
-    if (mat.metallicRoughTex != 0) {
-        float4 mrT = tex2D<float4>(mat.metallicRoughTex, uv.x, uv.y);
-        mat.roughness *= mrT.y;
-        mat.metallic  *= mrT.z;
-    }
-
-    surf.position    = hit.position;
-    surf.normal      = N;
-    surf.albedo      = albedo;
-    surf.roughness   = fmaxf(mat.roughness, 0.04f);
-    surf.metallic    = mat.metallic;
-    surf.pureDiffuse = mat.pureDiffuse ? 1u : 0u;
+    surf.position    = hit.position;          // BVH-fed, matches hPrim.pos to fp precision
+    surf.normal      = hPrim.normal;
+    surf.albedo      = hPrim.albedo;
+    surf.roughness   = fmaxf(hPrim.mat.roughness, 0.04f);
+    surf.metallic    = hPrim.mat.metallic;
+    surf.pureDiffuse = hPrim.pureDiffuse ? 1u : 0u;
     surf.viewDir     = -ray.direction;
     surf.valid       = 1.0f;
-    surf.specProb    = computeSpecProb(N, surf.viewDir, albedo, mat.metallic);
+    surf.specProb    = computeSpecProb(hPrim.normal, surf.viewDir, hPrim.albedo, hPrim.mat.metallic);
 
     // Reprojection coordinate for next-frame temporal reuse.
     float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hit.position);
@@ -279,7 +261,7 @@ __global__ void kReSTIRGI_InitCandidates(
 
     // Trace the indirect ray.
     Ray sec;
-    sec.origin    = hit.position + N * 0.001f;
+    sec.origin    = hit.position + hPrim.normal * 0.001f;
     sec.direction = wi;
     sec.tmin      = 0.001f;
     sec.tmax      = 1e30f;
@@ -311,47 +293,24 @@ __global__ void kReSTIRGI_InitCandidates(
             hasSample = (envLum > 0.0f);
             xrRoughness = 0.0f;        // env: gate disabled
         }
-    } else if (hit2.materialIndex >= 0 &&
-               (uint32_t)hit2.materialIndex < scene.materialCount) {
-        GPUMaterial mat2 = scene.d_materials[hit2.materialIndex];
-        uint32_t j0 = scene.d_indices[hit2.primitiveIndex * 3 + 0];
-        uint32_t j1 = scene.d_indices[hit2.primitiveIndex * 3 + 1];
-        uint32_t j2 = scene.d_indices[hit2.primitiveIndex * 3 + 2];
-        float c1 = hit2.uv.x, c2 = hit2.uv.y;
-        float c0 = 1.0f - c1 - c2;
-        float3 N2 = normalize(scene.d_normals[j0] * c0 +
-                              scene.d_normals[j1] * c1 +
-                              scene.d_normals[j2] * c2);
-        if (dot(N2, wi) > 0.0f) N2 = -N2;
-        float2 uv2 = scene.d_uvs[j0] * c0 + scene.d_uvs[j1] * c1 + scene.d_uvs[j2] * c2;
-        float3 albedo2 = mat2.albedo;
-        if (mat2.albedoTex != 0) {
-            float4 t = tex2D<float4>(mat2.albedoTex, uv2.x, uv2.y);
-            albedo2 = albedo2 * make_float3(t.x, t.y, t.z);
-        }
-        if (mat2.metallicRoughTex != 0) {
-            float4 mrT = tex2D<float4>(mat2.metallicRoughTex, uv2.x, uv2.y);
-            mat2.roughness *= mrT.y;
-            mat2.metallic  *= mrT.z;
-        }
-        // Outgoing radiance toward the visible point = emission + 1-bounce NEE.
-        float3 emis = mat2.emission * mat2.emissionStrength;
-        if (mat2.emissiveTex != 0) {
-            float4 et = tex2D<float4>(mat2.emissiveTex, uv2.x, uv2.y);
-            emis = make_float3(et.x, et.y, et.z) * mat2.emissionStrength;
-        }
-        float3 viewDir2 = -wi;  // toward the visible point
-        float3 direct = giDirectLightingAtSample(
-            scene, hit2.position, N2, albedo2,
-            fmaxf(mat2.roughness, 0.04f), mat2.metallic,
-            mat2.pureDiffuse != 0, viewDir2, rng);
+    } else {
+        ReSTIRHitDecode hSec = restirDecodeHit(
+            scene, (uint32_t)hit2.primitiveIndex, hit2.uv.x, hit2.uv.y, wi);
+        if (hSec.valid) {
+            // Outgoing radiance toward the visible point = emission + 1-bounce NEE.
+            float3 viewDir2 = -wi;  // toward the visible point
+            float3 direct = giDirectLightingAtSample(
+                scene, hit2.position, hSec.normal, hSec.albedo,
+                fmaxf(hSec.mat.roughness, 0.04f), hSec.mat.metallic,
+                hSec.pureDiffuse, viewDir2, rng);
 
-        Lo = emis + direct;
-        samplePos    = hit2.position;
-        sampleNormal = N2;
-        isEnvSample  = false;
-        hasSample = (luminance(Lo) > 0.0f);
-        xrRoughness = fmaxf(mat2.roughness, 0.04f);
+            Lo = hSec.emission + direct;
+            samplePos    = hit2.position;
+            sampleNormal = hSec.normal;
+            isEnvSample  = false;
+            hasSample = (luminance(Lo) > 0.0f);
+            xrRoughness = fmaxf(hSec.mat.roughness, 0.04f);
+        }
     }
 
     // Always treat this pixel as having drawn 1 RIS candidate, even if it

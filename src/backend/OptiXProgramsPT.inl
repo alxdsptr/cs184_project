@@ -7,25 +7,6 @@
 
 namespace pt_optix {
 
-// Build a ReSTIRSurface from raw shading attributes during the path postfix.
-__device__ inline ReSTIRSurface ptMakeSurface(
-    const float3& pos, const float3& N, const float3& albedo,
-    float roughness, float metallic, bool pureDiffuse, const float3& viewDir,
-    float specProb)
-{
-    ReSTIRSurface s{};
-    s.position    = pos;
-    s.normal      = N;
-    s.albedo      = albedo;
-    s.roughness   = fmaxf(roughness, 0.04f);
-    s.metallic    = metallic;
-    s.pureDiffuse = pureDiffuse ? 1u : 0u;
-    s.viewDir     = viewDir;
-    s.specProb    = specProb;
-    s.valid       = 1.0f;
-    return s;
-}
-
 // One NEE shadow-ray bounce at the given vertex via the OptiX shadow SBT.
 // Samples both area lights (single resampling sample via light BVH) and all
 // directional lights. Point lights are intentionally omitted (matches the
@@ -117,7 +98,8 @@ __device__ inline float3 ptDirectLightingAtVertexOptiX(
     return Li;
 }
 
-// Resolve a hit record (from rp = traceRadianceRay) into shading attributes.
+// Resolve a hit record (from rp = traceRadianceRay) into shading attributes
+// via the canonical restirDecodeHit (ReSTIRDevice.cuh).
 __device__ inline bool ptShadeHitOptiX(
     const DeviceSceneData& scene,
     const RadiancePayload& rp,
@@ -126,48 +108,15 @@ __device__ inline bool ptShadeHitOptiX(
     float& outRoughness, float& outMetallic, bool& outPureDiffuse)
 {
     if (rp.hit == 0) return false;
-    int matIdx = scene.d_materialIndices ? scene.d_materialIndices[rp.primIdx] : -1;
-    if (matIdx < 0 || (uint32_t)matIdx >= scene.materialCount) return false;
-    GPUMaterial mat = scene.d_materials[matIdx];
-    uint32_t i0 = scene.d_indices[rp.primIdx * 3 + 0];
-    uint32_t i1 = scene.d_indices[rp.primIdx * 3 + 1];
-    uint32_t i2 = scene.d_indices[rp.primIdx * 3 + 2];
-    float c1 = rp.baryU, c2 = rp.baryV;
-    float c0 = 1.0f - c1 - c2;
-    float3 v0b = scene.d_positions[i0];
-    float3 v1b = scene.d_positions[i1];
-    float3 v2b = scene.d_positions[i2];
-    outPos = v0b * c0 + v1b * c1 + v2b * c2;
-    float3 N = scene.d_normals
-        ? normalize(scene.d_normals[i0] * c0 +
-                    scene.d_normals[i1] * c1 +
-                    scene.d_normals[i2] * c2)
-        : normalize(cross(v1b - v0b, v2b - v0b));
-    if (dot(N, rayDir) > 0.0f) N = -N;
-    outN = N;
-    float2 uv = scene.d_uvs
-        ? (scene.d_uvs[i0] * c0 + scene.d_uvs[i1] * c1 + scene.d_uvs[i2] * c2)
-        : make_float2(0.0f, 0.0f);
-    float3 albedo = mat.albedo;
-    if (mat.albedoTex != 0) {
-        float4 t = tex2D<float4>(mat.albedoTex, uv.x, uv.y);
-        albedo = albedo * make_float3(t.x, t.y, t.z);
-    }
-    if (mat.metallicRoughTex != 0) {
-        float4 mrT = tex2D<float4>(mat.metallicRoughTex, uv.x, uv.y);
-        mat.roughness *= mrT.y;
-        mat.metallic  *= mrT.z;
-    }
-    float3 emis = mat.emission * mat.emissionStrength;
-    if (mat.emissiveTex != 0) {
-        float4 et = tex2D<float4>(mat.emissiveTex, uv.x, uv.y);
-        emis = make_float3(et.x, et.y, et.z) * mat.emissionStrength;
-    }
-    outAlbedo   = albedo;
-    outEmission = emis;
-    outRoughness = fmaxf(mat.roughness, 0.04f);
-    outMetallic  = mat.metallic;
-    outPureDiffuse = (mat.pureDiffuse != 0);
+    ReSTIRHitDecode h = restirDecodeHit(scene, rp.primIdx, rp.baryU, rp.baryV, rayDir);
+    if (!h.valid) return false;
+    outPos         = h.pos;
+    outN           = h.normal;
+    outAlbedo      = h.albedo;
+    outEmission    = h.emission;
+    outRoughness   = fmaxf(h.mat.roughness, 0.04f);
+    outMetallic    = h.mat.metallic;
+    outPureDiffuse = h.pureDiffuse;
     return true;
 }
 

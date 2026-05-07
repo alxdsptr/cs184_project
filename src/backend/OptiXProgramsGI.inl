@@ -160,69 +160,24 @@ extern "C" __global__ void __raygen__restir_gi_init_candidates()
         handle, ray.origin, ray.direction, ray.tmin, ray.tmax);
 
     bool primaryHit = (rp.hit != 0);
-    bool eligible = primaryHit;
-    int  matIdx = -1;
-    GPUMaterial mat;
-    float3 hitPos = make_float3(0,0,0);
-    float3 N      = make_float3(0,1,0);
-    float2 uv     = make_float2(0,0);
-    float3 albedo = make_float3(1,1,1);
-
-    if (eligible) {
-        uint32_t triIdx = rp.primIdx;
-        uint32_t i0 = scene.d_indices[triIdx * 3 + 0];
-        uint32_t i1 = scene.d_indices[triIdx * 3 + 1];
-        uint32_t i2 = scene.d_indices[triIdx * 3 + 2];
-        float baryU = rp.baryU, baryV = rp.baryV;
-        float baryW = 1.0f - baryU - baryV;
-        float3 v0 = scene.d_positions[i0];
-        float3 v1 = scene.d_positions[i1];
-        float3 v2 = scene.d_positions[i2];
-        hitPos = v0 * baryW + v1 * baryU + v2 * baryV;
-        matIdx = scene.d_materialIndices ? scene.d_materialIndices[triIdx] : -1;
-        if (matIdx < 0 || (uint32_t)matIdx >= scene.materialCount) {
-            eligible = false;
-        }
-        if (eligible) {
-            mat = scene.d_materials[matIdx];
-            if (scene.d_normals) {
-                N = normalize(scene.d_normals[i0] * baryW +
-                              scene.d_normals[i1] * baryU +
-                              scene.d_normals[i2] * baryV);
-            } else {
-                N = normalize(cross(v1 - v0, v2 - v0));
-            }
-            if (dot(N, ray.direction) > 0.0f) N = -N;
-            if (scene.d_uvs) {
-                uv = scene.d_uvs[i0] * baryW +
-                     scene.d_uvs[i1] * baryU +
-                     scene.d_uvs[i2] * baryV;
-            }
-            albedo = mat.albedo;
-            if (mat.albedoTex != 0) {
-                float4 t = tex2D<float4>(mat.albedoTex, uv.x, uv.y);
-                albedo = albedo * make_float3(t.x, t.y, t.z);
-            }
-            if (mat.metallicRoughTex != 0) {
-                float4 mrT = tex2D<float4>(mat.metallicRoughTex, uv.x, uv.y);
-                mat.roughness *= mrT.y;
-                mat.metallic  *= mrT.z;
-            }
-        }
+    ReSTIRHitDecode hPrim{};
+    if (primaryHit) {
+        hPrim = restirDecodeHit(scene, rp.primIdx, rp.baryU, rp.baryV, ray.direction);
     }
+    bool eligible = hPrim.valid;
 
     if (eligible) {
-        surf.position    = hitPos;
-        surf.normal      = N;
-        surf.albedo      = albedo;
-        surf.roughness   = fmaxf(mat.roughness, 0.04f);
-        surf.metallic    = mat.metallic;
-        surf.pureDiffuse = mat.pureDiffuse ? 1u : 0u;
+        surf.position    = hPrim.pos;
+        surf.normal      = hPrim.normal;
+        surf.albedo      = hPrim.albedo;
+        surf.roughness   = fmaxf(hPrim.mat.roughness, 0.04f);
+        surf.metallic    = hPrim.mat.metallic;
+        surf.pureDiffuse = hPrim.pureDiffuse ? 1u : 0u;
         surf.viewDir     = -ray.direction;
         surf.valid       = 1.0f;
-        surf.specProb    = computeSpecProb(N, surf.viewDir, albedo, mat.metallic);
+        surf.specProb    = computeSpecProb(hPrim.normal, surf.viewDir, hPrim.albedo, hPrim.mat.metallic);
 
-        float3 hitPosPrevGI = hitPos;
+        float3 hitPosPrevGI = hPrim.pos;
         if (scene.d_positionsPrev) {
             uint32_t triIdx2 = rp.primIdx;
             uint32_t pi0 = scene.d_indices[triIdx2 * 3 + 0];
@@ -262,7 +217,7 @@ extern "C" __global__ void __raygen__restir_gi_init_candidates()
             float  candXrRough  = 0.0f;
             bool   ok           = false;
 
-            float3 sec_origin = hitPos + N * 0.001f;
+            float3 sec_origin = hPrim.pos + hPrim.normal * 0.001f;
             RadiancePayload rp2 = traceRadianceRay(
                 handle, sec_origin, wi, 1e-3f, 1e30f);
             if (rp2.hit == 0) {
@@ -279,53 +234,19 @@ extern "C" __global__ void __raygen__restir_gi_init_candidates()
                     ok          = (envLum > 0.0f);
                 }
             } else {
-                uint32_t t2 = rp2.primIdx;
-                uint32_t j0 = scene.d_indices[t2 * 3 + 0];
-                uint32_t j1 = scene.d_indices[t2 * 3 + 1];
-                uint32_t j2 = scene.d_indices[t2 * 3 + 2];
-                float c1 = rp2.baryU, c2 = rp2.baryV;
-                float c0 = 1.0f - c1 - c2;
-                int matIdx2 = scene.d_materialIndices ? scene.d_materialIndices[t2] : -1;
-                if (matIdx2 >= 0 && (uint32_t)matIdx2 < scene.materialCount) {
-                    GPUMaterial mat2 = scene.d_materials[matIdx2];
-                    float3 v0b = scene.d_positions[j0];
-                    float3 v1b = scene.d_positions[j1];
-                    float3 v2b = scene.d_positions[j2];
-                    float3 sp  = v0b * c0 + v1b * c1 + v2b * c2;
-                    float3 N2 = scene.d_normals
-                        ? normalize(scene.d_normals[j0] * c0 +
-                                    scene.d_normals[j1] * c1 +
-                                    scene.d_normals[j2] * c2)
-                        : normalize(cross(v1b - v0b, v2b - v0b));
-                    if (dot(N2, wi) > 0.0f) N2 = -N2;
-                    float2 uv2 = scene.d_uvs
-                        ? (scene.d_uvs[j0] * c0 + scene.d_uvs[j1] * c1 + scene.d_uvs[j2] * c2)
-                        : make_float2(0.0f, 0.0f);
-                    float3 albedo2 = mat2.albedo;
-                    if (mat2.albedoTex != 0) {
-                        float4 t = tex2D<float4>(mat2.albedoTex, uv2.x, uv2.y);
-                        albedo2 = albedo2 * make_float3(t.x, t.y, t.z);
-                    }
-                    if (mat2.metallicRoughTex != 0) {
-                        float4 mrT = tex2D<float4>(mat2.metallicRoughTex, uv2.x, uv2.y);
-                        mat2.roughness *= mrT.y;
-                        mat2.metallic  *= mrT.z;
-                    }
-                    float3 emis = mat2.emission * mat2.emissionStrength;
-                    if (mat2.emissiveTex != 0) {
-                        float4 et = tex2D<float4>(mat2.emissiveTex, uv2.x, uv2.y);
-                        emis = make_float3(et.x, et.y, et.z) * mat2.emissionStrength;
-                    }
+                ReSTIRHitDecode hSec = restirDecodeHit(
+                    scene, rp2.primIdx, rp2.baryU, rp2.baryV, wi);
+                if (hSec.valid) {
                     float3 viewDir2 = -wi;
                     float3 direct = gi_optix::giDirectLightingAtSampleOptiX(
-                        scene, handle, sp, N2, albedo2,
-                        fmaxf(mat2.roughness, 0.04f), mat2.metallic,
-                        mat2.pureDiffuse != 0, viewDir2, rng);
-                    Lo          = emis + direct;
-                    candPos     = sp;
-                    candNormal  = N2;
+                        scene, handle, hSec.pos, hSec.normal, hSec.albedo,
+                        fmaxf(hSec.mat.roughness, 0.04f), hSec.mat.metallic,
+                        hSec.pureDiffuse, viewDir2, rng);
+                    Lo          = hSec.emission + direct;
+                    candPos     = hSec.pos;
+                    candNormal  = hSec.normal;
                     isEnvCand   = false;
-                    candXrRough = fmaxf(mat2.roughness, 0.04f);
+                    candXrRough = fmaxf(hSec.mat.roughness, 0.04f);
                     ok          = (luminance(Lo) > 0.0f);
                 }
             }

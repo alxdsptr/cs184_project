@@ -73,56 +73,29 @@ __global__ void kReSTIR_InitCandidates(
     ReSTIRSurface surf{};
     surf.valid = 0.0f;
 
-    if (didHit && hit.materialIndex >= 0 && (uint32_t)hit.materialIndex < scene.materialCount
+    if (didHit
         && scene.d_areaLights && scene.areaLightCount > 0
         && scene.d_lightBVHNodes)
     {
-        GPUMaterial mat = scene.d_materials[hit.materialIndex];
-        // Interpolate normal / tangent / uv using the hit's barycentrics.
-        uint32_t i0 = scene.d_indices[hit.primitiveIndex * 3 + 0];
-        uint32_t i1 = scene.d_indices[hit.primitiveIndex * 3 + 1];
-        uint32_t i2 = scene.d_indices[hit.primitiveIndex * 3 + 2];
-        float b1 = hit.uv.x, b2 = hit.uv.y;
-        float b0 = 1.0f - b1 - b2;
-        float3 N = normalize(scene.d_normals[i0] * b0 +
-                             scene.d_normals[i1] * b1 +
-                             scene.d_normals[i2] * b2);
-        if (dot(N, ray.direction) > 0.0f) N = -N;
-
-        float2 uv = scene.d_uvs[i0] * b0 + scene.d_uvs[i1] * b1 + scene.d_uvs[i2] * b2;
-        float3 albedo = mat.albedo;
-        if (mat.albedoTex != 0) {
-            float4 t = tex2D<float4>(mat.albedoTex, uv.x, uv.y);
-            albedo = albedo * make_float3(t.x, t.y, t.z);
-        }
-        if (mat.metallicRoughTex != 0) {
-            float4 mrT = tex2D<float4>(mat.metallicRoughTex, uv.x, uv.y);
-            mat.roughness *= mrT.y;
-            mat.metallic  *= mrT.z;
+        ReSTIRHitDecode hPrim = restirDecodeHit(
+            scene, (uint32_t)hit.primitiveIndex, hit.uv.x, hit.uv.y, ray.direction);
+        if (!hPrim.valid) {
+            outReservoirs[pixelIdx] = r;
+            outSurfaces[pixelIdx]   = surf;
+            return;
         }
 
         surf.position  = hit.position;
-        surf.normal    = N;
-        surf.albedo    = albedo;
-        surf.roughness = fmaxf(mat.roughness, 0.04f);
-        surf.metallic  = mat.metallic;
-        surf.pureDiffuse = mat.pureDiffuse ? 1u : 0u;
+        surf.normal    = hPrim.normal;
+        surf.albedo    = hPrim.albedo;
+        surf.roughness = fmaxf(hPrim.mat.roughness, 0.04f);
+        surf.metallic  = hPrim.mat.metallic;
+        surf.pureDiffuse = hPrim.pureDiffuse ? 1u : 0u;
         surf.viewDir   = -ray.direction;
         surf.valid     = 1.0f;
 
-        // Precompute cached specProb (matches main kernel's heuristic).
-        {
-            float NdotV = fmaxf(dot(surf.normal, surf.viewDir), 0.0f);
-            float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), surf.albedo, surf.metallic);
-            float t = 1.0f - fminf(fmaxf(NdotV, 0.0f), 1.0f);
-            float t5 = t*t*t*t*t;
-            float3 F = F0 + (make_float3(1,1,1) - F0) * t5;
-            float specW = luminance(F);
-            float3 kd = (make_float3(1,1,1) - F) * (1.0f - surf.metallic);
-            float diffW = luminance(kd * surf.albedo);
-            float p = specW / fmaxf(specW + diffW, 1e-7f);
-            surf.specProb = fminf(fmaxf(p, 0.1f), 0.9f);
-        }
+        // Cached specProb (matches main kernel's heuristic via PathTraceHelpers).
+        surf.specProb = computeSpecProb(surf.normal, surf.viewDir, surf.albedo, surf.metallic);
 
         // Screen-space motion for temporal lookup next frame.
         float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hit.position);

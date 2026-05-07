@@ -74,27 +74,6 @@
 
 namespace {
 
-// Build a ReSTIRSurface from raw shading attributes. PT-specific because we
-// reconstruct surfaces along the path postfix walk (the visible-point surface
-// is built directly inline in the raygen).
-__device__ inline ReSTIRSurface ptMakeSurface(
-    const float3& pos, const float3& N, const float3& albedo,
-    float roughness, float metallic, bool pureDiffuse, const float3& viewDir,
-    float specProb)
-{
-    ReSTIRSurface s{};
-    s.position    = pos;
-    s.normal      = N;
-    s.albedo      = albedo;
-    s.roughness   = fmaxf(roughness, 0.04f);
-    s.metallic    = metallic;
-    s.pureDiffuse = pureDiffuse ? 1u : 0u;
-    s.viewDir     = viewDir;
-    s.specProb    = specProb;
-    s.valid       = 1.0f;
-    return s;
-}
-
 // One NEE bounce. Mirrors the main path tracer.
 __device__ inline float3 ptDirectLightingAtVertex(
     const DeviceSceneData& scene, const ReSTIRSurface& s, uint32_t& rng)
@@ -193,49 +172,26 @@ __device__ inline float3 ptDirectLightingAtVertex(
     return Li;
 }
 
-// Resolve a BVH closest-hit into shading attributes.
+// Resolve a BVH closest-hit into shading attributes via the canonical
+// restirDecodeHit (ReSTIRDevice.cuh). Output uses `hit.position` directly
+// rather than re-interpolating from vertices — both yield the same point to
+// floating-point precision but the BVH-fed value matches the closest-hit's
+// own parametric position, keeping reservoir/visibility math consistent.
 __device__ inline bool ptShadeHit(
     const DeviceSceneData& scene, const Ray& ray, const HitRecord& hit,
     float3& outPos, float3& outN, float3& outAlbedo, float3& outEmission,
     float& outRoughness, float& outMetallic, bool& outPureDiffuse)
 {
-    if (hit.materialIndex < 0 ||
-        (uint32_t)hit.materialIndex >= scene.materialCount) return false;
-
-    GPUMaterial mat = scene.d_materials[hit.materialIndex];
-    uint32_t i0 = scene.d_indices[hit.primitiveIndex * 3 + 0];
-    uint32_t i1 = scene.d_indices[hit.primitiveIndex * 3 + 1];
-    uint32_t i2 = scene.d_indices[hit.primitiveIndex * 3 + 2];
-    float b1 = hit.uv.x, b2 = hit.uv.y;
-    float b0 = 1.0f - b1 - b2;
-    float3 N = normalize(scene.d_normals[i0] * b0 +
-                         scene.d_normals[i1] * b1 +
-                         scene.d_normals[i2] * b2);
-    if (dot(N, ray.direction) > 0.0f) N = -N;
-
-    float2 uv = scene.d_uvs[i0] * b0 + scene.d_uvs[i1] * b1 + scene.d_uvs[i2] * b2;
-    float3 albedo = mat.albedo;
-    if (mat.albedoTex != 0) {
-        float4 t = tex2D<float4>(mat.albedoTex, uv.x, uv.y);
-        albedo = albedo * make_float3(t.x, t.y, t.z);
-    }
-    if (mat.metallicRoughTex != 0) {
-        float4 mrT = tex2D<float4>(mat.metallicRoughTex, uv.x, uv.y);
-        mat.roughness *= mrT.y;
-        mat.metallic  *= mrT.z;
-    }
-    float3 emis = mat.emission * mat.emissionStrength;
-    if (mat.emissiveTex != 0) {
-        float4 et = tex2D<float4>(mat.emissiveTex, uv.x, uv.y);
-        emis = make_float3(et.x, et.y, et.z) * mat.emissionStrength;
-    }
-    outPos = hit.position;
-    outN   = N;
-    outAlbedo   = albedo;
-    outEmission = emis;
-    outRoughness = fmaxf(mat.roughness, 0.04f);
-    outMetallic  = mat.metallic;
-    outPureDiffuse = (mat.pureDiffuse != 0);
+    ReSTIRHitDecode h = restirDecodeHit(
+        scene, (uint32_t)hit.primitiveIndex, hit.uv.x, hit.uv.y, ray.direction);
+    if (!h.valid) return false;
+    outPos         = hit.position;
+    outN           = h.normal;
+    outAlbedo      = h.albedo;
+    outEmission    = h.emission;
+    outRoughness   = fmaxf(h.mat.roughness, 0.04f);
+    outMetallic    = h.mat.metallic;
+    outPureDiffuse = h.pureDiffuse;
     return true;
 }
 

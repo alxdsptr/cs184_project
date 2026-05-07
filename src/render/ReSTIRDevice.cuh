@@ -241,3 +241,112 @@ __device__ inline bool restir_reservoirCombine(
     dst.M += src.M;
     return accepted;
 }
+
+// ─────────────────────────────────────────────────────────────────
+// ReSTIR hit decode + ReSTIRSurface construction
+// ─────────────────────────────────────────────────────────────────
+
+// Result of `restirDecodeHit` — bundles vertex-interpolated shading attributes
+// + textured material values for one BVH / OptiX hit point. ReSTIR's shading
+// model is simpler than the path tracers' — no normal mapping (the ReSTIR
+// surface is mainly used for reservoir-compatibility tests and BRDF eval, not
+// for the most accurate shading frame).
+struct ReSTIRHitDecode {
+    bool        valid;       // false if material index is out of range
+    float3      pos;
+    float3      normal;      // interpolated geom-or-vertex, back-face-flipped
+    float2      uv;
+    float3      albedo;      // mat.albedo * albedoTex
+    float3      emission;    // mat.emission * emissionStrength * emissiveTex
+    GPUMaterial mat;         // mat.metallic / mat.roughness already adjusted from MR texture
+    bool        pureDiffuse;
+};
+
+// Resolve a primary or secondary hit (`primIdx` + barycentrics) into shading
+// attributes ReSTIR needs: position, back-face-flipped shading normal, UV,
+// albedo (with optional albedoTex), MR-adjusted material, emissive radiance
+// (with optional emissiveTex × emissionStrength). Vertex-normal / UV fetch
+// gracefully fall back when those streams are null.
+//
+// Used by:
+//   * ReSTIRPT.cu  ptShadeHit (CUDA)
+//   * OptiXProgramsPT.inl  ptShadeHitOptiX (OptiX)
+//   * ReSTIRGI.cu  primary + secondary hit decodes
+//   * OptiXProgramsGI.inl  primary + secondary hit decodes inside the raygen
+__device__ inline ReSTIRHitDecode restirDecodeHit(
+    const DeviceSceneData& scene,
+    uint32_t primIdx, float baryU, float baryV,
+    float3 rayDir)
+{
+    ReSTIRHitDecode h{};
+
+    int matIdx = scene.d_materialIndices ? scene.d_materialIndices[primIdx] : -1;
+    if (matIdx < 0 || (uint32_t)matIdx >= scene.materialCount) return h;
+    h.mat = scene.d_materials[matIdx];
+
+    uint32_t i0 = scene.d_indices[primIdx * 3 + 0];
+    uint32_t i1 = scene.d_indices[primIdx * 3 + 1];
+    uint32_t i2 = scene.d_indices[primIdx * 3 + 2];
+    float baryW = 1.0f - baryU - baryV;
+
+    float3 v0 = scene.d_positions[i0];
+    float3 v1 = scene.d_positions[i1];
+    float3 v2 = scene.d_positions[i2];
+    h.pos = v0 * baryW + v1 * baryU + v2 * baryV;
+
+    if (scene.d_normals) {
+        h.normal = normalize(scene.d_normals[i0] * baryW
+                           + scene.d_normals[i1] * baryU
+                           + scene.d_normals[i2] * baryV);
+    } else {
+        h.normal = normalize(cross(v1 - v0, v2 - v0));
+    }
+    if (dot(h.normal, rayDir) > 0.0f) h.normal = -h.normal;
+
+    h.uv = scene.d_uvs
+        ? (scene.d_uvs[i0] * baryW + scene.d_uvs[i1] * baryU + scene.d_uvs[i2] * baryV)
+        : make_float2(0.0f, 0.0f);
+
+    h.albedo = h.mat.albedo;
+    if (h.mat.albedoTex != 0) {
+        float4 t = tex2D<float4>(h.mat.albedoTex, h.uv.x, h.uv.y);
+        h.albedo = h.albedo * make_float3(t.x, t.y, t.z);
+    }
+    if (h.mat.metallicRoughTex != 0) {
+        float4 mrT = tex2D<float4>(h.mat.metallicRoughTex, h.uv.x, h.uv.y);
+        h.mat.roughness *= mrT.y;
+        h.mat.metallic  *= mrT.z;
+    }
+
+    h.emission = h.mat.emission * h.mat.emissionStrength;
+    if (h.mat.emissiveTex != 0) {
+        float4 et = tex2D<float4>(h.mat.emissiveTex, h.uv.x, h.uv.y);
+        h.emission = make_float3(et.x, et.y, et.z) * h.mat.emissionStrength;
+    }
+
+    h.pureDiffuse = (h.mat.pureDiffuse != 0);
+    h.valid = true;
+    return h;
+}
+
+// Build a ReSTIRSurface from raw shading attributes + a precomputed specProb.
+// Used by ReSTIR PT's path postfix (CUDA + OptiX) at every random-walk vertex
+// — the caller passes the just-decoded hit attributes plus the BSDF spec
+// probability for fast pHat eval inside the reservoir streamer.
+__device__ inline ReSTIRSurface ptMakeSurface(
+    const float3& pos, const float3& N, const float3& albedo,
+    float roughness, float metallic, bool pureDiffuse, const float3& viewDir,
+    float specProb)
+{
+    ReSTIRSurface s{};
+    s.position    = pos;
+    s.normal      = N;
+    s.albedo      = albedo;
+    s.roughness   = fmaxf(roughness, 0.04f);
+    s.metallic    = metallic;
+    s.pureDiffuse = pureDiffuse ? 1u : 0u;
+    s.viewDir     = viewDir;
+    s.specProb    = specProb;
+    s.valid       = 1.0f;
+    return s;
+}
