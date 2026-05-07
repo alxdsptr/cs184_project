@@ -19,6 +19,7 @@
 #include "gpu/BRDF.h"
 #include "accel/LightBVHSample.h"
 #include "render/PathTraceHelpers.cuh"
+#include "render/GBufferWriters.cuh"
 #include "render/ReSTIRDevice.cuh"
 #include "render/ReSTIRGIDevice.cuh"
 #include "render/VolumeNEE.cuh"
@@ -234,25 +235,16 @@ extern "C" __global__ void __raygen__path_trace()
                         ray.direction, scene.envMapTex,
                         scene.d_shEnvCoeffs, scene.envUseSH != 0,
                         !shForThisBounce);
-                    float envLum = 0.2126f * envColor.x + 0.7152f * envColor.y + 0.0722f * envColor.z;
-                    float envClamp = 100.0f;
-                    if (envLum > envClamp) envColor = envColor * (envClamp / envLum);
+                    envColor = clampEnvLuminance(envColor, 100.0f);
                     radiance += throughput * envColor;
                 }
-                // Sky pixel: write a sentinel viewZ so NRD treats it as sky
-                // (any value > denoisingRange) and DLSS sees uniform far depth.
+                // Sky pixel: sentinel g-buffer so NRD treats it as sky (viewZ
+                // beyond denoising range) and DLSS sees uniform far depth.
                 // Motion vector stays 0 — sky doesn't reproject by camera.
                 if (firstBounce && !gbufferWritten) {
-                    if (params.gbuffer.viewZ) {
-                        surf2Dwrite<float>(1.0e6f, params.gbuffer.viewZ, x * 4, y);
-                    }
-                    if (params.gbuffer.motionVectors) {
-                        ushort2 zero = make_ushort2(0, 0);
-                        surf2Dwrite<ushort2>(zero, params.gbuffer.motionVectors, x * 4, y);
-                    }
-                    if (params.gbuffer.ndcDepth) {
-                        surf2Dwrite<float>(1.0f, params.gbuffer.ndcDepth, x * 4, y); // far
-                    }
+                    writeSkyGBufferSentinel(
+                        params.gbuffer.viewZ, params.gbuffer.motionVectors,
+                        params.gbuffer.ndcDepth, x, y);
                     gbufferWritten = true;
                     firstBounce = false;
                 }
@@ -316,58 +308,9 @@ extern "C" __global__ void __raygen__path_trace()
                 texUV = uv0 * baryW + uv1 * baryU + uv2 * baryV;
             }
 
-            float3 albedo = mat.albedo;
-            if (mat.albedoTex != 0) {
-                float4 texColor = tex2D<float4>(mat.albedoTex, texUV.x, texUV.y);
-                albedo = make_float3(texColor.x, texColor.y, texColor.z);
-            }
-            if (mat.metallicRoughTex != 0) {
-                float4 mrTexel = tex2D<float4>(mat.metallicRoughTex, texUV.x, texUV.y);
-                mat.roughness = mat.roughness * mrTexel.y;
-                mat.metallic = mat.metallic * mrTexel.z;
-            }
-            // SG "soft" interpretation (see PathTraceKernel.cu for rationale).
-            if (mat.useSpecularGlossiness) {
-                if (mat.useFBXCustomPacking && mat.specularGlossTex != 0) {
-                    float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
-                    float B = clampf(sg.z, 0.0f, 1.0f);
-                    float G = clampf(sg.y, 0.0f, 1.0f);
-                    albedo = mat.specularColor;
-                    mat.metallic = B;
-                    mat.roughness = G;
-                } else if (mat.useFBXUEPacking && mat.specularGlossTex != 0) {
-                    float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
-                    float G = clampf(sg.y, 0.0f, 1.0f);
-                    float B = clampf(sg.z, 0.0f, 1.0f);
-                    mat.metallic  = B;
-                    mat.roughness = 1.0f - G;
-                } else {
-                    float3 specRGB = mat.specularColor;
-                    float  alphaG  = 1.0f;
-                    if (mat.specularGlossTex != 0) {
-                        float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
-                        specRGB = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
-                        alphaG  = sg.w;
-                    }
-                    float specLum = 0.2126f * specRGB.x + 0.7152f * specRGB.y + 0.0722f * specRGB.z;
-                    specLum = clampf(specLum, 0.0f, 1.0f);
-                    float specStrength = sqrtf(specLum);
-                    float F0_target = 0.04f + 0.56f * specStrength;
-                    mat.metallic = clampf((F0_target - 0.04f) / 0.96f, 0.0f, 1.0f);
-                    float gloss = mat.specularGlossAlphaIsGlossiness
-                                    ? (mat.glossiness * alphaG)
-                                    :  specStrength;
-                    mat.roughness = 1.0f - clampf(gloss, 0.0f, 0.95f);
-                }
-            }
-            mat.roughness = fmaxf(mat.roughness, 0.045f);
-            mat.metallic = clampf(mat.metallic, 0.0f, 1.0f);
-
-            float3 emissiveColor = mat.emission;
-            if (mat.emissiveTex != 0) {
-                float4 emissiveTexel = tex2D<float4>(mat.emissiveTex, texUV.x, texUV.y);
-                emissiveColor = make_float3(emissiveTexel.x, emissiveTexel.y, emissiveTexel.z);
-            }
+            float3 albedo;
+            float3 emissiveColor;
+            applyMaterialTextures(mat, texUV, albedo, emissiveColor);
 
             float3 N = hit.shadingNormal;
             if (scene.d_normals) {
@@ -389,8 +332,6 @@ extern "C" __global__ void __raygen__path_trace()
 
             if (firstBounce) {
                 if (!gbufferWritten) {
-                    float viewZprim = dot(hit.position - camera.position, camera.forward);
-                    float3 clipCurr = mat4_transformPoint(camera.viewProjMatrix, hit.position);
                     // Previous-frame world-space hit position. For static
                     // geometry this == hit.position, so reprojecting through
                     // prevViewProjMatrix captures camera motion only. For
@@ -405,15 +346,11 @@ extern "C" __global__ void __raygen__path_trace()
                         float3 v2p = scene.d_positionsPrev[i2];
                         hitPosPrev = v0p * baryW + v1p * baryU + v2p * baryV;
                     }
-                    float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hitPosPrev);
-                    float2 screenCurr = make_float2((clipCurr.x + 1.0f) * 0.5f * params.width,
-                                                     (1.0f - clipCurr.y) * 0.5f * params.height);
-                    float2 screenPrev = make_float2((clipPrev.x + 1.0f) * 0.5f * params.width,
-                                                     (1.0f - clipPrev.y) * 0.5f * params.height);
-                    // DLSS / NRD MV convention: "where was this pixel last
-                    // frame" = `prev - curr`. See PathTraceKernel.cu for the
-                    // longer comment.
-                    float2 mvPx = screenPrev - screenCurr;
+                    float  viewZprim, clipCurrZ;
+                    float2 mvPx;
+                    computePrimaryReproject(camera, hit.position, hitPosPrev,
+                                            params.width, params.height,
+                                            viewZprim, mvPx, clipCurrZ);
 
                     if (params.aux.d_linearDepth)   params.aux.d_linearDepth[pixelIdx] = viewZprim;
                     if (params.aux.d_albedo)        params.aux.d_albedo[pixelIdx]      = albedo;
@@ -424,23 +361,10 @@ extern "C" __global__ void __raygen__path_trace()
                     // post-processing can read them as VkImages directly. Only
                     // the first-sample primary hit wins (averaging across SPP
                     // would soften silhouettes and break temporal reprojection).
-                    if (params.gbuffer.viewZ) {
-                        surf2Dwrite<float>(viewZprim, params.gbuffer.viewZ, x * 4, y);  // R32F
-                    }
-                    if (params.gbuffer.motionVectors) {
-                        __half hx = __float2half(mvPx.x);
-                        __half hy = __float2half(mvPx.y);
-                        ushort2 packed;
-                        packed.x = *reinterpret_cast<unsigned short*>(&hx);
-                        packed.y = *reinterpret_cast<unsigned short*>(&hy);
-                        surf2Dwrite<ushort2>(packed, params.gbuffer.motionVectors, x * 4, y);  // RG16F
-                    }
-                    if (params.gbuffer.ndcDepth) {
-                        // DLSS needs NDC depth in [0,1], not linear viewZ.
-                        // `clipCurr` has already been perspective-divided.
-                        float ndcZ = clampf(clipCurr.z * 0.5f + 0.5f, 0.0f, 1.0f);
-                        surf2Dwrite<float>(ndcZ, params.gbuffer.ndcDepth, x * 4, y);
-                    }
+                    writePrimaryGBufferSurfaces(
+                        params.gbuffer.viewZ, params.gbuffer.motionVectors,
+                        params.gbuffer.ndcDepth,
+                        x, y, viewZprim, mvPx, clipCurrZ);
 
                     gbufferWritten = true;
                 }
@@ -1043,8 +967,7 @@ extern "C" __global__ void __raygen__path_trace_split()
                         ray.direction, scene.envMapTex,
                         scene.d_shEnvCoeffs, scene.envUseSH != 0,
                         !shForThisBounce);
-                    float envLum = 0.2126f*envColor.x + 0.7152f*envColor.y + 0.0722f*envColor.z;
-                    if (envLum > 20.0f) envColor = envColor * (20.0f / envLum);
+                    envColor = clampEnvLuminance(envColor, 20.0f);
                     if (bounce == 0) {
                         // Primary-ray miss: no surface → no diff/spec bucket
                         // to demodulate into. Route the sky through the
@@ -1120,55 +1043,9 @@ extern "C" __global__ void __raygen__path_trace_split()
                 texUV = uv0 * baryW + uv1 * baryU + uv2 * baryV;
             }
 
-            float3 albedo = mat.albedo;
-            if (mat.albedoTex != 0) {
-                float4 tc = tex2D<float4>(mat.albedoTex, texUV.x, texUV.y);
-                albedo = make_float3(tc.x, tc.y, tc.z);
-            }
-            if (mat.metallicRoughTex != 0) {
-                float4 mr = tex2D<float4>(mat.metallicRoughTex, texUV.x, texUV.y);
-                mat.roughness = mat.roughness * mr.y;
-                mat.metallic  = mat.metallic  * mr.z;
-            }
-            // SG remap (mirrors regular OptiX raygen).
-            if (mat.useSpecularGlossiness) {
-                if (mat.useFBXCustomPacking && mat.specularGlossTex != 0) {
-                    float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
-                    float B = clampf(sg.z, 0.0f, 1.0f);
-                    float G = clampf(sg.y, 0.0f, 1.0f);
-                    albedo = mat.specularColor;
-                    mat.metallic = B; mat.roughness = G;
-                } else if (mat.useFBXUEPacking && mat.specularGlossTex != 0) {
-                    float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
-                    float G = clampf(sg.y, 0.0f, 1.0f);
-                    float B = clampf(sg.z, 0.0f, 1.0f);
-                    mat.metallic = B; mat.roughness = 1.0f - G;
-                } else {
-                    float3 specRGB = mat.specularColor;
-                    float  alphaG  = 1.0f;
-                    if (mat.specularGlossTex != 0) {
-                        float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
-                        specRGB = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
-                        alphaG  = sg.w;
-                    }
-                    float specLum = 0.2126f * specRGB.x + 0.7152f * specRGB.y + 0.0722f * specRGB.z;
-                    specLum = clampf(specLum, 0.0f, 1.0f);
-                    float specStrength = sqrtf(specLum);
-                    float F0_target = 0.04f + 0.56f * specStrength;
-                    mat.metallic = clampf((F0_target - 0.04f) / 0.96f, 0.0f, 1.0f);
-                    float gloss = mat.specularGlossAlphaIsGlossiness
-                                    ? (mat.glossiness * alphaG) : specStrength;
-                    mat.roughness = 1.0f - clampf(gloss, 0.0f, 0.95f);
-                }
-            }
-            mat.roughness = fmaxf(mat.roughness, 0.045f);
-            mat.metallic  = clampf(mat.metallic, 0.0f, 1.0f);
-
-            float3 emissiveColor = mat.emission;
-            if (mat.emissiveTex != 0) {
-                float4 et = tex2D<float4>(mat.emissiveTex, texUV.x, texUV.y);
-                emissiveColor = make_float3(et.x, et.y, et.z);
-            }
+            float3 albedo;
+            float3 emissiveColor;
+            applyMaterialTextures(mat, texUV, albedo, emissiveColor);
 
             float3 N = hit.shadingNormal;
             if (scene.d_normals) {

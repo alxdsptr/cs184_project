@@ -275,6 +275,126 @@ __device__ inline float3 materialBsdfEvaluate(
     return bsdfEvaluate(N, V, L, albedo, mat.roughness, mat.metallic);
 }
 
+// ── Material texture sampling + Specular-Glossiness remap ────
+// Applies albedo / metallic-roughness / SG textures to a GPUMaterial and reads
+// emissiveTex into `emissive`. Mutates `mat.metallic`, `mat.roughness`, and
+// `albedo` so the rest of the kernel sees a uniform metallic-roughness
+// representation regardless of how the asset was authored.
+//
+// Specular-Glossiness "soft" interpretation: the spec map's chromaticity is
+// unreliable across assets (saturated magentas / yellows that aren't physical
+// F0), but its *luminance* is a meaningful "how reflective is this pixel"
+// signal. We use spec luminance to drive both roughness and F0 strength so
+// that bright-spec areas (e.g. MEASURE_SEVEN's polished floor) get visible
+// mirror-like highlights, while dark-spec areas (matte walls, fabric) stay
+// properly diffuse. Albedo keeps its BaseColor chromaticity — only its
+// weighting in the BRDF changes.
+//
+// Encoding the target F0 through (metallic, albedo) so we don't fork the BRDF:
+// setting metallic=m and albedo=a gives F0 = lerp(0.04, a, m) = 0.04*(1-m)+a*m.
+// We pick m so F0(white) = 0.04 + (Ftarget - 0.04) = Ftarget when a is treated
+// as white at the F0-mixing site. To keep diffuse colour intact we apply this
+// ONLY to F0; the diffuse term still uses the original BaseColor through
+// kd = (1-F)*(1-m), which gracefully fades diffuse as the surface becomes
+// more metallic — the right behaviour for polished stone / brushed metal.
+//
+// Three SG packing branches are recognized:
+//   1. C4D custom (mat.useFBXCustomPacking): G=roughness, B=per-material spec
+//      strength scaling specularColor up from the dielectric baseline. R/A
+//      unused. Encodes F0 = lerp(0.04, specularColor, B) by setting
+//      albedo := specColor, metallic := B — diffuse routes through
+//      (1-F)*(1-metallic)*albedo and fades on highly reflective pixels.
+//   2. Unreal / standard PBR-Specular (mat.useFBXUEPacking): G=glossiness
+//      (high=smooth), B=metallic mask. Albedo keeps its BaseColor — gives
+//      metals their characteristic tinted F0 = lerp(0.04, baseColor, 1).
+//   3. Generic glTF KHR_materials_pbrSpecularGlossiness: spec luminance drives
+//      a "soft" F0 target (0.04 + 0.56 * sqrt(specLum)) routed through the
+//      metallic+albedo path. The sqrt curve lets even mid-luminance spec give
+//      noticeable polish (matching how artists paint masks), and the 0.56 cap
+//      keeps F0 below pure mirror so BaseColor stays visible in the diffuse
+//      lobe. When alpha carries glossiness data it modulates the material
+//      factor; otherwise spec luminance directly drives glossiness so
+//      bright-spec areas show clear reflections.
+__device__ inline void applyMaterialTextures(
+    GPUMaterial& mat, float2 texUV,
+    float3& albedo, float3& emissive)
+{
+    albedo = mat.albedo;
+    if (mat.albedoTex != 0) {
+        float4 tc = tex2D<float4>(mat.albedoTex, texUV.x, texUV.y);
+        albedo = make_float3(tc.x, tc.y, tc.z);
+    }
+    // glTF MR convention: G = roughness, B = metallic.
+    if (mat.metallicRoughTex != 0) {
+        float4 mr = tex2D<float4>(mat.metallicRoughTex, texUV.x, texUV.y);
+        mat.roughness = mat.roughness * mr.y;
+        mat.metallic  = mat.metallic  * mr.z;
+    }
+    if (mat.useSpecularGlossiness) {
+        if (mat.useFBXCustomPacking && mat.specularGlossTex != 0) {
+            // C4D: G=roughness, B=spec strength.
+            float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
+            float B = clampf(sg.z, 0.0f, 1.0f);
+            float G = clampf(sg.y, 0.0f, 1.0f);
+            albedo = mat.specularColor;
+            mat.metallic  = B;
+            mat.roughness = G;
+        } else if (mat.useFBXUEPacking && mat.specularGlossTex != 0) {
+            // UE / standard PBR-Spec: G=glossiness (high=smooth), B=metallic.
+            float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
+            float G = clampf(sg.y, 0.0f, 1.0f);
+            float B = clampf(sg.z, 0.0f, 1.0f);
+            mat.metallic  = B;
+            mat.roughness = 1.0f - G;
+        } else {
+            // Generic glTF KHR_materials_pbrSpecularGlossiness — soft F0 mapping.
+            float3 specRGB = mat.specularColor;
+            float  alphaG  = 1.0f;
+            if (mat.specularGlossTex != 0) {
+                float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
+                specRGB = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
+                alphaG  = sg.w;
+            }
+            float specLum = 0.2126f * specRGB.x + 0.7152f * specRGB.y + 0.0722f * specRGB.z;
+            specLum = clampf(specLum, 0.0f, 1.0f);
+            // sqrt curve: even mid-luminance spec gives noticeable polish.
+            float specStrength = sqrtf(specLum);
+            // Target F0 ranges from dielectric baseline (0.04) to ~0.6 for the
+            // brightest spec values — polished-metal territory but capped below
+            // pure mirror to leave headroom for the BaseColor tint in diffuse.
+            float F0_target = 0.04f + 0.56f * specStrength;
+            mat.metallic = clampf((F0_target - 0.04f) / 0.96f, 0.0f, 1.0f);
+            // Alpha-as-glossiness uses the material factor; otherwise spec
+            // luminance directly drives glossiness so bright-spec areas show
+            // clear reflections, and `glossiness` acts as an upper-bound trim.
+            float gloss = mat.specularGlossAlphaIsGlossiness
+                            ? (mat.glossiness * alphaG)
+                            :  specStrength;
+            mat.roughness = 1.0f - clampf(gloss, 0.0f, 0.95f);
+        }
+    }
+    // Clamp to stable ranges for BRDF sampling/evaluation.
+    mat.roughness = fmaxf(mat.roughness, 0.045f);
+    mat.metallic  = clampf(mat.metallic, 0.0f, 1.0f);
+
+    emissive = mat.emission;
+    if (mat.emissiveTex != 0) {
+        float4 et = tex2D<float4>(mat.emissiveTex, texUV.x, texUV.y);
+        emissive = make_float3(et.x, et.y, et.z);
+    }
+}
+
+// Clamp an environment-map sample by luminance. NRD/DLSS feed bright HDR sky
+// pixels (e.g. the sun) directly into the temporal accumulator, where a single
+// firefly-strength sample survives reprojection for many frames as a shimmering
+// speck. The mono kernels use a generous cap (100); the split / NRD kernels
+// use a tighter cap (20) since RELAX is more sensitive to outliers.
+__device__ inline float3 clampEnvLuminance(float3 envColor, float maxLum) {
+    float lum = 0.2126f * envColor.x + 0.7152f * envColor.y + 0.0722f * envColor.z;
+    if (lum > maxLum) envColor = envColor * (maxLum / lum);
+    return envColor;
+}
+
 // ── Lobe-only BRDF evaluators ────────────────────────────────
 // Diffuse / specular halves of `bsdfEvaluate`. Used by NRD-/DLSS-RR-targeted
 // split kernels at the primary hit, where NEE and BSDF sampling are forced to

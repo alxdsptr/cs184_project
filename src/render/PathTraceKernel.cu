@@ -1,5 +1,6 @@
 #include "render/PathTraceKernel.h"
 #include "render/PathTraceHelpers.cuh"
+#include "render/GBufferWriters.cuh"
 #include "core/Halton.h"
 #include "core/VolumeMedium.h"
 #include "core/VolumeDevice.cuh"
@@ -177,25 +178,13 @@ __global__ void pathTraceKernel(
                     !shForThisBounce);
                 // Clamp extremely bright HDR texels (sun etc.) to prevent
                 // fireflies when a path through glass hits a hot pixel.
-                float envLum = 0.2126f * envColor.x + 0.7152f * envColor.y + 0.0722f * envColor.z;
-                float envClamp = 100.0f;
-                if (envLum > envClamp) {
-                    envColor = envColor * (envClamp / envLum);
-                }
+                envColor = clampEnvLuminance(envColor, 100.0f);
                 radiance += throughput * envColor;
             }
-            // Sky pixel: write a sentinel viewZ so DLSS / NRD treat it as far.
+            // Sky pixel: write sentinel g-buffer so DLSS / NRD treat it as far.
             if (firstBounce && !gbufferWritten) {
-                if (gbuffer.viewZ) {
-                    surf2Dwrite<float>(1.0e6f, gbuffer.viewZ, x * 4, y);
-                }
-                if (gbuffer.motionVectors) {
-                    ushort2 zero = make_ushort2(0, 0);
-                    surf2Dwrite<ushort2>(zero, gbuffer.motionVectors, x * 4, y);
-                }
-                if (gbuffer.ndcDepth) {
-                    surf2Dwrite<float>(1.0f, gbuffer.ndcDepth, x * 4, y); // far plane
-                }
+                writeSkyGBufferSentinel(
+                    gbuffer.viewZ, gbuffer.motionVectors, gbuffer.ndcDepth, x, y);
                 gbufferWritten = true;
                 firstBounce = false;
             }
@@ -238,114 +227,10 @@ __global__ void pathTraceKernel(
             texUV = uv0 * baryW + uv1 * baryU + uv2 * baryV;
         }
 
-        // Sample albedo texture if available
-        float3 albedo = mat.albedo;
-        if (mat.albedoTex != 0) {
-            float4 texColor = tex2D<float4>(mat.albedoTex, texUV.x, texUV.y);
-            albedo = make_float3(texColor.x, texColor.y, texColor.z);
-        }
-
-        // Sample metallic-roughness texture (glTF convention: G=roughness, B=metallic)
-        if (mat.metallicRoughTex != 0) {
-            float4 mrTexel = tex2D<float4>(mat.metallicRoughTex, texUV.x, texUV.y);
-            mat.roughness = mat.roughness * mrTexel.y;
-            mat.metallic = mat.metallic * mrTexel.z;
-        }
-
-        // Specular-Glossiness "soft" interpretation: the spec map's chromaticity
-        // is unreliable across assets (saturated magentas / yellows that aren't
-        // physical F0), but its *luminance* is a meaningful "how reflective is
-        // this pixel" signal. We use spec luminance to drive both roughness and
-        // F0 strength so that bright-spec areas (MEASURE_SEVEN's polished floor)
-        // get visible mirror-like highlights, while dark-spec areas (matte
-        // walls, fabric) stay properly diffuse. Albedo keeps its BaseColor
-        // chromaticity — only its weighting in the BRDF changes.
-        //
-        // Encoding the target F0 through (metallic, albedo) so we don't fork
-        // the BRDF: setting metallic = m and albedo = a gives F0 =
-        //   lerp(0.04, a, m) = 0.04*(1-m) + a*m.
-        // We pick m so that F0 (white) = 0.04 + (Ftarget - 0.04) = Ftarget when
-        // a is treated as white at the F0-mixing site. To keep diffuse colour
-        // intact we apply this ONLY to F0; the diffuse term still uses the
-        // original BaseColor through kd = (1-F)*(1-m), which gracefully fades
-        // diffuse as the surface becomes more metallic — the exact behaviour
-        // we want for polished stone / brushed metal.
-        if (mat.useSpecularGlossiness) {
-            if (mat.useFBXCustomPacking && mat.specularGlossTex != 0) {
-                // C4D-style packing: G = roughness, B = per-material spec
-                // strength scaling the material's specularColor up from the
-                // dielectric baseline. R/A are unused.
-                float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
-                float B = clampf(sg.z, 0.0f, 1.0f);
-                float G = clampf(sg.y, 0.0f, 1.0f);
-
-                // Encode F0 = lerp(0.04, specularColor, B) through the
-                // metallic+albedo path so the rest of the BRDF stays untouched.
-                // F0_mr = lerp(0.04, albedo, metallic). Picking albedo := specColor
-                // and metallic := B reproduces the desired F0 exactly while still
-                // routing diffuse through (1-F)*(1-metallic)*albedo, which fades
-                // diffuse on highly reflective pixels — the right behaviour for
-                // polished surfaces.
-                albedo = mat.specularColor;
-                mat.metallic = B;
-                mat.roughness = G;
-            } else if (mat.useFBXUEPacking && mat.specularGlossTex != 0) {
-                // UE / standard PBR-Specular packing: G = glossiness (high =
-                // smooth, opposite of roughness), B = metallic mask. Albedo
-                // keeps its BaseColor — this gives metals their characteristic
-                // tinted F0 = lerp(0.04, baseColor, 1) = baseColor.
-                float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
-                float G = clampf(sg.y, 0.0f, 1.0f);
-                float B = clampf(sg.z, 0.0f, 1.0f);
-                mat.metallic  = B;
-                mat.roughness = 1.0f - G;
-            } else {
-                float3 specRGB = mat.specularColor;
-                float  alphaG  = 1.0f;
-                if (mat.specularGlossTex != 0) {
-                    float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
-                    specRGB = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
-                    alphaG  = sg.w;
-                }
-                float specLum = 0.2126f * specRGB.x + 0.7152f * specRGB.y + 0.0722f * specRGB.z;
-                specLum = clampf(specLum, 0.0f, 1.0f);
-
-                // sqrt curve: even mid-luminance spec gives a noticeable polish,
-                // matching how artists usually paint these masks.
-                float specStrength = sqrtf(specLum);
-
-                // Target F0 ranges from dielectric baseline (0.04) to ~0.6 for the
-                // brightest spec values — well into "polished metal" territory but
-                // capped below pure mirror to leave headroom for the BaseColor tint
-                // visible in the diffuse lobe.
-                float F0_target = 0.04f + 0.56f * specStrength;
-                mat.metallic = clampf((F0_target - 0.04f) / 0.96f, 0.0f, 1.0f);
-
-                // When alpha carries glossiness data, use it (modulated by the
-                // material factor). When it doesn't, let spec luminance directly
-                // drive glossiness so bright-spec areas show clear reflections;
-                // the scalar `glossiness` factor only acts as an upper bound /
-                // global trim.
-                float gloss;
-                if (mat.specularGlossAlphaIsGlossiness) {
-                    gloss = mat.glossiness * alphaG;
-                } else {
-                    gloss = specStrength;
-                }
-                mat.roughness = 1.0f - clampf(gloss, 0.0f, 0.95f);
-            }
-        }
-
-        // Clamp roughness/metallic to stable ranges for BRDF sampling/evaluation
-        mat.roughness = fmaxf(mat.roughness, 0.045f);
-        mat.metallic = clampf(mat.metallic, 0.0f, 1.0f);
-
-        // Sample emissive texture if available
-        float3 emissiveColor = mat.emission;
-        if (mat.emissiveTex != 0) {
-            float4 emissiveTexel = tex2D<float4>(mat.emissiveTex, texUV.x, texUV.y);
-            emissiveColor = make_float3(emissiveTexel.x, emissiveTexel.y, emissiveTexel.z);
-        }
+        // Apply albedo / MR / SG textures and resolve emissive. Mutates `mat`.
+        float3 albedo;
+        float3 emissiveColor;
+        applyMaterialTextures(mat, texUV, albedo, emissiveColor);
 
         // Interpolate vertex normals if available
         float3 N = hit.shadingNormal;
@@ -486,44 +371,21 @@ __global__ void pathTraceKernel(
         // the samples-per-pixel loop so we don't overwrite on subsequent spp.
         if (firstBounce) {
             if (!gbufferWritten) {
-                float viewZprim = dot(hit.position - camera.position, camera.forward);
-                float3 clipCurr = mat4_transformPoint(camera.viewProjMatrix, hit.position);
-                float3 clipPrev = mat4_transformPoint(camera.prevViewProjMatrix, hit.position);
-                float2 screenCurr = make_float2((clipCurr.x + 1.0f) * 0.5f * width,
-                                                 (1.0f - clipCurr.y) * 0.5f * height);
-                float2 screenPrev = make_float2((clipPrev.x + 1.0f) * 0.5f * width,
-                                                 (1.0f - clipPrev.y) * 0.5f * height);
-                // DLSS / NRD MV convention: "where was this pixel last frame",
-                // i.e. `prev - curr`. With the opposite sign DLSS reprojects
-                // history in the wrong direction and smears moving content
-                // into a long ghost trail.
-                float2 mvPx = screenPrev - screenCurr;
+                float  viewZprim, clipCurrZ;
+                float2 mvPx;
+                computePrimaryReproject(camera, hit.position, hit.position,
+                                        width, height,
+                                        viewZprim, mvPx, clipCurrZ);
 
                 if (auxBuffers.d_linearDepth)   auxBuffers.d_linearDepth[pixelIdx]   = viewZprim;
                 if (auxBuffers.d_albedo)        auxBuffers.d_albedo[pixelIdx]        = albedo;
                 if (auxBuffers.d_normal)        auxBuffers.d_normal[pixelIdx]        = N;
                 if (auxBuffers.d_motionVectors) auxBuffers.d_motionVectors[pixelIdx] = mvPx;
 
-                // DLSSOnly: also write to Vulkan-shared surfaces (mirrors the
-                // OptiX raygen logic — see OptiXPrograms.cu).
-                if (gbuffer.viewZ) {
-                    surf2Dwrite<float>(viewZprim, gbuffer.viewZ, x * 4, y);
-                }
-                if (gbuffer.motionVectors) {
-                    __half hx = __float2half(mvPx.x);
-                    __half hy = __float2half(mvPx.y);
-                    ushort2 packed;
-                    packed.x = *reinterpret_cast<unsigned short*>(&hx);
-                    packed.y = *reinterpret_cast<unsigned short*>(&hy);
-                    surf2Dwrite<ushort2>(packed, gbuffer.motionVectors, x * 4, y);
-                }
-                if (gbuffer.ndcDepth) {
-                    // DLSS needs post-perspective clip.z/clip.w. `clipCurr` is
-                    // already the perspective-divided NDC position in [-1,1];
-                    // remap to DLSS's [0,1] convention (near=0, far=1).
-                    float ndcZ = clampf(clipCurr.z * 0.5f + 0.5f, 0.0f, 1.0f);
-                    surf2Dwrite<float>(ndcZ, gbuffer.ndcDepth, x * 4, y);
-                }
+                // DLSSOnly: also write to Vulkan-shared surfaces.
+                writePrimaryGBufferSurfaces(
+                    gbuffer.viewZ, gbuffer.motionVectors, gbuffer.ndcDepth,
+                    x, y, viewZprim, mvPx, clipCurrZ);
 
                 gbufferWritten = true;
             }

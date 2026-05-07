@@ -3,6 +3,7 @@
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
 
 #include "render/PathTraceHelpers.cuh"
+#include "render/GBufferWriters.cuh"
 #include "render/ReSTIR.h"
 #include "render/VolumeNEE.cuh"
 #include "render/VolumeShadowCuda.cuh"
@@ -213,8 +214,7 @@ __global__ void pathTraceKernelSplit(
                     ray.direction, scene.envMapTex,
                     scene.d_shEnvCoeffs, scene.envUseSH != 0,
                     !shForThisBounce);
-                float envLum = 0.2126f*envColor.x + 0.7152f*envColor.y + 0.0722f*envColor.z;
-                if (envLum > 20.0f) envColor = envColor * (20.0f / envLum);
+                envColor = clampEnvLuminance(envColor, 20.0f);
                 if (bounce == 0) {
                     // Primary-ray miss: there is no surface, so there's no
                     // diff/spec bucket to demodulate into. Route the sky
@@ -258,58 +258,9 @@ __global__ void pathTraceKernelSplit(
             texUV = scene.d_uvs[i0] * baryW + scene.d_uvs[i1] * baryU + scene.d_uvs[i2] * baryV;
         }
 
-        float3 albedo = mat.albedo;
-        if (mat.albedoTex != 0) {
-            float4 tc = tex2D<float4>(mat.albedoTex, texUV.x, texUV.y);
-            albedo = make_float3(tc.x, tc.y, tc.z);
-        }
-        if (mat.metallicRoughTex != 0) {
-            float4 mr = tex2D<float4>(mat.metallicRoughTex, texUV.x, texUV.y);
-            mat.roughness = mat.roughness * mr.y;
-            mat.metallic = mat.metallic * mr.z;
-        }
-        // SG "soft" interpretation (see PathTraceKernel.cu for rationale).
-        if (mat.useSpecularGlossiness) {
-            if (mat.useFBXCustomPacking && mat.specularGlossTex != 0) {
-                float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
-                float B = clampf(sg.z, 0.0f, 1.0f);
-                float G = clampf(sg.y, 0.0f, 1.0f);
-                albedo = mat.specularColor;
-                mat.metallic = B;
-                mat.roughness = G;
-            } else if (mat.useFBXUEPacking && mat.specularGlossTex != 0) {
-                float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
-                float G = clampf(sg.y, 0.0f, 1.0f);
-                float B = clampf(sg.z, 0.0f, 1.0f);
-                mat.metallic  = B;
-                mat.roughness = 1.0f - G;
-            } else {
-                float3 specRGB = mat.specularColor;
-                float  alphaG  = 1.0f;
-                if (mat.specularGlossTex != 0) {
-                    float4 sg = tex2D<float4>(mat.specularGlossTex, texUV.x, texUV.y);
-                    specRGB = mat.specularColor * make_float3(sg.x, sg.y, sg.z);
-                    alphaG  = sg.w;
-                }
-                float specLum = 0.2126f * specRGB.x + 0.7152f * specRGB.y + 0.0722f * specRGB.z;
-                specLum = clampf(specLum, 0.0f, 1.0f);
-                float specStrength = sqrtf(specLum);
-                float F0_target = 0.04f + 0.56f * specStrength;
-                mat.metallic = clampf((F0_target - 0.04f) / 0.96f, 0.0f, 1.0f);
-                float gloss = mat.specularGlossAlphaIsGlossiness
-                                ? (mat.glossiness * alphaG)
-                                :  specStrength;
-                mat.roughness = 1.0f - clampf(gloss, 0.0f, 0.95f);
-            }
-        }
-        mat.roughness = fmaxf(mat.roughness, 0.045f);
-        mat.metallic = clampf(mat.metallic, 0.0f, 1.0f);
-
-        float3 emissiveColor = mat.emission;
-        if (mat.emissiveTex != 0) {
-            float4 et = tex2D<float4>(mat.emissiveTex, texUV.x, texUV.y);
-            emissiveColor = make_float3(et.x, et.y, et.z);
-        }
+        float3 albedo;
+        float3 emissiveColor;
+        applyMaterialTextures(mat, texUV, albedo, emissiveColor);
 
         float3 N = hit.shadingNormal;
         if (scene.d_normals) {
