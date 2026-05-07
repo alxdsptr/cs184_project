@@ -18,15 +18,29 @@ void CUDABackend::buildAccelerationStructure(const Scene& scene) {
     }
 
     // Build SAH BVH on CPU using the flattened position/index data
-    // We need host copies for the CPU BVH builder
-    const auto& meshes = scene.getMeshes();
+    // We need host copies for the CPU BVH builder.
+    //
+    // SceneLoader keeps mesh.positions in *mesh-local* space (it dropped
+    // aiProcess_PreTransformVertices when animation landed). DeviceScene bakes
+    // each mesh's node->worldRest into the GPU position buffer at upload, so
+    // the kernel sees world-space triangles. We must mirror that bake here, or
+    // the BVH (mesh-local) and the geometry the kernel intersects (world)
+    // would live in different coordinate frames and traversal would miss.
+    const auto& meshes   = scene.getMeshes();
+    const auto& bindings = scene.getMeshBindings();
+    const auto& nodes    = scene.getNodes();
 
-    // Flatten positions and indices on host (same layout as DeviceScene)
     std::vector<float3>   hostPositions;
     std::vector<uint32_t> hostIndices;
     uint32_t vertexOffset = 0;
-    for (auto& mesh : meshes) {
-        for (auto& p : mesh.positions) hostPositions.push_back(p);
+    for (size_t mi = 0; mi < meshes.size(); mi++) {
+        const auto& mesh = meshes[mi];
+        int ni = (mi < bindings.size()) ? bindings[mi].nodeIndex : -1;
+        const float4x4& W = (ni >= 0 && (size_t)ni < nodes.size())
+                                ? nodes[(size_t)ni].worldRest
+                                : float4x4::identity();
+        for (auto& p : mesh.positions)
+            hostPositions.push_back(mat4_transformPoint(W, p));
         for (auto idx : mesh.indices)
             hostIndices.push_back(idx + vertexOffset);
         vertexOffset += (uint32_t)mesh.positions.size();
