@@ -15,6 +15,47 @@
 #include "core/Math.h"   // mat4_inverse
 #include <cstring>
 #include <cmath>
+#include <filesystem>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#endif
+
+namespace {
+// Resolve the directory holding our SPIR-V shaders. The literal "shaders" is
+// CWD-relative; running from project root (instead of the build dir) makes
+// CompositePass init fail and demote to Native, which then can leave Vulkan-
+// shared aux buffers half-attached and crash inside OptiX on the next launch.
+// Probe the same candidate set VulkanDisplay uses, plus the exe directory, so
+// the launch CWD doesn't matter. Cached on first call.
+const std::string& resolveShaderDir() {
+    static std::string cached = []() -> std::string {
+        namespace fs = std::filesystem;
+        fs::path exeDir;
+#ifdef _WIN32
+        wchar_t buf[MAX_PATH];
+        DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+        if (n > 0) exeDir = fs::path(std::wstring(buf, n)).parent_path();
+#endif
+        const char* sentinel = "fullscreen_quad_vk.vert.spv";
+        fs::path candidates[] = {
+            exeDir / "shaders",
+            fs::path("shaders"),
+            fs::path("../shaders"),
+            fs::path("Release/shaders"),
+            fs::path("build/shaders"),
+            fs::path("build/Release/shaders"),
+        };
+        for (auto& c : candidates) {
+            if (fs::exists(c / sentinel)) return c.string();
+        }
+        // No probe hit — fall back to "shaders" so the failure path still logs
+        // the same "shaders/<file> not found" we used to.
+        return std::string("shaders");
+    }();
+    return cached;
+}
+} // namespace
 #endif
 
 Renderer::Renderer()  = default;
@@ -496,7 +537,7 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
             m_compositeRender = std::make_unique<CompositePass>();
             if (!m_compositeRender->init(dev, m_hdrRenderPass,
                                          CompositePass::COMPOSITE_LINEAR_HDR,
-                                         VK_FORMAT_R16G16B16A16_SFLOAT, "shaders")) {
+                                         VK_FORMAT_R16G16B16A16_SFLOAT, resolveShaderDir().c_str())) {
                 LOG_WARN("Composite (linear HDR) init failed — demoting to NRDOnly");
                 newMode = Mode::NRDOnly;
             }
@@ -505,7 +546,7 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
                 m_tonemap = std::make_unique<CompositePass>();
                 if (!m_tonemap->init(dev, m_ldrRenderPass,
                                      CompositePass::TONEMAP_ONLY,
-                                     display->sampledImageFormat(), "shaders")) {
+                                     display->sampledImageFormat(), resolveShaderDir().c_str())) {
                     LOG_WARN("Tonemap pass init failed — demoting to NRDOnly");
                     newMode = Mode::NRDOnly;
                     m_tonemap.reset();
@@ -517,7 +558,7 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
                 m_compositeRender = std::make_unique<CompositePass>();
                 if (!m_compositeRender->init(dev, m_ldrRenderPass,
                         CompositePass::COMPOSITE_TONEMAP,
-                        display->sampledImageFormat(), "shaders")) {
+                        display->sampledImageFormat(), resolveShaderDir().c_str())) {
                     LOG_ERROR("Unable to rebuild LDR composite after demotion");
                     shutdownNrdPath();
                     m_mode = Mode::Native;
@@ -568,7 +609,7 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
         m_tonemap = std::make_unique<CompositePass>();
         if (!m_tonemap->init(dev, m_ldrRenderPass,
                              CompositePass::TONEMAP_ONLY,
-                             display->sampledImageFormat(), "shaders")) {
+                             display->sampledImageFormat(), resolveShaderDir().c_str())) {
             LOG_ERROR("DLSS%s: Tonemap pass init failed — demoting to Native",
                       newMode == Mode::DLSSRR ? "RR" : "Only");
             shutdownDlssPath();
@@ -715,7 +756,7 @@ bool Renderer::initNrdPath(VulkanDisplay* display, uint32_t renderW, uint32_t re
     if (withNrd) {
         m_compositeRender = std::make_unique<CompositePass>();
         if (!m_compositeRender->init(dev, m_ldrRenderPass,
-                                     CompositePass::COMPOSITE_TONEMAP, fmt, "shaders")) {
+                                     CompositePass::COMPOSITE_TONEMAP, fmt, resolveShaderDir().c_str())) {
             LOG_ERROR("Renderer: CompositePass::init failed");
             vkDestroyFramebuffer(dev, m_ldrFramebuffer, nullptr); m_ldrFramebuffer = VK_NULL_HANDLE;
             vkDestroyRenderPass(dev, m_ldrRenderPass, nullptr); m_ldrRenderPass = VK_NULL_HANDLE;
