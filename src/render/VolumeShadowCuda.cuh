@@ -1,11 +1,9 @@
 #pragma once
-// CUDA-backend shadow-ray adapter for participating-medium NEE. Lives in its
-// own header so both PathTraceKernel.cu and PathTraceKernelSplit.cu can pull
-// it in without conflicting with the per-file inline duplicates of the BSDF
-// helpers (PathTraceKernel.cu still defines its own, PathTraceKernelSplit.cu
-// pulls them from PathTraceHelpers.cuh — adding shadow tracing to either
-// shared header would force a redefinition fight). Pairs with the backend-
-// agnostic NEE template in render/VolumeNEE.cuh.
+// CUDA-backend shadow-ray adapter for participating-medium NEE. Pairs with
+// the backend-agnostic NEE template in render/VolumeNEE.cuh — that template
+// receives this function as the `TraceShadowFn` callable so the medium
+// integrator can stay backend-agnostic while we use the SAH-BVH on CUDA and
+// the OptiX GAS on the OptiX backend.
 
 #include "core/Math.h"
 #include "gpu/MaterialGPU.h"
