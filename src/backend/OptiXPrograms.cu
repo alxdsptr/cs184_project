@@ -894,74 +894,6 @@ extern "C" __global__ void __anyhit__shadow()
 // temporal filtering). Each spp-loop iteration does one full path.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Lobe-only BRDF evaluators (port of bsdfDiffuseLobe / bsdfSpecularLobe in
-// PathTraceKernelSplit.cu). Used at the primary hit when forcing NEE/BSDF
-// to the picked bucket, so that diff_bucket * albedo + spec_bucket recovers
-// the full primary-hit radiance.
-static __forceinline__ __device__ float3 splitDiffuseLobe(
-    const float3& N, const float3& V, const float3& L,
-    const float3& albedo, float roughness, float metallic)
-{
-    (void)roughness;
-    float NdotL = fmaxf(dot(N, L), 0.0f);
-    float NdotV = fmaxf(dot(N, V), 0.0f);
-    if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0,0,0);
-    float3 H = normalize(V + L);
-    float LdotH = fmaxf(dot(L, H), 0.0f);
-    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, metallic);
-    float3 F  = fresnelSchlick_local(LdotH, F0);
-    float3 kd = (make_float3(1,1,1) - F) * (1.0f - metallic);
-    return kd * albedo * (1.0f / M_PI_F);
-}
-
-static __forceinline__ __device__ float3 splitSpecularLobe(
-    const float3& N, const float3& V, const float3& L,
-    const float3& albedo, float roughness, float metallic)
-{
-    float NdotL = fmaxf(dot(N, L), 0.0f);
-    float NdotV = fmaxf(dot(N, V), 0.0f);
-    if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0,0,0);
-    float3 H = normalize(V + L);
-    float NdotH = fmaxf(dot(N, H), 0.0f);
-    float LdotH = fmaxf(dot(L, H), 0.0f);
-    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, metallic);
-    float3 F  = fresnelSchlick_local(LdotH, F0);
-    float D_val = ggxD_local(NdotH, roughness);
-    float alpha = roughness * roughness;
-    float G_val = smithG1_GGX(NdotL, alpha) * smithG1_GGX(NdotV, alpha);
-    return F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
-}
-
-static __forceinline__ __device__ float3 materialDiffuseLobe_split(
-    const GPUMaterial& mat,
-    const float3& N, const float3& V, const float3& L, const float3& albedo)
-{
-    if (mat.pureDiffuse) {
-        float NdotL = fmaxf(dot(N, L), 0.0f);
-        float NdotV = fmaxf(dot(N, V), 0.0f);
-        if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0, 0, 0);
-        return albedo * (1.0f / M_PI_F);
-    }
-    return splitDiffuseLobe(N, V, L, albedo, mat.roughness, mat.metallic);
-}
-
-static __forceinline__ __device__ float3 materialSpecularLobe_split(
-    const GPUMaterial& mat,
-    const float3& N, const float3& V, const float3& L, const float3& albedo)
-{
-    if (mat.pureDiffuse) return make_float3(0, 0, 0);
-    return splitSpecularLobe(N, V, L, albedo, mat.roughness, mat.metallic);
-}
-
-// Per-contribution firefly clamp (luminance-bounded). RELAX is sensitive to
-// single-sample spikes that survive temporal filtering for many frames as
-// shimmering specks ("water ripples"); clamp each NEE / emissive contribution.
-static __forceinline__ __device__ float3 clampFirefly_split(float3 c, float maxLum) {
-    float lum = 0.2126f*c.x + 0.7152f*c.y + 0.0722f*c.z;
-    if (lum > maxLum && lum > 1e-7f) c = c * (maxLum / lum);
-    return c;
-}
-
 // Lift packHalf4 out of the raygen body — lambdas inside OptiX raygen
 // functions have caused misaligned-stack issues in some toolchain versions.
 // Use the __half_as_ushort intrinsic (no pointer reinterpret) to avoid any
@@ -992,38 +924,6 @@ static __forceinline__ __device__ uint32_t packRGBA8(float r, float g, float b, 
     uint32_t bb = (uint32_t)(fminf(fmaxf(b, 0.0f), 1.0f) * 255.0f + 0.5f);
     uint32_t ba = (uint32_t)(fminf(fmaxf(a, 0.0f), 1.0f) * 255.0f + 0.5f);
     return (ba << 24) | (bb << 16) | (bg << 8) | br;
-}
-
-// DLSS-RR §3.4.2 / Appendix: per-pixel specular albedo from F0, alpha, NoV.
-static __forceinline__ __device__ float3 envBRDFApprox2_split(
-    float3 F0, float alpha, float NoV)
-{
-    NoV = fabsf(NoV);
-    float NoV2 = NoV * NoV;
-    float NoV3 = NoV2 * NoV;
-    float a3   = alpha * alpha * alpha;
-    float M1xy_top = 0.99044f - 1.28514f * NoV;
-    float M1xy_bot = 1.29678f - 0.755907f * NoV;
-    float biasNum = M1xy_top + M1xy_bot * alpha;
-    float M2_0 = 1.0f + 2.92338f * NoV + 59.4188f * NoV3;
-    float M2_1 = 20.3225f - 27.0302f * NoV + 222.592f * NoV3;
-    float M2_2 = 121.563f + 626.13f * NoV + 316.627f * NoV3;
-    float biasDen = M2_0 + M2_1 * alpha + M2_2 * a3;
-    float bias = biasNum / fmaxf(biasDen, 1e-7f);
-    float M3xy_top = 0.0365463f + 3.32707f * NoV;
-    float M3xy_bot = 9.0632f    - 9.04756f * NoV;
-    float scaleNum = M3xy_top + M3xy_bot * alpha;
-    float M4_0 = 1.0f + 3.59685f * NoV2 - 1.36772f * NoV3;
-    float M4_1 = 9.04401f - 16.3174f * NoV2 + 9.22949f * NoV3;
-    float M4_2 = 5.56589f + 19.7886f * NoV2 - 20.2123f * NoV3;
-    float scaleDen = M4_0 + M4_1 * alpha + M4_2 * a3;
-    float scale = scaleNum / fmaxf(scaleDen, 1e-7f);
-    bias  *= fminf(fmaxf(F0.y * 50.0f, 0.0f), 1.0f);
-    scale = fmaxf(scale, 0.0f);
-    bias  = fmaxf(bias, 0.0f);
-    return make_float3(F0.x * scale + bias,
-                       F0.y * scale + bias,
-                       F0.z * scale + bias);
 }
 
 extern "C" __global__ void __raygen__path_trace_split()
@@ -1153,7 +1053,7 @@ extern "C" __global__ void __raygen__path_trace_split()
 
                             // Route into the emissive bucket. Path terminates.
                             float3 contrib = throughput * ssAlbedo * inScatter;
-                            emissiveContrib += clampFirefly_split(contrib, 10.0f);
+                            emissiveContrib += clampFirefly(contrib, 10.0f);
                             break;
                         }
                         // No scatter — ratio-track transmittance for surface span.
@@ -1181,7 +1081,7 @@ extern "C" __global__ void __raygen__path_trace_split()
                         // the composite shader picks it up via `+ emis`.
                         emissiveContrib = envColor;
                     } else {
-                        pathRadiance += clampFirefly_split(throughput * envColor, 10.0f);
+                        pathRadiance += clampFirefly(throughput * envColor, 10.0f);
                     }
                 }
                 // Sky pixel sentinel viewZ — only the first sample's miss wins.
@@ -1416,7 +1316,7 @@ extern "C" __global__ void __raygen__path_trace_split()
                 if (bounce == 0) {
                     emissiveContrib = Le * weight;   // Primary emissive — separate image.
                 } else {
-                    pathRadiance += clampFirefly_split(throughput * Le * weight, 10.0f);
+                    pathRadiance += clampFirefly(throughput * Le * weight, 10.0f);
                 }
                 if (mat.emissiveTex == 0) break;
             }
@@ -1482,8 +1382,8 @@ extern "C" __global__ void __raygen__path_trace_split()
                         float3 brdf;
                         if (primaryLobeOverride) {
                             brdf = (pickedBucket == 0)
-                                ? materialDiffuseLobe_split(mat, N, V, Ld, albedo)
-                                : materialSpecularLobe_split(mat, N, V, Ld, albedo);
+                                ? materialDiffuseLobe(mat, N, V, Ld, albedo)
+                                : materialSpecularLobe(mat, N, V, Ld, albedo);
                         } else {
                             brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
                         }
@@ -1493,7 +1393,7 @@ extern "C" __global__ void __raygen__path_trace_split()
                             float geom = lNdot / d2;
                             float3 neeContrib = throughput * st * brdf * Le *
                                                 (NdotL * geom) * restirW;
-                            pathRadiance += clampFirefly_split(neeContrib, 10.0f);
+                            pathRadiance += clampFirefly(neeContrib, 10.0f);
                         } else {
                             float pTri = light.weight / scene.areaLightTotalWeight;
                             float pArea = pTri / fmaxf(light.area, 1e-7f);
@@ -1510,7 +1410,7 @@ extern "C" __global__ void __raygen__path_trace_split()
                             float w = powerHeuristic(pdfOmega, pdfBs);
                             float3 neeContrib = throughput * st * brdf * Le *
                                                 (NdotL / fmaxf(pdfOmega, 1e-7f)) * w;
-                            pathRadiance += clampFirefly_split(neeContrib, 10.0f);
+                            pathRadiance += clampFirefly(neeContrib, 10.0f);
                         }
                     }
                 }
@@ -1548,12 +1448,12 @@ extern "C" __global__ void __raygen__path_trace_split()
                     float3 brdf;
                     if (primaryLobeOverride) {
                         brdf = (pickedBucket == 0)
-                            ? materialDiffuseLobe_split(mat, N, V, Ld, albedo)
-                            : materialSpecularLobe_split(mat, N, V, Ld, albedo);
+                            ? materialDiffuseLobe(mat, N, V, Ld, albedo)
+                            : materialSpecularLobe(mat, N, V, Ld, albedo);
                     } else {
                         brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
                     }
-                    direct += clampFirefly_split(brdf * st * Li * NdotL, 10.0f);
+                    direct += clampFirefly(brdf * st * Li * NdotL, 10.0f);
                 }
                 pathRadiance += throughput * direct;
             }
@@ -1578,12 +1478,12 @@ extern "C" __global__ void __raygen__path_trace_split()
                     float3 brdf;
                     if (primaryLobeOverride) {
                         brdf = (pickedBucket == 0)
-                            ? materialDiffuseLobe_split(mat, N, V, Ld, albedo)
-                            : materialSpecularLobe_split(mat, N, V, Ld, albedo);
+                            ? materialDiffuseLobe(mat, N, V, Ld, albedo)
+                            : materialSpecularLobe(mat, N, V, Ld, albedo);
                     } else {
                         brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
                     }
-                    direct += clampFirefly_split(brdf * st * light.color * NdotL, 10.0f);
+                    direct += clampFirefly(brdf * st * light.color * NdotL, 10.0f);
                 }
                 pathRadiance += throughput * direct;
             }
@@ -1646,10 +1546,10 @@ extern "C" __global__ void __raygen__path_trace_split()
             if (primaryLobeOverride) {
                 if (pickedBucket == 0) {
                     pdf  = bsdfDiffusePdf(NdotLn);
-                    brdf = materialDiffuseLobe_split(mat, N, V, newDir, albedo);
+                    brdf = materialDiffuseLobe(mat, N, V, newDir, albedo);
                 } else {
                     pdf  = bsdfSpecularPdf(N, V, newDir, mat.roughness);
-                    brdf = materialSpecularLobe_split(mat, N, V, newDir, albedo);
+                    brdf = materialSpecularLobe(mat, N, V, newDir, albedo);
                 }
             } else {
                 pdf  = materialMixturePdf(mat, N, V, newDir, specProb);
@@ -1737,7 +1637,7 @@ extern "C" __global__ void __raygen__path_trace_split()
     float3 specF0_RR = lerp(make_float3(0.04f, 0.04f, 0.04f),
                             outPrimaryAlbedo, outPrimaryMetallic);
     float NoV_RR = fmaxf(-dot(outPrimaryRayDir, outPrimaryNormal), 0.0f);
-    float3 specAlbedoAvg = envBRDFApprox2_split(
+    float3 specAlbedoAvg = envBRDFApprox2(
         specF0_RR, outPrimaryRoughness * outPrimaryRoughness, NoV_RR);
     if (!gbufferWritten) {
         specAlbedoAvg = make_float3(0.5f, 0.5f, 0.5f);

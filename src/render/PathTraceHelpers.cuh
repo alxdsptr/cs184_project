@@ -273,6 +273,153 @@ __device__ inline float3 materialBsdfEvaluate(
     return bsdfEvaluate(N, V, L, albedo, mat.roughness, mat.metallic);
 }
 
+// ── Lobe-only BRDF evaluators ────────────────────────────────
+// Diffuse / specular halves of `bsdfEvaluate`. Used by NRD-/DLSS-RR-targeted
+// split kernels at the primary hit, where NEE and BSDF sampling are forced to
+// the picked bucket so that diff_bucket * albedo + spec_bucket recovers the
+// full primary-hit radiance after demodulation.
+
+__device__ inline float3 bsdfDiffuseLobe(
+    const float3& N, const float3& V, const float3& L,
+    const float3& albedo, float roughness, float metallic)
+{
+    (void)roughness;
+    float NdotL = fmaxf(dot(N, L), 0.0f);
+    float NdotV = fmaxf(dot(N, V), 0.0f);
+    if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0,0,0);
+    float3 H = normalize(V + L);
+    float LdotH = fmaxf(dot(L, H), 0.0f);
+    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, metallic);
+    float3 F  = fresnelSchlick_local(LdotH, F0);
+    float3 kd = (make_float3(1,1,1) - F) * (1.0f - metallic);
+    return kd * albedo * (1.0f / M_PI_F);
+}
+
+__device__ inline float3 bsdfSpecularLobe(
+    const float3& N, const float3& V, const float3& L,
+    const float3& albedo, float roughness, float metallic)
+{
+    float NdotL = fmaxf(dot(N, L), 0.0f);
+    float NdotV = fmaxf(dot(N, V), 0.0f);
+    if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0,0,0);
+    float3 H = normalize(V + L);
+    float NdotH = fmaxf(dot(N, H), 0.0f);
+    float LdotH = fmaxf(dot(L, H), 0.0f);
+    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), albedo, metallic);
+    float3 F  = fresnelSchlick_local(LdotH, F0);
+    float D_val = ggxD_local(NdotH, roughness);
+    float alpha = roughness * roughness;
+    float G_val = smithG1_GGX(NdotL, alpha) * smithG1_GGX(NdotV, alpha);
+    return F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
+}
+
+// SG variants: F0 comes from the material's specularColor instead of being
+// derived from albedo+metallic. Diffuse lobe drops the (1-metallic) darkening.
+__device__ inline float3 bsdfDiffuseLobeSG(
+    const float3& N, const float3& V, const float3& L,
+    const float3& albedo, const float3& F0)
+{
+    float NdotL = fmaxf(dot(N, L), 0.0f);
+    float NdotV = fmaxf(dot(N, V), 0.0f);
+    if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0,0,0);
+    float3 H = normalize(V + L);
+    float LdotH = fmaxf(dot(L, H), 0.0f);
+    float3 F  = fresnelSchlick_local(LdotH, F0);
+    float3 kd = (make_float3(1,1,1) - F);
+    return kd * albedo * (1.0f / M_PI_F);
+}
+
+__device__ inline float3 bsdfSpecularLobeSG(
+    const float3& N, const float3& V, const float3& L,
+    float roughness, const float3& F0)
+{
+    float NdotL = fmaxf(dot(N, L), 0.0f);
+    float NdotV = fmaxf(dot(N, V), 0.0f);
+    if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0,0,0);
+    float3 H = normalize(V + L);
+    float NdotH = fmaxf(dot(N, H), 0.0f);
+    float LdotH = fmaxf(dot(L, H), 0.0f);
+    float3 F  = fresnelSchlick_local(LdotH, F0);
+    float D_val = ggxD_local(NdotH, roughness);
+    float alpha = roughness * roughness;
+    float G_val = smithG1_GGX(NdotL, alpha) * smithG1_GGX(NdotV, alpha);
+    return F * (D_val * G_val / (4.0f * NdotL * NdotV + 1e-7f));
+}
+
+// Material-aware lobe wrappers — pureDiffuse materials have no specular lobe,
+// and the diffuse lobe is pure albedo/π (no F0 dielectric scaling). SG
+// materials are remapped to MR per-pixel before reaching here.
+__device__ inline float3 materialDiffuseLobe(
+    const GPUMaterial& mat,
+    const float3& N, const float3& V, const float3& L, const float3& albedo)
+{
+    if (mat.pureDiffuse) {
+        float NdotL = fmaxf(dot(N, L), 0.0f);
+        float NdotV = fmaxf(dot(N, V), 0.0f);
+        if (NdotL <= 0.0f || NdotV <= 0.0f) return make_float3(0, 0, 0);
+        return albedo * (1.0f / M_PI_F);
+    }
+    return bsdfDiffuseLobe(N, V, L, albedo, mat.roughness, mat.metallic);
+}
+
+__device__ inline float3 materialSpecularLobe(
+    const GPUMaterial& mat,
+    const float3& N, const float3& V, const float3& L, const float3& albedo)
+{
+    if (mat.pureDiffuse) return make_float3(0, 0, 0);
+    return bsdfSpecularLobe(N, V, L, albedo, mat.roughness, mat.metallic);
+}
+
+// ── Firefly clamp ────────────────────────────────────────────
+// Per-contribution luminance-bounded clamp. NRD's RELAX denoiser is sensitive
+// to single-sample spikes — one 100x outlier survives temporal filtering for
+// many frames as a shimmering bright speck (water-ripple look). Clamp each
+// NEE / emissive contribution by luminance before adding it to the running
+// path radiance, rather than only clamping the sum once at the end.
+__device__ inline float3 clampFirefly(float3 c, float maxLum) {
+    float lum = 0.2126f*c.x + 0.7152f*c.y + 0.0722f*c.z;
+    if (lum > maxLum && lum > 1e-7f) c = c * (maxLum / lum);
+    return c;
+}
+
+// ── DLSS-RR specular albedo guide ────────────────────────────
+// DLSS-RR §3.4.2 / Appendix: per-pixel specular albedo from F0, alpha, NoV.
+// F0 is derived from the material's specular reflectance
+// (lerp(0.04, albedo, metallic)). Used as the demodulation factor for the
+// specular guide. Sky pixels get a neutral default — see guide §3.4.2.
+__device__ inline float3 envBRDFApprox2(float3 F0, float alpha, float NoV) {
+    NoV = fabsf(NoV);
+    float NoV2 = NoV * NoV;
+    float NoV3 = NoV2 * NoV;
+    float a3   = alpha * alpha * alpha;
+    // M1 = [[0.99044, -1.28514], [1.29678, -0.755907]]
+    float M1xy_top = 0.99044f - 1.28514f * NoV;
+    float M1xy_bot = 1.29678f - 0.755907f * NoV;
+    float biasNum = M1xy_top + M1xy_bot * alpha;
+    // M2 = [[1, 2.92338, 59.4188], [20.3225, -27.0302, 222.592], [121.563, 626.13, 316.627]]
+    float M2_0 = 1.0f + 2.92338f * NoV + 59.4188f * NoV3;
+    float M2_1 = 20.3225f - 27.0302f * NoV + 222.592f * NoV3;
+    float M2_2 = 121.563f + 626.13f * NoV + 316.627f * NoV3;
+    float biasDen = M2_0 + M2_1 * alpha + M2_2 * a3;
+    float bias = biasNum / fmaxf(biasDen, 1e-7f);
+    // M3 = [[0.0365463, 3.32707], [9.0632, -9.04756]]
+    float M3xy_top = 0.0365463f + 3.32707f * NoV;
+    float M3xy_bot = 9.0632f    - 9.04756f * NoV;
+    float scaleNum = M3xy_top + M3xy_bot * alpha;
+    // M4 = [[1, 3.59685, -1.36772], [9.04401, -16.3174, 9.22949], [5.56589, 19.7886, -20.2123]]
+    float M4_0 = 1.0f + 3.59685f * NoV2 - 1.36772f * NoV3;
+    float M4_1 = 9.04401f - 16.3174f * NoV2 + 9.22949f * NoV3;
+    float M4_2 = 5.56589f + 19.7886f * NoV2 - 20.2123f * NoV3;
+    float scaleDen = M4_0 + M4_1 * alpha + M4_2 * a3;
+    float scale = scaleNum / fmaxf(scaleDen, 1e-7f);
+    bias *= fminf(fmaxf(F0.y * 50.0f, 0.0f), 1.0f);
+    scale = fmaxf(scale, 0.0f);
+    bias  = fmaxf(bias, 0.0f);
+    return make_float3(F0.x * scale + bias,
+                       F0.y * scale + bias,
+                       F0.z * scale + bias);
+}
+
 // Fetch Le at a barycentric point on an area light (texture-aware).
 __device__ inline float3 sampleAreaLightLe(
     const GPUAreaLight& light, float b0, float b1, float b2)
