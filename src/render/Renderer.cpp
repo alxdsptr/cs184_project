@@ -13,6 +13,8 @@
 #include "postfx/CompositePass.h"
 #include "interop/VulkanImageInterop.h"
 #include "core/Math.h"   // mat4_inverse
+#include "util/CudaCheck.h"
+#include <cuda_runtime.h>
 #include <cstring>
 #include <cmath>
 #include <filesystem>
@@ -420,6 +422,15 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
 #else
     if (newMode == m_mode && display == m_display) return true;
 
+    // Mode transitions release NGX features (which hold CUDA-imported memory)
+    // and cudaFree the accum/aux buffers. Both can still be in use by the
+    // previous frame's path-trace kernel — drain Vulkan AND CUDA before
+    // tearing anything down, otherwise the next launch hits an illegal
+    // memory access. vkDeviceWaitIdle alone is not enough: CUDA streams
+    // that don't signal a Vulkan-side wait aren't covered.
+    if (display) vkDeviceWaitIdle(display->device());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
     // Always tear down non-Native resources first to reach a clean state.
     shutdownDlssPath();
     shutdownNrdPath();
@@ -428,11 +439,22 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
     }
 
     if (newMode == Mode::Native) {
-        // Restore accum/aux buffers to output resolution if the previous mode
-        // had shrunk them (DLSSOnly resizes them to renderW × renderH).
+        // Restore accum/aux/ReSTIR buffers to output resolution if the
+        // previous mode had shrunk them (any mode that DLSS picked a sub-
+        // display render res for). Skipping ReSTIR here was the cause of
+        // CUDA illegal-memory-access on toggling ReSTIR after coming back
+        // from DLSS-RR — the kernel launches at m_width but the reservoir
+        // buffers were still sized at the smaller renderW, so threads at
+        // x >= renderW wrote past the buffer end.
         if (m_renderWidth != m_width || m_renderHeight != m_height) {
             m_accumBuffer.resize(m_width, m_height);
             m_auxBuffers.resize(m_width, m_height);
+            m_restir.resize(m_width, m_height);
+            m_restir.invalidateHistory();
+            m_restirGI.resize(m_width, m_height);
+            m_restirGI.invalidateHistory();
+            m_restirPT.resize(m_width, m_height);
+            m_restirPT.invalidateHistory();
         }
         m_mode = Mode::Native;
         m_display = display;
@@ -569,11 +591,14 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
         }
     }
 
-    // DLSSOnly / DLSSRR: the path-trace kernel runs at the (sub-output) render
-    // resolution; we must resize accum + aux before the first frame, otherwise
-    // the kernel walks past the buffer end.
-    if ((newMode == Mode::DLSSOnly || newMode == Mode::DLSSRR) &&
-        (renderW != m_width || renderH != m_height)) {
+    // The path-trace kernel runs at renderW × renderH for ALL non-Native
+    // modes (NRDOnly = m_width; NRDDLSS / DLSSOnly / DLSSRR = DLSS-supplied
+    // sub-display res). Every render-res-sized buffer must match, otherwise
+    // the kernel walks past the buffer end → CUDA illegal memory access.
+    // The most-bitten case was NRD → DLSS-RR → NRD: returning to NRD's
+    // larger m_width left ReSTIR reservoirs sized for DLSS-RR's smaller
+    // renderW. resize() is a no-op when dims already match, so calling it
+    // unconditionally costs nothing.
         m_accumBuffer.resize(renderW, renderH);
         m_auxBuffers.resize(renderW, renderH);
         m_restir.resize(renderW, renderH);
@@ -582,7 +607,6 @@ bool Renderer::setMode(Mode newMode, VulkanDisplay* display) {
         m_restirGI.invalidateHistory();
         m_restirPT.resize(renderW, renderH);
         m_restirPT.invalidateHistory();
-    }
 
     // DLSSOnly mode: path tracer writes HDR directly into m_sharedAux->hdrColor()
     // (a render-res shared image), DLSS upscales it into m_hdrOutputImage, then
