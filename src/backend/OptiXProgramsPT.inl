@@ -8,93 +8,22 @@
 namespace pt_optix {
 
 // One NEE shadow-ray bounce at the given vertex via the OptiX shadow SBT.
-// Samples both area lights (single resampling sample via light BVH) and all
-// directional lights. Point lights are intentionally omitted (matches the
-// area-vs-point exclusivity on the megakernel side).
+// Glass-aware (traceShadowRay returns float3 attenuation through the
+// __anyhit__shadow program). Source-side firefly cap matches the CUDA PT
+// (25, tighter than GI's 50 due to throughput stacking through the
+// postfix random walk).
 __device__ inline float3 ptDirectLightingAtVertexOptiX(
     const DeviceSceneData& scene,
     OptixTraversableHandle handle,
     const ReSTIRSurface& s,
     uint32_t& rng)
 {
-    float3 Li = make_float3(0.0f, 0.0f, 0.0f);
-
-    // ── Area-light NEE via light BVH ──────────────────────────────────────
-    do {
-        if (!scene.d_areaLights || scene.areaLightCount == 0 ||
-            !scene.d_lightBVHNodes) break;
-
-        uint32_t slot = 0;
-        float    pSelect = 0.0f;
-        if (!lightBVH_sample(scene.d_lightBVHNodes, scene.lightBVHRootIndex,
-                             s.position, pcg32_float(rng), slot, pSelect) ||
-            !(pSelect > 0.0f))
-            break;
-        uint32_t lightIdx = scene.d_lightOrderedIndices[slot];
-        GPUAreaLight light = scene.d_areaLights[lightIdx];
-
-        float r1 = pcg32_float(rng);
-        float r2 = pcg32_float(rng);
-        float su = sqrtf(r1);
-        float b0 = 1.0f - su;
-        float b1 = su * (1.0f - r2);
-        float b2 = su * r2;
-        float3 lp = light.v0 * b0 + (light.v0 + light.e1) * b1 + (light.v0 + light.e2) * b2;
-        float3 toL = lp - s.position;
-        float  d2  = fmaxf(dot(toL, toL), 1e-6f);
-        float  d   = sqrtf(d2);
-        float3 L   = toL * (1.0f / d);
-        float NdotL = fmaxf(dot(s.normal, L), 0.0f);
-        float lightCos = fmaxf(dot(light.normal, -L), 0.0f);
-        if (NdotL <= 0.0f || lightCos <= 0.0f) break;
-
-        float3 origin = s.position + s.normal * 0.001f;
-        float tmax = fmaxf(d - 0.002f, 0.001f);
-        float3 trans = traceShadowRay(handle, origin, L, 1e-3f, tmax);
-        if (luminance(trans) <= 1e-6f) break;
-
-        float3 Le;
-        if (light.emissiveTex == 0) {
-            Le = light.emission;
-        } else {
-            float texU = light.uv0.x * b0 + light.uv1.x * b1 + light.uv2.x * b2;
-            float texV = light.uv0.y * b0 + light.uv1.y * b1 + light.uv2.y * b2;
-            float4 et = tex2D<float4>(light.emissiveTex, texU, texV);
-            Le = make_float3(et.x, et.y, et.z) * light.emission;
-        }
-
-        float3 brdf = restirEvalBrdf(s, L);
-        float pTri  = pSelect;
-        float pArea = pTri / fmaxf(light.area, 1e-7f);
-        float pdfOmega = pArea * d2 / fmaxf(lightCos, 1e-7f);
-        float3 areaLi = brdf * Le * trans * (NdotL / fmaxf(pdfOmega, 1e-7f));
-        // Source-side firefly clamp — see render/ReSTIRPT.cu and
-        // OptiXProgramsGI.inl for the M7 flash-and-decay rationale.
-        // Match the CUDA kernel's PT-tightened cap (25, vs GI's 50).
-        float lumLi = luminance(areaLi);
-        const float liCap = 25.0f;
-        if (lumLi > liCap) areaLi = areaLi * (liCap / lumLi);
-        Li = Li + areaLi;
-    } while (0);
-
-    // ── Directional-light NEE ─────────────────────────────────────────────
-    // Delta direction → no MIS, no 1/pdfOmega blow-up, no firefly clamp.
-    if (scene.d_directionalLights && scene.directionalLightCount > 0) {
-        float3 origin = s.position + s.normal * 0.001f;
-        for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
-            GPUDirectionalLight light = scene.d_directionalLights[li];
-            float3 Ld = light.direction;
-            float NdotL = fmaxf(dot(s.normal, Ld), 0.0f);
-            if (NdotL <= 0.0f) continue;
-
-            float3 trans = traceShadowRay(handle, origin, Ld, 1e-3f, 1e30f);
-            if (luminance(trans) <= 1e-6f) continue;
-
-            float3 brdf = restirEvalBrdf(s, Ld);
-            Li = Li + brdf * trans * light.color * NdotL;
-        }
-    }
-
+    auto traceShadow = [&](float3 origin, float3 dir, float dist) -> float3 {
+        float tmax = (dist >= 1.0e29f) ? 1.0e30f : fmaxf(dist - 0.002f, 0.001f);
+        return traceShadowRay(handle, origin, dir, 1.0e-3f, tmax);
+    };
+    float3 Li = restirAreaLightNEE(scene, s, rng, traceShadow, /*fireflyClamp=*/25.0f);
+    Li = Li + restirDirectionalLightsNEE(scene, s, traceShadow);
     return Li;
 }
 

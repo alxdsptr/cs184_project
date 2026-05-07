@@ -350,3 +350,101 @@ __device__ inline ReSTIRSurface ptMakeSurface(
     s.valid       = 1.0f;
     return s;
 }
+
+// Single-sample area-light NEE at ReSTIR vertex `s` via the light BVH.
+// `traceShadow(origin, dir, dist) -> float3` is the backend's shadow primitive
+// — (1,1,1) unobstructed, (0,0,0) occluded, tinted on glass (OptiX-only;
+// CUDA's wrapper is bool-returning, opaque-only). `dist >= 1e29f` signals
+// infinite (directional). Returns the radiance contribution at `s` — caller
+// multiplies by their accumulated throughput. No MIS / no volumetric
+// attenuation / no throughput baked in: at this postfix vertex NEE is the
+// only sampling strategy, so the inverse-pdf estimator is correct on its own.
+template <typename TraceShadowFn>
+__device__ inline float3 restirAreaLightNEE(
+    const DeviceSceneData& scene,
+    const ReSTIRSurface& s,
+    uint32_t& rng,
+    TraceShadowFn traceShadow,
+    float fireflyClamp)
+{
+    if (!scene.d_areaLights || scene.areaLightCount == 0 ||
+        !scene.d_lightBVHNodes) return make_float3(0.0f, 0.0f, 0.0f);
+
+    uint32_t slot = 0;
+    float    pSelect = 0.0f;
+    if (!lightBVH_sample(scene.d_lightBVHNodes, scene.lightBVHRootIndex,
+                         s.position, pcg32_float(rng), slot, pSelect) ||
+        !(pSelect > 0.0f))
+        return make_float3(0.0f, 0.0f, 0.0f);
+    uint32_t lightIdx = scene.d_lightOrderedIndices[slot];
+    GPUAreaLight light = scene.d_areaLights[lightIdx];
+
+    float r1 = pcg32_float(rng);
+    float r2 = pcg32_float(rng);
+    float su = sqrtf(r1);
+    float b0 = 1.0f - su;
+    float b1 = su * (1.0f - r2);
+    float b2 = su * r2;
+    float3 lp = light.v0 * b0 + (light.v0 + light.e1) * b1 + (light.v0 + light.e2) * b2;
+    float3 toL = lp - s.position;
+    float  d2  = fmaxf(dot(toL, toL), 1e-6f);
+    float  d   = sqrtf(d2);
+    float3 L   = toL * (1.0f / d);
+    float NdotL = fmaxf(dot(s.normal, L), 0.0f);
+    float lightCos = fmaxf(dot(light.normal, -L), 0.0f);
+    if (NdotL <= 0.0f || lightCos <= 0.0f) return make_float3(0.0f, 0.0f, 0.0f);
+
+    float3 origin = s.position + s.normal * 0.001f;
+    float3 trans = traceShadow(origin, L, d);
+    if (luminance(trans) <= 1e-6f) return make_float3(0.0f, 0.0f, 0.0f);
+
+    float3 Le = sampleAreaLightLe(light, b0, b1, b2);
+
+    float3 brdf = restirEvalBrdf(s, L);
+    float pArea = pSelect / fmaxf(light.area, 1e-7f);
+    float pdfOmega = pArea * d2 / fmaxf(lightCos, 1e-7f);
+    float3 areaLi = brdf * Le * trans * (NdotL / fmaxf(pdfOmega, 1e-7f));
+    if (fireflyClamp > 0.0f) {
+        // Source-side firefly clamp: a grazing NEE sample whose 1/pdfOmega
+        // term spikes Li would otherwise get stored in the reservoir's
+        // sampleRadiance and propagated for ~mCap frames by the temporal
+        // pass — the M7 flash-and-decay artifact. PT typically passes 25
+        // (tighter, since the postfix random walk multiplies through several
+        // throughput stages); GI passes 50 (single-bounce, less compounding).
+        float lumLi = luminance(areaLi);
+        if (lumLi > fireflyClamp) areaLi = areaLi * (fireflyClamp / lumLi);
+    }
+    return areaLi;
+}
+
+// NEE contributions from all directional lights at vertex `s`. Delta direction
+// → no MIS, no 1/pdfOmega blow-up, no firefly clamp needed. Point lights are
+// intentionally omitted: matches the area-vs-point exclusivity on the
+// megakernel side (directional always runs alongside area; point lights only
+// run when no area lights exist).
+template <typename TraceShadowFn>
+__device__ inline float3 restirDirectionalLightsNEE(
+    const DeviceSceneData& scene,
+    const ReSTIRSurface& s,
+    TraceShadowFn traceShadow)
+{
+    float3 Li = make_float3(0.0f, 0.0f, 0.0f);
+    if (!scene.d_directionalLights || scene.directionalLightCount == 0) return Li;
+
+    float3 origin = s.position + s.normal * 0.001f;
+    for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
+        GPUDirectionalLight light = scene.d_directionalLights[li];
+        float3 Ld = light.direction;
+        float NdotL = fmaxf(dot(s.normal, Ld), 0.0f);
+        if (NdotL <= 0.0f) continue;
+
+        // 1e30 → "infinite" sentinel; the wrapper translates to its backend's
+        // far-plane tmax (CUDA: synthetic 1e10 target; OptiX: 1e30).
+        float3 trans = traceShadow(origin, Ld, 1.0e30f);
+        if (luminance(trans) <= 1e-6f) continue;
+
+        float3 brdf = restirEvalBrdf(s, Ld);
+        Li = Li + brdf * trans * light.color * NdotL;
+    }
+    return Li;
+}

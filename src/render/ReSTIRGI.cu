@@ -49,132 +49,34 @@ __device__ inline float3 giDirectLightingAtSample(
     const float3& viewDir,
     uint32_t& rng)
 {
-    float3 Li = make_float3(0.0f, 0.0f, 0.0f);
+    if (!scene.d_bvhNodes || scene.totalTriangles == 0)
+        return make_float3(0.0f, 0.0f, 0.0f);
 
-    // ── Area-light NEE via light BVH (single resampling sample) ───────────
-    do {
-        if (!scene.d_areaLights || scene.areaLightCount == 0 ||
-            !scene.d_lightBVHNodes) break;
+    // Pack the raw shading attributes into a temporary ReSTIRSurface so the
+    // shared BRDF eval (`restirEvalBrdf`) sees the same fields it does at
+    // pHat / reservoir-merge time — keeps Lo and pHat using identical BRDF
+    // weights.
+    ReSTIRSurface tmp = ptMakeSurface(pos, normal, albedo,
+                                       fmaxf(roughness, 0.04f), metallic,
+                                       pureDiffuse, viewDir, /*specProb=*/0.0f);
 
-        uint32_t slot = 0;
-        float    pSelect = 0.0f;
-        if (!lightBVH_sample(scene.d_lightBVHNodes, scene.lightBVHRootIndex,
-                             pos, pcg32_float(rng), slot, pSelect) ||
-            !(pSelect > 0.0f))
-            break;
-        uint32_t lightIdx = scene.d_lightOrderedIndices[slot];
-        GPUAreaLight light = scene.d_areaLights[lightIdx];
-
-        float r1 = pcg32_float(rng);
-        float r2 = pcg32_float(rng);
-        float su = sqrtf(r1);
-        float b0 = 1.0f - su;
-        float b1 = su * (1.0f - r2);
-        float b2 = su * r2;
-        float3 lp = light.v0 * b0 + (light.v0 + light.e1) * b1 + (light.v0 + light.e2) * b2;
-        float3 toL = lp - pos;
-        float  d2  = fmaxf(dot(toL, toL), 1e-6f);
-        float  d   = sqrtf(d2);
-        float3 L   = toL * (1.0f / d);
-        float NdotL = fmaxf(dot(normal, L), 0.0f);
-        float lightCos = fmaxf(dot(light.normal, -L), 0.0f);
-        if (NdotL <= 0.0f || lightCos <= 0.0f) break;
-
-        // Shadow ray (opaque-only, no glass transparency tracking — keeps the
-        // GI sample cheap; shadow inaccuracy at the indirect bounce is invisible
-        // once accumulated). bvh_anyHit pre-shrinks tmax by 1e-4 so we won't
-        // self-intersect the emitter triangle at distance `d`.
-        if (scene.d_bvhNodes && scene.totalTriangles > 0) {
-            float3 shadowOrigin = pos + normal * 0.001f;
-            if (bvh_anyHit(shadowOrigin, lp,
-                           scene.d_bvhNodes, scene.bvhRootIndex,
-                           scene.d_positions, scene.d_indices))
-                break;
-        }
-
-        // Inline BRDF eval — same Cook-Torrance + diffuse mixture as
-        // restirEvalBrdf, but constructed from raw material params (the sample
-        // point isn't a ReSTIRSurface).
-        float3 Le;
-        if (light.emissiveTex == 0) {
-            Le = light.emission;
-        } else {
-            float texU = light.uv0.x * b0 + light.uv1.x * b1 + light.uv2.x * b2;
-            float texV = light.uv0.y * b0 + light.uv1.y * b1 + light.uv2.y * b2;
-            float4 et = tex2D<float4>(light.emissiveTex, texU, texV);
-            Le = make_float3(et.x, et.y, et.z) * light.emission;
-        }
-
-        float3 brdf;
-        if (pureDiffuse) {
-            brdf = albedo * (1.0f / M_PI_F);
-        } else {
-            // Build a temp ReSTIRSurface to call restirEvalBrdf — keeps the BRDF
-            // model identical to what we use for pHat evaluation.
-            ReSTIRSurface tmp{};
-            tmp.position = pos;
-            tmp.normal   = normal;
-            tmp.albedo   = albedo;
-            tmp.roughness = fmaxf(roughness, 0.04f);
-            tmp.metallic  = metallic;
-            tmp.viewDir   = viewDir;
-            tmp.pureDiffuse = 0u;
-            brdf = restirEvalBrdf(tmp, L);
-        }
-
-        float pTri  = pSelect;
-        float pArea = pTri / fmaxf(light.area, 1e-7f);
-        float pdfOmega = pArea * d2 / fmaxf(lightCos, 1e-7f);
-        float3 areaLi = brdf * Le * (NdotL / fmaxf(pdfOmega, 1e-7f));
-        // Source-side firefly clamp: bound the per-vertex NEE contribution so a
-        // grazing-on-emitter sample (lightCos→0 → pdfOmega→0 → Li→huge) doesn't
-        // get *stored* in the GI reservoir as `sampleRadiance`. Without this
-        // bound the temporal pass propagates the firefly forward for ~mCap
-        // frames; the destination shade-pass clamp can't undo it cleanly
-        // because the bright Lo also feeds the pHat used during merge MIS.
-        float lumLi = luminance(areaLi);
-        const float liCap = 50.0f;
-        if (lumLi > liCap) areaLi = areaLi * (liCap / lumLi);
-        Li = Li + areaLi;
-    } while (0);
-
-    // ── Directional-light NEE ─────────────────────────────────────────────
-    // Delta direction → no MIS weighting and no 1/pdfOmega blow-up, so no
-    // source-side firefly clamp is needed. Synthetic far target lets us
-    // reuse bvh_anyHit's target-position interface for an "infinite" ray.
-    if (scene.d_directionalLights && scene.directionalLightCount > 0 &&
-        scene.d_bvhNodes && scene.totalTriangles > 0) {
-        float3 shadowOrigin = pos + normal * 0.001f;
-        for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
-            GPUDirectionalLight light = scene.d_directionalLights[li];
-            float3 Ld = light.direction;
-            float NdotL = fmaxf(dot(normal, Ld), 0.0f);
-            if (NdotL <= 0.0f) continue;
-
-            float3 shadowTarget = shadowOrigin + Ld * 1.0e10f;
-            if (bvh_anyHit(shadowOrigin, shadowTarget,
-                           scene.d_bvhNodes, scene.bvhRootIndex,
-                           scene.d_positions, scene.d_indices))
-                continue;
-
-            float3 brdf;
-            if (pureDiffuse) {
-                brdf = albedo * (1.0f / M_PI_F);
-            } else {
-                ReSTIRSurface tmp{};
-                tmp.position    = pos;
-                tmp.normal      = normal;
-                tmp.albedo      = albedo;
-                tmp.roughness   = fmaxf(roughness, 0.04f);
-                tmp.metallic    = metallic;
-                tmp.viewDir     = viewDir;
-                tmp.pureDiffuse = 0u;
-                brdf = restirEvalBrdf(tmp, Ld);
-            }
-            Li = Li + brdf * light.color * NdotL;
-        }
-    }
-
+    // Opaque-only shadow trace: glass transparency tracking is too expensive
+    // for the indirect bounce, and shadow inaccuracy here is invisible once
+    // the GI sample is accumulated through temporal + spatial reuse.
+    auto traceShadow = [&](float3 origin, float3 dir, float dist) -> float3 {
+        float t = (dist >= 1.0e29f) ? 1.0e10f : fmaxf(dist - 0.002f, 0.001f);
+        float3 target = origin + dir * t;
+        if (bvh_anyHit(origin, target, scene.d_bvhNodes, scene.bvhRootIndex,
+                       scene.d_positions, scene.d_indices))
+            return make_float3(0.0f, 0.0f, 0.0f);
+        return make_float3(1.0f, 1.0f, 1.0f);
+    };
+    // GI's source-side cap is 50 (looser than PT's 25): GI's sample is just
+    // one bounce, so there's less throughput compounding to amplify a grazing
+    // firefly. PT's postfix random walk can multiply Li through several
+    // throughput stages, which is why PT uses the tighter cap.
+    float3 Li = restirAreaLightNEE(scene, tmp, rng, traceShadow, /*fireflyClamp=*/50.0f);
+    Li = Li + restirDirectionalLightsNEE(scene, tmp, traceShadow);
     return Li;
 }
 
