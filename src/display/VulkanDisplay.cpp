@@ -1,4 +1,5 @@
 #include "display/VulkanDisplay.h"
+#include "util/ImageWriter.h"
 #include "util/Log.h"
 #include "util/CudaCheck.h"
 
@@ -12,9 +13,6 @@
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
-
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include <stb_image_write.h>
 
 #include <cuda_runtime.h>
 
@@ -909,6 +907,105 @@ void VulkanDisplay::destroySampledImage() {
     if (m_sampledImageMemory) { vkFreeMemory(m_device, m_sampledImageMemory, nullptr);       m_sampledImageMemory = VK_NULL_HANDLE; }
 }
 
+void VulkanDisplay::createScreenshotResources() {
+    // Staging buffer sized for the full RGBA8 framebuffer, persistently
+    // mapped so saveToPNG can memcpy out without per-call map/unmap.
+    const VkDeviceSize size = (VkDeviceSize)m_width * (VkDeviceSize)m_height * 4u;
+    m_screenshotStagingSize = size;
+
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size        = size;
+    bci.usage       = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VK_CHECK(vkCreateBuffer(m_device, &bci, nullptr, &m_screenshotStagingBuf));
+
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(m_device, m_screenshotStagingBuf, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize  = req.size;
+    // Prefer HOST_CACHED for the screenshot staging — we only ever READ this
+    // buffer on the CPU, and reading from uncached host-coherent memory is
+    // PCIe-bound at ~150-250 MB/s, which dominated saveToPNG. With cached
+    // memory the memcpy runs at L2/main-memory bandwidth (~5+ GB/s).
+    //
+    // Try HOST_VISIBLE | HOST_CACHED | HOST_COHERENT first (most common on
+    // PC GPUs — no explicit invalidate needed), then HOST_VISIBLE | HOST_CACHED
+    // (needs vkInvalidateMappedMemoryRanges before each read), then fall back
+    // to plain HOST_VISIBLE | HOST_COHERENT for portability.
+    auto tryFindMem = [&](VkMemoryPropertyFlags flags) -> int32_t {
+        VkPhysicalDeviceMemoryProperties mp{};
+        vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &mp);
+        for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+            if ((req.memoryTypeBits & (1u << i)) &&
+                (mp.memoryTypes[i].propertyFlags & flags) == flags) {
+                return (int32_t)i;
+            }
+        }
+        return -1;
+    };
+    const VkMemoryPropertyFlags hostCachedCoherent =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_CACHED_BIT  |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const VkMemoryPropertyFlags hostCached =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    const VkMemoryPropertyFlags hostCoherent =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    int32_t typeIdx = tryFindMem(hostCachedCoherent);
+    if (typeIdx >= 0) {
+        m_screenshotStagingNeedsInvalidate = false;
+        LOG_INFO("Screenshot staging: HOST_CACHED|HOST_COHERENT");
+    } else if ((typeIdx = tryFindMem(hostCached)) >= 0) {
+        m_screenshotStagingNeedsInvalidate = true;
+        LOG_INFO("Screenshot staging: HOST_CACHED (explicit invalidate)");
+    } else {
+        typeIdx = tryFindMem(hostCoherent);
+        if (typeIdx < 0) throw std::runtime_error("No host-visible memory type for screenshot staging");
+        m_screenshotStagingNeedsInvalidate = false;
+        LOG_WARN("Screenshot staging: HOST_COHERENT only (slow PCIe readback)");
+    }
+    mai.memoryTypeIndex = (uint32_t)typeIdx;
+    VK_CHECK(vkAllocateMemory(m_device, &mai, nullptr, &m_screenshotStagingMem));
+    VK_CHECK(vkBindBufferMemory(m_device, m_screenshotStagingBuf, m_screenshotStagingMem, 0));
+    VK_CHECK(vkMapMemory(m_device, m_screenshotStagingMem, 0, size, 0,
+                         &m_screenshotStagingMap));
+
+    VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbai.commandPool        = m_commandPool;
+    cbai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VK_CHECK(vkAllocateCommandBuffers(m_device, &cbai, &m_screenshotCmd));
+
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VK_CHECK(vkCreateFence(m_device, &fci, nullptr, &m_screenshotFence));
+}
+
+void VulkanDisplay::destroyScreenshotResources() {
+    if (m_screenshotFence) {
+        vkDestroyFence(m_device, m_screenshotFence, nullptr);
+        m_screenshotFence = VK_NULL_HANDLE;
+    }
+    if (m_screenshotCmd) {
+        vkFreeCommandBuffers(m_device, m_commandPool, 1, &m_screenshotCmd);
+        m_screenshotCmd = VK_NULL_HANDLE;
+    }
+    if (m_screenshotStagingMap) {
+        vkUnmapMemory(m_device, m_screenshotStagingMem);
+        m_screenshotStagingMap = nullptr;
+    }
+    if (m_screenshotStagingMem) {
+        vkFreeMemory(m_device, m_screenshotStagingMem, nullptr);
+        m_screenshotStagingMem = VK_NULL_HANDLE;
+    }
+    if (m_screenshotStagingBuf) {
+        vkDestroyBuffer(m_device, m_screenshotStagingBuf, nullptr);
+        m_screenshotStagingBuf = VK_NULL_HANDLE;
+    }
+    m_screenshotStagingSize = 0;
+}
+
 void VulkanDisplay::updateDescriptorSet() {
     VkDescriptorImageInfo di{};
     di.sampler     = m_sampler;
@@ -964,6 +1061,7 @@ void VulkanDisplay::init(uint32_t width, uint32_t height) {
 
     createInteropBuffer();
     createSampledImage();
+    createScreenshotResources();
     updateDescriptorSet();
 
     LOG_INFO("VulkanDisplay initialized (%ux%u)", m_width, m_height);
@@ -974,6 +1072,7 @@ void VulkanDisplay::resize(uint32_t width, uint32_t height) {
     if (width == 0 || height == 0) return;
 
     vkDeviceWaitIdle(m_device);
+    destroyScreenshotResources();
     destroySampledImage();
     destroyInteropBuffer();
     destroySwapchain();
@@ -984,6 +1083,7 @@ void VulkanDisplay::resize(uint32_t width, uint32_t height) {
     createFramebuffers();
     createInteropBuffer();
     createSampledImage();
+    createScreenshotResources();
     updateDescriptorSet();
 }
 
@@ -1088,6 +1188,10 @@ void VulkanDisplay::present() {
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores    = &m_renderFinished[imageIndex];
     VK_CHECK(vkQueueSubmit(m_graphicsQueue, 1, &si, m_inFlight[frame]));
+    // Latch this fence as the "most recent present" so saveToPNG can wait on
+    // exactly the work that wrote m_sampledImage instead of draining the
+    // entire device with vkDeviceWaitIdle.
+    m_lastPresentFenceIdx = frame;
 
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
@@ -1109,8 +1213,18 @@ void VulkanDisplay::waitIdle() {
 
 void VulkanDisplay::shutdown() {
     if (!m_device) return;
+
+    // Drain any pending image-encoder jobs before tearing down. The worker
+    // thread doesn't touch Vulkan directly, but if the caller forgot to flush
+    // we still want completed PNGs on disk before exit.
+    if (m_imageWriter) {
+        m_imageWriter->flush();
+        m_imageWriter.reset();
+    }
+
     vkDeviceWaitIdle(m_device);
 
+    destroyScreenshotResources();
     destroySampledImage();
     destroyInteropBuffer();
     if (m_sampler) { vkDestroySampler(m_device, m_sampler, nullptr); m_sampler = VK_NULL_HANDLE; }
@@ -1148,8 +1262,12 @@ void VulkanDisplay::setPrePresentRecorder(void (*fn)(VkCommandBuffer, void*), vo
     m_prePresentUser = user;
 }
 
+VulkanDisplay::VulkanDisplay() = default;
+VulkanDisplay::~VulkanDisplay() = default;
+
 // ─────────────────────────────────────────────────────────────
-// Screenshot: read the displayed image back to host and PNG-encode.
+// Screenshot: read the displayed image back to host and hand it to the
+// background ImageWriter for encoding (PNG by extension, raw RGBA8 otherwise).
 //
 // Source must be `m_sampledImage` (RGBA8_UNORM), NOT `m_cudaDevPtr`. In
 // non-Native modes (NRDOnly / NRDDLSS / DLSSOnly) the CUDA interop buffer is
@@ -1161,64 +1279,38 @@ void VulkanDisplay::setPrePresentRecorder(void (*fn)(VkCommandBuffer, void*), vo
 // regardless of the actual on-screen output).
 //
 // We pump the GPU to idle first so that the most recently presented frame is
-// fully resolved into `m_sampledImage`, then issue a one-shot transient
-// command buffer that copies image → host-visible staging buffer.
+// fully resolved into `m_sampledImage`, then run the pooled image→buffer
+// copy command and wait on a fence (cheaper than vkQueueWaitIdle). The host
+// memcpy + encode is offloaded so the caller can move on to the next pose.
 // ─────────────────────────────────────────────────────────────
-bool VulkanDisplay::saveToPNG(const std::string& path) const {
+bool VulkanDisplay::saveToPNG(const std::string& path) {
     if (m_width == 0 || m_height == 0 || !m_sampledImage) return false;
-    std::filesystem::path p(path);
-    if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path());
+    if (!m_screenshotStagingBuf || !m_screenshotCmd || !m_screenshotFence) return false;
 
-    // Make sure the most recent present's writes to m_sampledImage are visible.
-    vkDeviceWaitIdle(m_device);
+    // Wait for ONLY the most recent present submission to finish — that's the
+    // submit that wrote m_sampledImage. vkDeviceWaitIdle would also drain
+    // unrelated GPU work and (worse) couldn't pipeline against the encoder
+    // workers; on a 1080p replay this saves ~10 ms/frame.
+    //
+    // Safety: the fence at m_lastPresentFenceIdx is signaled-on-completion by
+    // present()'s vkQueueSubmit and only reset on a *future* present() call
+    // that reuses the same slot (kFramesInFlight=2, cyclic). Replay calls
+    // saveToPNG immediately after present() with no further present in
+    // between, so the fence is in {signaled, signal-pending} when we wait.
+    vkWaitForFences(m_device, 1, &m_inFlight[m_lastPresentFenceIdx],
+                    VK_TRUE, UINT64_MAX);
 
-    const VkDeviceSize size = (VkDeviceSize)m_width * m_height * 4;
+    const VkDeviceSize size = m_screenshotStagingSize;
 
-    // Host-visible staging buffer.
-    VkBuffer stagingBuf = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMem = VK_NULL_HANDLE;
-    {
-        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bci.size = size;
-        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        if (vkCreateBuffer(m_device, &bci, nullptr, &stagingBuf) != VK_SUCCESS) return false;
-
-        VkMemoryRequirements req{};
-        vkGetBufferMemoryRequirements(m_device, stagingBuf, &req);
-        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        mai.allocationSize = req.size;
-        mai.memoryTypeIndex = findMemoryType(req.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (vkAllocateMemory(m_device, &mai, nullptr, &stagingMem) != VK_SUCCESS) {
-            vkDestroyBuffer(m_device, stagingBuf, nullptr);
-            return false;
-        }
-        vkBindBufferMemory(m_device, stagingBuf, stagingMem, 0);
-    }
-
-    // One-shot command buffer.
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    {
-        VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cbai.commandPool = m_commandPool;
-        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbai.commandBufferCount = 1;
-        if (vkAllocateCommandBuffers(m_device, &cbai, &cmd) != VK_SUCCESS) {
-            vkFreeMemory(m_device, stagingMem, nullptr);
-            vkDestroyBuffer(m_device, stagingBuf, nullptr);
-            return false;
-        }
-    }
-
+    VK_CHECK(vkResetCommandBuffer(m_screenshotCmd, 0));
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
+    vkBeginCommandBuffer(m_screenshotCmd, &bi);
 
     // m_sampledImage was last left in SHADER_READ_ONLY_OPTIMAL by present().
     // Transition to TRANSFER_SRC for the copy, then back so subsequent frames
     // observe the layout the present-loop expects.
-    transitionImageLayout(cmd, m_sampledImage,
+    transitionImageLayout(m_screenshotCmd, m_sampledImage,
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -1230,37 +1322,57 @@ bool VulkanDisplay::saveToPNG(const std::string& path) const {
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageOffset = {0, 0, 0};
     region.imageExtent = {m_width, m_height, 1};
-    vkCmdCopyImageToBuffer(cmd, m_sampledImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           stagingBuf, 1, &region);
+    vkCmdCopyImageToBuffer(m_screenshotCmd, m_sampledImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           m_screenshotStagingBuf, 1, &region);
 
-    transitionImageLayout(cmd, m_sampledImage,
+    transitionImageLayout(m_screenshotCmd, m_sampledImage,
         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 
-    vkEndCommandBuffer(cmd);
+    vkEndCommandBuffer(m_screenshotCmd);
+
+    VK_CHECK(vkResetFences(m_device, 1, &m_screenshotFence));
 
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    vkQueueSubmit(m_graphicsQueue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_graphicsQueue);
-    vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
+    si.pCommandBuffers    = &m_screenshotCmd;
+    VK_CHECK(vkQueueSubmit(m_graphicsQueue, 1, &si, m_screenshotFence));
+    VK_CHECK(vkWaitForFences(m_device, 1, &m_screenshotFence, VK_TRUE, UINT64_MAX));
 
-    // Map and PNG-encode.
-    std::vector<unsigned char> pixels((size_t)size);
-    void* mapped = nullptr;
-    if (vkMapMemory(m_device, stagingMem, 0, size, 0, &mapped) != VK_SUCCESS) {
-        vkFreeMemory(m_device, stagingMem, nullptr);
-        vkDestroyBuffer(m_device, stagingBuf, nullptr);
-        return false;
+    // If we picked HOST_CACHED memory without HOST_COHERENT, the GPU's writes
+    // may still be sitting in some intermediate buffer not yet visible to a
+    // CPU cache load. Invalidate makes them visible. With HOST_COHERENT this
+    // is implicit and the call is unnecessary.
+    if (m_screenshotStagingNeedsInvalidate) {
+        VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+        range.memory = m_screenshotStagingMem;
+        range.offset = 0;
+        range.size   = VK_WHOLE_SIZE;
+        VK_CHECK(vkInvalidateMappedMemoryRanges(m_device, 1, &range));
     }
-    std::memcpy(pixels.data(), mapped, (size_t)size);
-    vkUnmapMemory(m_device, stagingMem);
 
-    vkFreeMemory(m_device, stagingMem, nullptr);
-    vkDestroyBuffer(m_device, stagingBuf, nullptr);
+    // Memcpy out of the persistently-mapped staging buffer into a fresh
+    // owned vector that we hand off to the encoder thread. The vector
+    // ownership transfer is the cheapest way to pipeline encode against the
+    // next frame's render — no shared state, no extra synchronization.
+    std::vector<unsigned char> pixels((size_t)size);
+    std::memcpy(pixels.data(), m_screenshotStagingMap, (size_t)size);
 
-    return stbi_write_png(path.c_str(), (int)m_width, (int)m_height, 4,
-                          pixels.data(), (int)m_width * 4) != 0;
+    if (!m_imageWriter) {
+        m_imageWriter = std::make_unique<ImageWriter>(m_imageWriterFailFast);
+    }
+    return m_imageWriter->submit(std::move(pixels), m_width, m_height, path);
+}
+
+void VulkanDisplay::flushImageWriter() {
+    if (m_imageWriter) m_imageWriter->flush();
+}
+
+size_t VulkanDisplay::imageWriterFailureCount() const {
+    return m_imageWriter ? m_imageWriter->failureCount() : 0;
+}
+
+std::string VulkanDisplay::imageWriterFirstFailurePath() const {
+    return m_imageWriter ? m_imageWriter->firstFailurePath() : std::string{};
 }

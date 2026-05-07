@@ -701,6 +701,14 @@ void Application::renderSceneSample(uchar4* d_pbo, bool timeHeadless) {
 }
 
 void Application::runGui() {
+    // Capture mode writes a multi-frame batch paired with a meta.json sidecar;
+    // a silently missing PNG would desync the saved_indices array. Bail loudly
+    // on first failure. Plain GUI sessions (F12 ad-hoc screenshot) keep the
+    // default lenient policy — one bad write shouldn't kill the session.
+    if (m_captureEnabled) {
+        m_display.setImageWriterFailFast(true);
+    }
+
     while (!glfwWindowShouldClose(m_window)) {
         glfwPollEvents();
 
@@ -909,13 +917,39 @@ void Application::runGui() {
                             m_captureSavedIndices.push_back(m_captureMotionFrames);
                             m_captureFramesSaved++;
                         } else {
-                            LOG_ERROR("Capture: failed to save %s", name.str().c_str());
+                            // Fail-fast: writer poisoned. Don't keep iterating
+                            // and writing meta.json with truncated indices —
+                            // bail and let the caller see the error.
+                            LOG_ERROR("Capture: aborting — writer reported"
+                                      " failure (first failed path: %s)",
+                                      m_display.imageWriterFirstFailurePath().c_str());
+                            glfwSetWindowShouldClose(m_window, true);
+                            break;
                         }
                         // Decide whether another capture point fits.
                         uint32_t nextMotionIdx = m_captureMotionFrames
                                                 + m_captureOpts.captureStride;
                         if (nextMotionIdx >= m_captureOpts.captureFrames) {
                             m_captureMotionRemaining = 0;
+                            // Drain the async ImageWriter before writing
+                            // meta.json so any downstream tool that reads the
+                            // sidecar mid-shutdown sees every referenced PNG
+                            // already on disk.
+                            m_display.flushImageWriter();
+                            // If a background encode failed AFTER its
+                            // saveToPNG returned true (e.g. disk filled mid-
+                            // run), the producer never noticed. Skip
+                            // meta.json so we don't emit a sidecar pointing
+                            // at a hole.
+                            const size_t capFailures = m_display.imageWriterFailureCount();
+                            if (capFailures > 0) {
+                                LOG_ERROR("Capture: %zu frame(s) failed to encode "
+                                          "(first: %s); skipping meta.json",
+                                          capFailures,
+                                          m_display.imageWriterFirstFailurePath().c_str());
+                                glfwSetWindowShouldClose(m_window, true);
+                                break;
+                            }
                             // Dump meta.json and quit.
                             double totalSec = glfwGetTime() - m_captureStartTime;
                             double meanFps = totalSec > 0.0
@@ -1124,6 +1158,10 @@ void Application::runGui() {
 }
 
 void Application::runHeadless() {
+    // One-shot save: fail-fast is the only sensible policy. If the single
+    // PNG can't be written, the caller (CLI / scripts) needs a clear signal.
+    m_display.setImageWriterFailFast(true);
+
     const auto totalStart = std::chrono::steady_clock::now();
 
     while (!glfwWindowShouldClose(m_window)) {
@@ -1141,7 +1179,11 @@ void Application::runHeadless() {
             m_headlessTotalMs = std::chrono::duration<double, std::milli>(totalEnd - totalStart).count();
             LOG_INFO("Target samples reached: %u", m_renderer.getSampleCount());
             LOG_INFO("Headless total elapsed time: %.3f ms", m_headlessTotalMs);
-            if (m_display.saveToPNG(m_headlessOutputPath)) {
+            const bool queued = m_display.saveToPNG(m_headlessOutputPath);
+            // Drain so the encode result is observable before we exit.
+            m_display.flushImageWriter();
+            const size_t failures = m_display.imageWriterFailureCount();
+            if (queued && failures == 0) {
                 LOG_INFO("Saved image: %s", m_headlessOutputPath.c_str());
             } else {
                 LOG_ERROR("Failed to save image: %s", m_headlessOutputPath.c_str());
@@ -1271,6 +1313,12 @@ void Application::runReplay() {
 
     std::filesystem::create_directories(m_replayOpts.outDir);
 
+    // Replay produces frames that get assembled into an mp4. A silently-
+    // missing frame would let ffmpeg splice over the gap and the output
+    // would have a wrong frame count / wrong timing without any error. Bail
+    // on the first encode failure instead.
+    m_display.setImageWriterFailFast(true);
+
     // Override aspect to match the actual render resolution. Otherwise a
     // recording made at one window size would render squashed at another.
     float renderAspect = m_height > 0 ? (float)m_width / (float)m_height : 1.0f;
@@ -1344,12 +1392,21 @@ void Application::runReplay() {
         const bool isOutputFrame = (i % m_replayOpts.stride == 0);
         if (!isOutputFrame) continue;
 
-        CUDA_CHECK(cudaDeviceSynchronize());
+        // No cudaDeviceSynchronize here: saveToPNG's wait-on-present-fence
+        // (and the unmapFromCUDA → cudaStreamSynchronize on the present
+        // path) already serialize the CUDA writes against the Vulkan readback.
         std::ostringstream name;
         name << m_replayOpts.outDir << "/frame_" << std::setw(6)
              << std::setfill('0') << saved << ".png";
-        if (!m_display.saveToPNG(name.str())) {
-            LOG_ERROR("Replay: failed to save %s", name.str().c_str());
+        const bool ok = m_display.saveToPNG(name.str());
+        if (!ok) {
+            // Fail-fast: writer has refused this submit (or a prior encode
+            // already failed). Don't keep iterating — the output mp4 would
+            // be missing or off-by-N frames downstream.
+            LOG_ERROR("Replay: aborting at frame %u; writer reported failure"
+                      " (first failed path: %s)",
+                      saved, m_display.imageWriterFirstFailurePath().c_str());
+            break;
         }
         ++saved;
 
@@ -1358,10 +1415,22 @@ void Application::runReplay() {
         }
     }
 
+    // Wait for the background ImageWriter to drain before reporting wall-clock.
+    // Without this, the timing reflects only when readbacks were *queued*,
+    // not when frames hit disk — and it'd race the shutdown teardown.
+    m_display.flushImageWriter();
     const auto totalEnd = std::chrono::steady_clock::now();
     double totalMs = std::chrono::duration<double, std::milli>(totalEnd - totalStart).count();
     LOG_INFO("Replay: done, %u frame(s) in %.2f s (%.1f ms/frame)",
              saved, totalMs / 1000.0, saved > 0 ? totalMs / saved : 0.0);
+
+    // Encode failures from the worker may surface AFTER the producer broke
+    // out — e.g. the last in-flight job failed during drain. Always check.
+    const size_t failures = m_display.imageWriterFailureCount();
+    if (failures > 0) {
+        LOG_ERROR("Replay: %zu frame(s) failed to encode (first: %s)",
+                  failures, m_display.imageWriterFirstFailurePath().c_str());
+    }
 
     glfwSetWindowShouldClose(m_window, true);
 }

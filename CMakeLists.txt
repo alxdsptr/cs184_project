@@ -53,6 +53,7 @@ include(cmake/CompilerFlags.cmake)
 include(cmake/FetchGLFW.cmake)
 include(cmake/FetchImGui.cmake)
 include(cmake/FetchGLI.cmake)
+include(cmake/Fetchfpng.cmake)
 
 # Assimp (existing submodule)
 set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -194,6 +195,7 @@ add_executable(pathtracer
     src/scene/utils.cpp
     # Display
     src/display/VulkanDisplay.cpp
+    src/util/ImageWriter.cpp
     # GUI
     src/gui/GUI.cpp
     # Render
@@ -233,6 +235,7 @@ target_link_libraries(pathtracer PRIVATE
     imgui
     assimp
     gli_headers
+    fpng
     CUDA::cudart
 )
 
