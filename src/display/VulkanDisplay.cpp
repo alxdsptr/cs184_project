@@ -410,15 +410,26 @@ void VulkanDisplay::createSwapchain() {
     LOG_INFO("Swapchain format: %d", (int)surfaceFmt.format);
     m_swapchainFormat = surfaceFmt.format;
 
-    // Extent
+    // Extent. The swapchain MUST be created at caps.currentExtent (when not
+    // sentinel) — Vulkan ignores anything else. We track that separately as
+    // m_swapchainExtent. Render-side resources (m_sampledImage, m_interopBuffer,
+    // screenshot staging) stay at the caller-requested m_width/m_height so a
+    // headless 1920x1080 replay produces 1920x1080 PNGs even when Windows
+    // clamps the swapchain to 1920x1055 because of the taskbar. The
+    // fullscreen-triangle blit in present() samples m_sampledImage with
+    // normalized UVs, so any size mismatch resolves as automatic scaling
+    // when the swapchain image is presented to a visible window.
     VkExtent2D extent = caps.currentExtent;
     if (extent.width == UINT32_MAX) {
         extent.width  = std::clamp(m_width,  caps.minImageExtent.width,  caps.maxImageExtent.width);
         extent.height = std::clamp(m_height, caps.minImageExtent.height, caps.maxImageExtent.height);
     }
     m_swapchainExtent = extent;
-    m_width  = extent.width;
-    m_height = extent.height;
+    if (extent.width != m_width || extent.height != m_height) {
+        LOG_INFO("Swapchain extent %ux%u differs from render extent %ux%u - "
+                 "render-side buffers stay at request, swapchain blit will scale.",
+                 extent.width, extent.height, m_width, m_height);
+    }
 
     // Prefer MAILBOX (tear-free, no frame-rate cap) over FIFO (hard vsync cap).
     // MAILBOX is optional, so query and fall back to FIFO (always supported).
