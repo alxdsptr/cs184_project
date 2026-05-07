@@ -222,7 +222,11 @@ void DLSSDContext::evaluate(
     p.pInRoughness      = &rNR;
     p.pInSpecularHitDistance = &rHit;
     // We provide hitT + matrices so RR derives specular MVs internally
-    // (§3.4.9). Matrices: row-major, left-multiply (matches our float4x4).
+    // (§3.4.9). NGX takes matrices in column-major / column-vector layout,
+    // same as NRD (CommonSettings); the headers don't document this but
+    // empirically the row-major / left-multiply variant produced highlight
+    // shimmer during camera pans. The caller (Renderer.cpp) transposes our
+    // row-major float4x4 into the flat column-major buffer expected here.
     p.pInWorldToViewMatrix = worldToView;
     p.pInViewToClipMatrix  = viewToClip;
 

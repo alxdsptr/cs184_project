@@ -1288,15 +1288,20 @@ void Renderer::recordDlssRRPrePresent(VkCommandBuffer cmd) {
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, VK_ACCESS_SHADER_WRITE_BIT);
 
-    // Convert our row-major float4x4 (m[row][col]) into a flat float[16]. RR
-    // expects row-major, left-multiplication — same layout we already store.
-    // No transpose needed; just memcpy 64 bytes.
+    // NGX matrices follow NRD's convention (column-major + column-vector),
+    // not row-major + left-multiply as the headers leave undocumented. Our
+    // float4x4 stores row-major (m[row][col]), so transpose into a flat
+    // column-major buffer — same lambda the NRD path uses upstream. Without
+    // the transpose, DLSS-RR's matrix-derived spec MV diverges from the
+    // path-traced MV during camera motion (static is fine because prev_VP
+    // == curr_VP makes any layout error cancel), surfacing as highlight
+    // shimmer on pans.
     float worldToView[16];
     float viewToClip[16];
-    for (int r = 0; r < 4; ++r)
-        for (int c = 0; c < 4; ++c) {
-            worldToView[r * 4 + c] = m_lastCamera.viewMatrix.m[r][c];
-            viewToClip[r * 4 + c]  = m_lastCamera.projMatrix.m[r][c];
+    for (int c = 0; c < 4; ++c)
+        for (int r = 0; r < 4; ++r) {
+            worldToView[c * 4 + r] = m_lastCamera.viewMatrix.m[r][c];
+            viewToClip[c * 4 + r]  = m_lastCamera.projMatrix.m[r][c];
         }
 
     // Pipeline reset signal — see notes in recordPrePresent. Camera motion
