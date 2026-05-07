@@ -2,6 +2,7 @@
 #include "render/PathTraceHelpers.cuh"
 #include "render/GBufferWriters.cuh"
 #include "render/NEEHelpers.cuh"
+#include "render/Finalizers.cuh"
 #include "core/Halton.h"
 #include "core/VolumeMedium.h"
 #include "core/VolumeDevice.cuh"
@@ -656,42 +657,12 @@ __global__ void pathTraceKernel(
         ray.tmax      = 1e30f;
     }
 
-    // Clamp fireflies and reject NaN/inf before accumulation
-    if (isnan(radiance.x) || isnan(radiance.y) || isnan(radiance.z) ||
-        isinf(radiance.x) || isinf(radiance.y) || isinf(radiance.z)) {
-        radiance = make_float3(0.0f, 0.0f, 0.0f);
-    }
-    float luminance = 0.2126f * radiance.x + 0.7152f * radiance.y + 0.0722f * radiance.z;
-    float clampMax = 200.0f;
-    if (luminance > clampMax) {
-        float scale = clampMax / luminance;
-        radiance = radiance * scale;
-    }
-
-        radianceSum = radianceSum + radiance;
+        monoAccumulateSppSample(radiance, radianceSum);
     } // end spp loop
 
-    // Accumulate: add all spp samples at once. The caller advances the sample
-    // counter by `samplesPerPixel`, so the divisor below stays correct.
-    float4 sumTexel = make_float4(radianceSum.x, radianceSum.y, radianceSum.z, (float)samplesPerPixel);
-    d_accumBuffer[pixelIdx] = d_accumBuffer[pixelIdx] + sumTexel;
-    float invN = 1.0f / (float)(sampleIndex + samplesPerPixel);
-    float4 hdr = d_accumBuffer[pixelIdx] * invN;
-    if (d_outputBuffer) d_outputBuffer[pixelIdx] = hdr;
-
-    // DLSSOnly: also publish HDR into the Vulkan-shared interop image.
-    if (gbuffer.hdrColor) {
-        __half hx = __float2half(hdr.x);
-        __half hy = __float2half(hdr.y);
-        __half hz = __float2half(hdr.z);
-        __half hw = __float2half(1.0f);
-        ushort4 p;
-        p.x = *reinterpret_cast<unsigned short*>(&hx);
-        p.y = *reinterpret_cast<unsigned short*>(&hy);
-        p.z = *reinterpret_cast<unsigned short*>(&hz);
-        p.w = *reinterpret_cast<unsigned short*>(&hw);
-        surf2Dwrite<ushort4>(p, gbuffer.hdrColor, x * 8, y);
-    }
+    monoFinalizePixel(radianceSum,
+                      d_accumBuffer, d_outputBuffer, gbuffer.hdrColor,
+                      pixelIdx, x, y, sampleIndex, samplesPerPixel);
 }
 
 void launchPathTraceKernel(

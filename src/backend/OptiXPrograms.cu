@@ -21,6 +21,7 @@
 #include "render/PathTraceHelpers.cuh"
 #include "render/GBufferWriters.cuh"
 #include "render/NEEHelpers.cuh"
+#include "render/Finalizers.cuh"
 #include "render/ReSTIRDevice.cuh"
 #include "render/ReSTIRGIDevice.cuh"
 #include "render/VolumeNEE.cuh"
@@ -584,39 +585,12 @@ extern "C" __global__ void __raygen__path_trace()
             ray.tmax      = 1e30f;
         }
 
-        if (isnan(radiance.x) || isnan(radiance.y) || isnan(radiance.z) ||
-            isinf(radiance.x) || isinf(radiance.y) || isinf(radiance.z)) {
-            radiance = make_float3(0.0f, 0.0f, 0.0f);
-        }
-        float luminance = 0.2126f * radiance.x + 0.7152f * radiance.y + 0.0722f * radiance.z;
-        float clampMax = 200.0f;
-        if (luminance > clampMax) {
-            radiance = radiance * (clampMax / luminance);
-        }
-        radianceSum = radianceSum + radiance;
+        monoAccumulateSppSample(radiance, radianceSum);
     }
 
-    float4 sumTexel = make_float4(radianceSum.x, radianceSum.y, radianceSum.z, (float)samplesPerPixel);
-    params.accum[pixelIdx] = params.accum[pixelIdx] + sumTexel;
-    float invN = 1.0f / (float)(params.sampleIndex + samplesPerPixel);
-    float4 hdr = params.accum[pixelIdx] * invN;
-    if (params.output) params.output[pixelIdx] = hdr;
-
-    // DLSSOnly: also publish HDR into the Vulkan-shared interop image so the
-    // post-processing chain can sample it. Packed as four halves matching the
-    // RGBA16F VkImage format of `m_hdrColor`.
-    if (params.gbuffer.hdrColor) {
-        __half hx = __float2half(hdr.x);
-        __half hy = __float2half(hdr.y);
-        __half hz = __float2half(hdr.z);
-        __half hw = __float2half(1.0f);
-        ushort4 p;
-        p.x = *reinterpret_cast<unsigned short*>(&hx);
-        p.y = *reinterpret_cast<unsigned short*>(&hy);
-        p.z = *reinterpret_cast<unsigned short*>(&hz);
-        p.w = *reinterpret_cast<unsigned short*>(&hw);
-        surf2Dwrite<ushort4>(p, params.gbuffer.hdrColor, x * 8, y);  // RGBA16F = 8B
-    }
+    monoFinalizePixel(radianceSum,
+                      params.accum, params.output, params.gbuffer.hdrColor,
+                      pixelIdx, x, y, params.sampleIndex, samplesPerPixel);
 }
 
 // ── Miss: radiance ────────────────────────────────────────────
@@ -689,38 +663,6 @@ extern "C" __global__ void __anyhit__shadow()
 // temporal filtering). Each spp-loop iteration does one full path.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Lift packHalf4 out of the raygen body — lambdas inside OptiX raygen
-// functions have caused misaligned-stack issues in some toolchain versions.
-// Use the __half_as_ushort intrinsic (no pointer reinterpret) to avoid any
-// alignment ambiguity.
-static __forceinline__ __device__ ushort4 packHalf4_split(float4 v) {
-    ushort4 r;
-    r.x = __half_as_ushort(__float2half(v.x));
-    r.y = __half_as_ushort(__float2half(v.y));
-    r.z = __half_as_ushort(__float2half(v.z));
-    r.w = __half_as_ushort(__float2half(v.w));
-    return r;
-}
-
-static __forceinline__ __device__ ushort2 packHalf2_split(float x, float y) {
-    ushort2 r;
-    r.x = __half_as_ushort(__float2half(x));
-    r.y = __half_as_ushort(__float2half(y));
-    return r;
-}
-
-// Workaround: surf2Dwrite<uchar4> in OptiX-compiled device code emits a
-// PTX store that faults with "misaligned address" on Ampere+ (verified on
-// RTX 4070, OptiX 9.0). Writing the same 4 bytes as a uint32_t works.
-// Same byte layout (LE: byte0=r, byte1=g, byte2=b, byte3=a).
-static __forceinline__ __device__ uint32_t packRGBA8(float r, float g, float b, float a) {
-    uint32_t br = (uint32_t)(fminf(fmaxf(r, 0.0f), 1.0f) * 255.0f + 0.5f);
-    uint32_t bg = (uint32_t)(fminf(fmaxf(g, 0.0f), 1.0f) * 255.0f + 0.5f);
-    uint32_t bb = (uint32_t)(fminf(fmaxf(b, 0.0f), 1.0f) * 255.0f + 0.5f);
-    uint32_t ba = (uint32_t)(fminf(fmaxf(a, 0.0f), 1.0f) * 255.0f + 0.5f);
-    return (ba << 24) | (bb << 16) | (bg << 8) | br;
-}
-
 extern "C" __global__ void __raygen__path_trace_split()
 {
     uint3 idx = optixGetLaunchIndex();
@@ -736,29 +678,10 @@ extern "C" __global__ void __raygen__path_trace_split()
     bool enableEnvironment   = params.enableEnvironment != 0;
     OptixTraversableHandle handle = params.handle;
 
-    // Per-pixel accumulators across spp.
-    float3 demodDiffSum = make_float3(0, 0, 0);
-    float3 demodSpecSum = make_float3(0, 0, 0);
-    float3 emissiveSum  = make_float3(0, 0, 0);
-    float  diffHitSum = 0.0f; uint32_t diffHitCount = 0;
-    float  specHitSum = 0.0f; uint32_t specHitCount = 0;
-    // DLSS-RR additional accumulators.
-    float3 noisyColorSum = make_float3(0, 0, 0);
-    float  anyHitSum = 0.0f; uint32_t anyHitCount = 0;
-
-    bool   gbufferWritten = false;
-    float3 outPrimaryAlbedo    = make_float3(0, 0, 0);
-    float3 outPrimaryNormal    = make_float3(0, 1, 0);
-    float  outPrimaryRoughness = 1.0f;
-    float  outPrimaryViewZ     = 0.0f;
-    float2 outPrimaryMvPx      = make_float2(0.0f, 0.0f);
-    float  outPrimaryNdcZ      = 1.0f;
-    // DLSS-RR fix: see PathTraceKernelSplit.cu — preserve primary hit pos /
-    // view ray dir / metallic for post-loop mirror-ray spec hitT trace and
-    // metallic-aware spec albedo F0.
-    float3 outPrimaryHitPos    = make_float3(0, 0, 0);
-    float3 outPrimaryRayDir    = make_float3(0, 0, -1);
-    float  outPrimaryMetallic  = 0.0f;
+    // Per-pixel running state across spp samples (demod buckets, primary
+    // g-buffer, DLSS-RR primary hit pos / ray dir / metallic for the post-spp
+    // mirror-ray spec hitT trace and metallic-aware spec-albedo F0).
+    SplitAccumState acc{};
 
     for (uint32_t s = 0; s < samplesPerPixel; s++) {
         // Mix frameIndex so replay (which resets sampleIndex per pose) doesn't
@@ -783,19 +706,12 @@ extern "C" __global__ void __raygen__path_trace_split()
         float3 emissiveContrib = make_float3(0, 0, 0);
 
         // Per-sample primary-hit state for bucket classification.
+        // `pg` mirrors what we'll capture into `acc.primary` on the first hit.
         bool haveGbuffer = false;
-        float3 primaryAlbedo    = make_float3(0, 0, 0);
-        float3 primaryNormal    = make_float3(0, 1, 0);
-        float  primaryRoughness = 1.0f;
-        float  primaryViewZ     = 0.0f;
-        float2 primaryMvPx      = make_float2(0.0f, 0.0f);
-        float  primaryNdcZ      = 1.0f;
+        PrimaryGBuffer pg{};
         int    pickedBucket     = 0;       // 0 = diff, 1 = spec
         float  bucketHitDist    = 0.0f;
         bool   bucketHitDistSet = false;
-        float3 primaryHitPos    = make_float3(0, 0, 0);
-        float3 primaryRayDir    = make_float3(0, 0, -1);
-        float  primaryMetallic  = 0.0f;
 
         bool firstBounce      = true;
         bool lastBounceDelta  = false;
@@ -880,15 +796,15 @@ extern "C" __global__ void __raygen__path_trace_split()
                 }
                 // Sky pixel sentinel viewZ — only the first sample's miss wins.
                 if (firstBounce && !haveGbuffer) {
-                    primaryViewZ = 1.0e6f;
-                    primaryMvPx  = make_float2(0.0f, 0.0f);
+                    pg.viewZ = 1.0e6f;
+                    pg.mvPx  = make_float2(0.0f, 0.0f);
                     // Don't set haveGbuffer — sky pixels don't contribute to
                     // diff/spec bucket and must not trigger the demodulation
                     // path below. We still want a sentinel viewZ written, so
                     // capture it via outPrimary fields directly.
-                    if (!gbufferWritten) {
-                        outPrimaryViewZ = primaryViewZ;
-                        outPrimaryMvPx  = primaryMvPx;
+                    if (!acc.gbufferWritten) {
+                        acc.primary.viewZ = pg.viewZ;
+                        acc.primary.mvPx  = pg.mvPx;
                         // Leave normal/roughness/albedo at their defaults.
                     }
                 }
@@ -964,13 +880,13 @@ extern "C" __global__ void __raygen__path_trace_split()
 
             // Primary-hit g-buffer capture + bucket classification.
             if (firstBounce) {
-                primaryAlbedo    = albedo;
-                primaryNormal    = N;
-                primaryRoughness = mat.roughness;
-                primaryHitPos    = hit.position;
-                primaryRayDir    = ray.direction;
-                primaryMetallic  = mat.metallic;
-                primaryViewZ     = nrd_helpers::computeViewZ(hit.position, camera.position, camera.forward);
+                pg.albedo    = albedo;
+                pg.normal    = N;
+                pg.roughness = mat.roughness;
+                pg.hitPos    = hit.position;
+                pg.rayDir    = ray.direction;
+                pg.metallic  = mat.metallic;
+                pg.viewZ     = nrd_helpers::computeViewZ(hit.position, camera.position, camera.forward);
                 // Animated-geometry-aware motion vector — see comment at the
                 // matching site in __raygen__path_trace.
                 if (scene.d_positionsPrev) {
@@ -978,18 +894,18 @@ extern "C" __global__ void __raygen__path_trace_split()
                     float3 v1p = scene.d_positionsPrev[i1];
                     float3 v2p = scene.d_positionsPrev[i2];
                     float3 hitPosPrev = v0p * baryW + v1p * baryU + v2p * baryV;
-                    primaryMvPx = nrd_helpers::computeMotionVectorPxAnimated(
+                    pg.mvPx = nrd_helpers::computeMotionVectorPxAnimated(
                         hit.position, hitPosPrev,
                         camera.viewProjMatrix, camera.prevViewProjMatrix,
                         params.width, params.height);
                 } else {
-                    primaryMvPx = nrd_helpers::computeMotionVectorPx(
+                    pg.mvPx = nrd_helpers::computeMotionVectorPx(
                         hit.position, camera.viewProjMatrix, camera.prevViewProjMatrix,
                         params.width, params.height);
                 }
                 {
                     float3 ndc = mat4_transformPoint(camera.viewProjMatrix, hit.position);
-                    primaryNdcZ = clampf(ndc.z * 0.5f + 0.5f, 0.0f, 1.0f);
+                    pg.ndcZ = clampf(ndc.z * 0.5f + 0.5f, 0.0f, 1.0f);
                 }
 
                 float3 V = -ray.direction;
@@ -1215,204 +1131,21 @@ extern "C" __global__ void __raygen__path_trace_split()
             ray.tmax      = 1e30f;
         } // end bounce loop
 
-        // Sanitize + clamp per channel (matches CUDA split kernel).
-        if (isnan(pathRadiance.x) || isnan(pathRadiance.y) || isnan(pathRadiance.z) ||
-            isinf(pathRadiance.x) || isinf(pathRadiance.y) || isinf(pathRadiance.z)) {
-            pathRadiance = make_float3(0,0,0);
-        }
-        pathRadiance.x = fminf(fmaxf(pathRadiance.x, 0.0f), 15.0f);
-        pathRadiance.y = fminf(fmaxf(pathRadiance.y, 0.0f), 15.0f);
-        pathRadiance.z = fminf(fmaxf(pathRadiance.z, 0.0f), 15.0f);
-
-        // Demodulate by albedo (NRD wants irradiance — composite remultiplies).
-        float3 demodDiff = make_float3(0,0,0);
-        float3 demodSpec = make_float3(0,0,0);
-        if (haveGbuffer) {
-            if (pickedBucket == 0) {
-                float3 invA = make_float3(
-                    1.0f / fmaxf(primaryAlbedo.x, 1e-3f),
-                    1.0f / fmaxf(primaryAlbedo.y, 1e-3f),
-                    1.0f / fmaxf(primaryAlbedo.z, 1e-3f));
-                demodDiff = pathRadiance * invA;
-            } else {
-                demodSpec = pathRadiance;
-            }
-        }
-
-        demodDiffSum = demodDiffSum + demodDiff;
-        demodSpecSum = demodSpecSum + demodSpec;
-        emissiveSum  = emissiveSum  + emissiveContrib;
-        if (haveGbuffer && bucketHitDistSet) {
-            if (pickedBucket == 0) { diffHitSum += bucketHitDist; diffHitCount++; }
-            else                    { specHitSum += bucketHitDist; specHitCount++; }
-            anyHitSum += bucketHitDist; anyHitCount++;
-        }
-        // DLSS-RR noisy combined color: pathRadiance already incorporates
-        // 1/pickedP, so its expected value over both buckets is the un-modulated
-        // primary-hit radiance.
-        noisyColorSum = noisyColorSum + pathRadiance + emissiveContrib;
-        if (!gbufferWritten && haveGbuffer) {
-            outPrimaryAlbedo    = primaryAlbedo;
-            outPrimaryNormal    = primaryNormal;
-            outPrimaryRoughness = primaryRoughness;
-            outPrimaryViewZ     = primaryViewZ;
-            outPrimaryMvPx      = primaryMvPx;
-            outPrimaryNdcZ      = primaryNdcZ;
-            outPrimaryHitPos    = primaryHitPos;
-            outPrimaryRayDir    = primaryRayDir;
-            outPrimaryMetallic  = primaryMetallic;
-            gbufferWritten = true;
-        }
+        splitAccumulateSppSample(acc, pathRadiance, emissiveContrib,
+                                 haveGbuffer, pickedBucket, pg,
+                                 bucketHitDist, bucketHitDistSet);
     } // end spp loop
 
-    // Average per-pixel radiance across spp.
-    float invSpp = 1.0f / (float)samplesPerPixel;
-    float3 demodDiffAvg = demodDiffSum * invSpp;
-    float3 demodSpecAvg = demodSpecSum * invSpp;
-    float3 emissiveAvg  = emissiveSum  * invSpp;
-    float3 noisyColorAvg = noisyColorSum * invSpp;
-    float diffHitAvg = diffHitCount > 0 ? (diffHitSum / (float)diffHitCount) : 0.0f;
-    float specHitAvg = specHitCount > 0 ? (specHitSum / (float)specHitCount) : 0.0f;
-    float anyHitAvg  = anyHitCount  > 0 ? (anyHitSum  / (float)anyHitCount)  : 0.0f;
-
-    // DLSS-RR specular albedo: F0 = lerp(0.04, primaryAlbedo, metallic) per
-    // §3.4.2 + Appendix EnvBRDFApprox2. Metallic is now preserved through
-    // outPrimaryMetallic. NoV uses the actual primary ray direction (rather
-    // than camera.forward) for sub-pixel-stable, jittered-ray-correct values.
-    float3 specF0_RR = lerp(make_float3(0.04f, 0.04f, 0.04f),
-                            outPrimaryAlbedo, outPrimaryMetallic);
-    float NoV_RR = fmaxf(-dot(outPrimaryRayDir, outPrimaryNormal), 0.0f);
-    float3 specAlbedoAvg = envBRDFApprox2(
-        specF0_RR, outPrimaryRoughness * outPrimaryRoughness, NoV_RR);
-    if (!gbufferWritten) {
-        specAlbedoAvg = make_float3(0.5f, 0.5f, 0.5f);
-    }
-
-    // DLSS-RR specular hit distance (§3.4.9): explicit mirror-ray trace from
-    // the primary hit. See PathTraceKernelSplit.cu for the full rationale.
-    // The previous `anyHitAvg` was a per-bucket-roll average that flickers
-    // frame-to-frame, producing the surface shimmer measured at 2.19 (vs
-    // DLSS-SR 1.45). One mirror trace per pixel is deterministic.
-    float rrSpecHitT = 0.0f;
-    if (gbufferWritten) {
-        float3 rd = outPrimaryRayDir;
-        float3 N  = outPrimaryNormal;
-        float3 mirrorDir = normalize(rd - N * (2.0f * dot(rd, N)));
-        float3 mOrigin   = outPrimaryHitPos + N * 0.001f;
-        RadiancePayload mrp = traceRadianceRay(
-            handle, mOrigin, mirrorDir, 0.001f, 1e30f);
-        rrSpecHitT = mrp.hit ? mrp.tHit : 1.0e4f;
-    }
-    if (isnan(rrSpecHitT) || isinf(rrSpecHitT) || rrSpecHitT < 0.0f) rrSpecHitT = 0.0f;
-
-    float4 diffTexel = nrd_helpers::packRadianceHitDist(demodDiffAvg, diffHitAvg);
-    float4 specTexel = nrd_helpers::packRadianceHitDist(demodSpecAvg, specHitAvg);
-    float4 normTexel = nrd_helpers::packNormalRoughness(outPrimaryNormal, outPrimaryRoughness);
-    float4 albTexel  = make_float4(
-        fminf(fmaxf(outPrimaryAlbedo.x, 0.0f), 1.0f),
-        fminf(fmaxf(outPrimaryAlbedo.y, 0.0f), 1.0f),
-        fminf(fmaxf(outPrimaryAlbedo.z, 0.0f), 1.0f),
-        1.0f);
-    float4 emTexel = make_float4(emissiveAvg.x, emissiveAvg.y, emissiveAvg.z, 1.0f);
-
-    if (params.splitDiffuseRadianceHitDist) {
-        ushort4 p = packHalf4_split(diffTexel);
-        surf2Dwrite<ushort4>(p, params.splitDiffuseRadianceHitDist, x * 8, y);
-    }
-    if (params.splitSpecularRadianceHitDist) {
-        ushort4 p = packHalf4_split(specTexel);
-        surf2Dwrite<ushort4>(p, params.splitSpecularRadianceHitDist, x * 8, y);
-    }
-    if (params.splitNormalRoughness) {
-        uint32_t packed = packRGBA8(normTexel.x, normTexel.y, normTexel.z, normTexel.w);
-        surf2Dwrite<uint32_t>(packed, params.splitNormalRoughness, x * 4, y);
-    }
-    if (params.splitViewZ)
-        surf2Dwrite<float>(outPrimaryViewZ, params.splitViewZ, x * 4, y);
-    if (params.splitNdcDepth)
-        surf2Dwrite<float>(outPrimaryNdcZ, params.splitNdcDepth, x * 4, y);
-    if (params.splitMotionVectors) {
-        ushort2 packed = packHalf2_split(outPrimaryMvPx.x, outPrimaryMvPx.y);
-        surf2Dwrite<ushort2>(packed, params.splitMotionVectors, x * 4, y);
-    }
-    if (params.splitAlbedo) {
-        // DLSS-RR min-albedo guard (RTXPT PostProcess.hlsl §349-351):
-        // when both diffAlbedo AND specAlbedo are near-zero, the RR network
-        // has no reflectance signal to demodulate against and produces
-        // splotchy output that flickers during motion. Bumping diffAlbedo
-        // by 0.05 if their sum is below 0.05 keeps RR's reflectance
-        // estimator stable on near-black surfaces (deep wood, dark fabric).
-        // Only relevant when this aux image feeds DLSS-RR (params.splitSpecAlbedo
-        // also set); NRD-only mode still gets the un-bumped albedo for the
-        // composite shader's diff*alb modulation.
-        float3 dA = make_float3(albTexel.x, albTexel.y, albTexel.z);
-        if (params.splitSpecAlbedo) {
-            float avg = (dA.x + dA.y + dA.z + specAlbedoAvg.x +
-                         specAlbedoAvg.y + specAlbedoAvg.z) * (1.0f / 3.0f);
-            if (avg < 0.05f) {
-                dA.x += 0.05f; dA.y += 0.05f; dA.z += 0.05f;
-                dA.x = fminf(dA.x, 1.0f); dA.y = fminf(dA.y, 1.0f); dA.z = fminf(dA.z, 1.0f);
-            }
-        }
-        // Alpha = surface-valid mask. 0 on primary-miss (sky) pixels so the
-        // composite shader can suppress NRD's stale OUT_SPEC values there;
-        // see composite_tonemap.frag.
-        float aMask = gbufferWritten ? 1.0f : 0.0f;
-        uint32_t packed = packRGBA8(dA.x, dA.y, dA.z, aMask);
-        surf2Dwrite<uint32_t>(packed, params.splitAlbedo, x * 4, y);
-    }
-    if (params.splitEmissive) {
-        ushort4 p = packHalf4_split(emTexel);
-        surf2Dwrite<ushort4>(p, params.splitEmissive, x * 8, y);
-    }
-
-    // ── DLSS-RR specific surfaces (only written in Mode::DLSSRR) ──
-    if (params.splitHdrColor) {
-        float3 c = noisyColorAvg;
-        if (isnan(c.x) || isnan(c.y) || isnan(c.z) ||
-            isinf(c.x) || isinf(c.y) || isinf(c.z)) c = make_float3(0,0,0);
-        // RTXPT-style firefly clamp on the DLSS-RR input. RR's neural
-        // model can't denoise outliers above its training distribution,
-        // and a single high-energy firefly bleeds into nearby pixels for
-        // multiple frames during motion. RTXPT's PostProcess.hlsl §354
-        // clamps `max3(combinedRadiance) <= DLSSRRBrightnessClampK` (~10).
-        // We do the same as a max-channel clamp instead of per-channel —
-        // per-channel clamping shifts hue on saturated colors.
-        //
-        // M7 with --emissive-target 5 still produces visible streak
-        // artifacts during continuous motion regardless of the clamp
-        // value (5–10 tested). Root cause is M7's 9759 sub-pixel emissive
-        // triangles aliasing during motion faster than RR's history can
-        // resolve, not a clamp tuning. Bistro motion is clean at 10.
-        const float kRRBrightnessClamp = 10.0f;
-        float maxC = fmaxf(c.x, fmaxf(c.y, c.z));
-        if (maxC > kRRBrightnessClamp) {
-            c = c * (kRRBrightnessClamp / maxC);
-        }
-        c.x = fmaxf(c.x, 0.0f);
-        c.y = fmaxf(c.y, 0.0f);
-        c.z = fmaxf(c.z, 0.0f);
-        ushort4 p = packHalf4_split(make_float4(c.x, c.y, c.z, 1.0f));
-        surf2Dwrite<ushort4>(p, params.splitHdrColor, x * 8, y);
-    }
-    if (params.splitWorldNormalRoughness) {
-        ushort4 p = packHalf4_split(make_float4(
-            outPrimaryNormal.x, outPrimaryNormal.y, outPrimaryNormal.z,
-            outPrimaryRoughness));
-        surf2Dwrite<ushort4>(p, params.splitWorldNormalRoughness, x * 8, y);
-    }
-    if (params.splitSpecAlbedo) {
-        ushort4 p = packHalf4_split(make_float4(
-            fminf(fmaxf(specAlbedoAvg.x, 0.0f), 4.0f),
-            fminf(fmaxf(specAlbedoAvg.y, 0.0f), 4.0f),
-            fminf(fmaxf(specAlbedoAvg.z, 0.0f), 4.0f),
-            1.0f));
-        surf2Dwrite<ushort4>(p, params.splitSpecAlbedo, x * 8, y);
-    }
-    if (params.splitSpecHitT) {
-        // §3.4.9: world-space distance, primary surface to spec-reflected hit.
-        surf2Dwrite<float>(rrSpecHitT, params.splitSpecHitT, x * 4, y);
-    }
+    auto traceMirror = [&](float3 origin, float3 dir) -> float {
+        RadiancePayload mrp = traceRadianceRay(handle, origin, dir, 0.001f, 1e30f);
+        // Miss returns 1e4f — RR treats hitT=0 as "no reflection", so a
+        // long-but-finite distance keeps the reflection-speed estimate sane.
+        return mrp.hit ? mrp.tHit : 1.0e4f;
+    };
+    splitFinalizeAndWrite(acc, samplesPerPixel,
+                          traceMirror, params.splitSurfaces, x, y,
+                          /*applyDlssRRMinAlbedoGuard=*/true,         // OptiX: RTXPT min-albedo bump
+                          SplitHdrClampPolicy::MaxChannel10);         // OptiX: RTXPT max-channel 10
 }
 
 // ─────────────────────────────────────────────────────────────────────────

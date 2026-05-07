@@ -20,32 +20,6 @@ void launchPathTraceKernel(
 );
 
 #ifdef PATHTRACER_NRD_DLSS_ENABLED
-// Split-output surfaces consumed by NRD. Each handle is a cudaSurfaceObject_t
-// wrapping a Vulkan-shared VkImage (see VulkanSharedAuxBuffers). Formats:
-//   diffuseRadianceHitDist  : RGBA16F   (RGB = demodulated diffuse radiance, A = hitT)
-//   specularRadianceHitDist : RGBA16F   (RGB = specular radiance, A = hitT)
-//   normalRoughness         : RGBA8     (oct-encoded normal in RG, roughness in A)
-//   viewZ                   : R32F      (linear view-space Z, positive in front)
-//   motionVectors           : RG16F     (screen-space pixel delta, prev-curr)
-//   albedo                  : RGBA8     (diffuse reflectance for composite remodulation)
-//   emissive                : RGBA16F   (linear HDR emissive radiance, not denoised)
-struct SplitSurfaceOutputs {
-    cudaSurfaceObject_t diffuseRadianceHitDist = 0;
-    cudaSurfaceObject_t specularRadianceHitDist = 0;
-    cudaSurfaceObject_t normalRoughness         = 0;
-    cudaSurfaceObject_t viewZ                   = 0;
-    cudaSurfaceObject_t motionVectors           = 0;
-    cudaSurfaceObject_t albedo                  = 0;
-    cudaSurfaceObject_t emissive                = 0;
-    cudaSurfaceObject_t ndcDepth                = 0; // clip.z / clip.w (for DLSS)
-    // ── DLSS-RR-specific guides (zero in NRD modes; populated in Mode::DLSSRR)
-    // hdrColor: un-demodulated noisy combined color (diff*albedo + spec + emissive)
-    cudaSurfaceObject_t hdrColor                = 0; // RGBA16F linear HDR
-    cudaSurfaceObject_t worldNormalRoughness    = 0; // RGBA16F: world-space normal.xyz, roughness in .w
-    cudaSurfaceObject_t specAlbedo              = 0; // RGBA16F: EnvBRDFApprox2 (DLSS-RR §3.4.2)
-    cudaSurfaceObject_t specHitT                = 0; // R32F:    world-space distance from primary surface to first reflected hit
-};
-
 // Split-output variant of the path tracer. Writes demodulated diffuse / specular
 // radiance plus the NRD g-buffer directly into Vulkan-shared images.
 //

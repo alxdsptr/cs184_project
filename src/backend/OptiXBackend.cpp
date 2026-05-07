@@ -665,18 +665,7 @@ void OptiXBackend::launchPathTraceSplit(
     lp.scene   = scene;
     lp.camera  = camera;
     // accum/output/aux/gbuffer all unused by the split raygen — leave zeroed.
-    lp.splitDiffuseRadianceHitDist  = surfaces.diffuseRadianceHitDist;
-    lp.splitSpecularRadianceHitDist = surfaces.specularRadianceHitDist;
-    lp.splitNormalRoughness         = surfaces.normalRoughness;
-    lp.splitViewZ                   = surfaces.viewZ;
-    lp.splitMotionVectors           = surfaces.motionVectors;
-    lp.splitAlbedo                  = surfaces.albedo;
-    lp.splitEmissive                = surfaces.emissive;
-    lp.splitNdcDepth                = surfaces.ndcDepth;
-    lp.splitHdrColor                = surfaces.hdrColor;
-    lp.splitWorldNormalRoughness    = surfaces.worldNormalRoughness;
-    lp.splitSpecAlbedo              = surfaces.specAlbedo;
-    lp.splitSpecHitT                = surfaces.specHitT;
+    lp.splitSurfaces = surfaces;
     lp.width       = width;
     lp.height      = height;
     lp.sampleIndex = sampleIndex;

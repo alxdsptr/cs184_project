@@ -28,6 +28,53 @@ __device__ inline ushort2 packRG16F(float x, float y) {
     return r;
 }
 
+// Pack a float4 into a ushort4 carrying four __half bit patterns. RGBA16F
+// surfaces are 8 bytes/texel — never write `float4` (16 bytes) at `x * 8`,
+// the second half spills into the next pixel and silently corrupts the NRD
+// inputs (looks exactly like "the denoiser has no effect").
+__device__ inline ushort4 packRGBA16F(float4 v) {
+    ushort4 r;
+    r.x = __half_as_ushort(__float2half(v.x));
+    r.y = __half_as_ushort(__float2half(v.y));
+    r.z = __half_as_ushort(__float2half(v.z));
+    r.w = __half_as_ushort(__float2half(v.w));
+    return r;
+}
+
+// Pack four [0,1] floats into a single uint32 with byte layout (LE):
+// byte0=r, byte1=g, byte2=b, byte3=a. Workaround: surf2Dwrite<uchar4> in
+// OptiX-compiled device code emits a PTX store that faults with
+// "misaligned address" on Ampere+ (verified on RTX 4070, OptiX 9.0); writing
+// the same 4 bytes as a uint32_t works. CUDA-compiled code can use the
+// uchar4 path directly and doesn't need this.
+__device__ inline uint32_t packRGBA8_uint(float r, float g, float b, float a) {
+    uint32_t br = (uint32_t)(fminf(fmaxf(r, 0.0f), 1.0f) * 255.0f + 0.5f);
+    uint32_t bg = (uint32_t)(fminf(fmaxf(g, 0.0f), 1.0f) * 255.0f + 0.5f);
+    uint32_t bb = (uint32_t)(fminf(fmaxf(b, 0.0f), 1.0f) * 255.0f + 0.5f);
+    uint32_t ba = (uint32_t)(fminf(fmaxf(a, 0.0f), 1.0f) * 255.0f + 0.5f);
+    return (ba << 24) | (bb << 16) | (bg << 8) | br;
+}
+
+// ── Conditional surface writes (no-op if the handle is zero) ─────
+// Skip the `if (surf)` boilerplate at every call site. surf2Dwrite expects a
+// BYTE offset for x — the second arg of each helper is the texel-stride
+// already factored in.
+
+// R32F: 4 bytes/texel.
+__device__ inline void writeR32F(cudaSurfaceObject_t surf, uint32_t x, uint32_t y, float v) {
+    if (surf) surf2Dwrite<float>(v, surf, x * 4, y);
+}
+
+// RG16F: 4 bytes/texel, written as a packed ushort2 (a pair of __half).
+__device__ inline void writeRG16F(cudaSurfaceObject_t surf, uint32_t x, uint32_t y, float2 v) {
+    if (surf) surf2Dwrite<ushort2>(packRG16F(v.x, v.y), surf, x * 4, y);
+}
+
+// RGBA16F: 8 bytes/texel, written as a packed ushort4 (four __half).
+__device__ inline void writeRGBA16F(cudaSurfaceObject_t surf, uint32_t x, uint32_t y, float4 v) {
+    if (surf) surf2Dwrite<ushort4>(packRGBA16F(v), surf, x * 8, y);
+}
+
 // Write the primary-hit g-buffer entries (viewZ, motion vector, NDC depth) to
 // any surfaces that are bound (zero-handle = skip). DLSS / NRD only need the
 // first sample's hit to win — the caller gates with `firstBounce && !gbufferWritten`
@@ -39,17 +86,10 @@ __device__ inline void writePrimaryGBufferSurfaces(
     uint32_t x, uint32_t y,
     float viewZ, float2 mvPx, float clipCurrZ)
 {
-    if (viewZSurf) {
-        surf2Dwrite<float>(viewZ, viewZSurf, x * 4, y);
-    }
-    if (mvSurf) {
-        surf2Dwrite<ushort2>(packRG16F(mvPx.x, mvPx.y), mvSurf, x * 4, y);
-    }
-    if (ndcDepthSurf) {
-        // DLSS expects post-perspective clip.z/clip.w in [0,1] (near=0, far=1).
-        float ndcZ = clampf(clipCurrZ * 0.5f + 0.5f, 0.0f, 1.0f);
-        surf2Dwrite<float>(ndcZ, ndcDepthSurf, x * 4, y);
-    }
+    writeR32F(viewZSurf, x, y, viewZ);
+    writeRG16F(mvSurf,   x, y, mvPx);
+    // DLSS expects post-perspective clip.z/clip.w in [0,1] (near=0, far=1).
+    writeR32F(ndcDepthSurf, x, y, clampf(clipCurrZ * 0.5f + 0.5f, 0.0f, 1.0f));
 }
 
 // Sky-pixel sentinel: viewZ = 1e6 (beyond denoising range), motion = 0
@@ -62,16 +102,9 @@ __device__ inline void writeSkyGBufferSentinel(
     cudaSurfaceObject_t ndcDepthSurf,
     uint32_t x, uint32_t y)
 {
-    if (viewZSurf) {
-        surf2Dwrite<float>(1.0e6f, viewZSurf, x * 4, y);
-    }
-    if (mvSurf) {
-        ushort2 zero = make_ushort2(0, 0);
-        surf2Dwrite<ushort2>(zero, mvSurf, x * 4, y);
-    }
-    if (ndcDepthSurf) {
-        surf2Dwrite<float>(1.0f, ndcDepthSurf, x * 4, y);
-    }
+    writeR32F(viewZSurf,    x, y, 1.0e6f);
+    writeRG16F(mvSurf,      x, y, make_float2(0.0f, 0.0f));
+    writeR32F(ndcDepthSurf, x, y, 1.0f);
 }
 
 // Pure math: project hit position through current and previous view-projection
