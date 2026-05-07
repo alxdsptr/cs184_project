@@ -427,46 +427,25 @@ void NRDContext::denoise(VkCommandBuffer cmd, const VulkanSharedAuxBuffers& aux)
 
     // RELAX denoiser settings — one-shot (settings are sticky across frames in
     // the integration). Re-apply if the integration was recreated (resize).
-    //
-    // Tuning mirrors RTXPT's NrdConfig::getDefaultRELAXSettings(): they ship a
-    // path tracer with the same probabilistic-bucket pattern we use, and their
-    // tuning kills shimmer that the NRD defaults leave in.  Notable choices:
-    //   - hitDistRecon = OFF (NOT AREA_3X3). With AREA_3X3 the per-pixel hitT
-    //     gets averaged across the 3×3 spatial neighborhood every frame,
-    //     coupling neighbor luminance into the local hitT estimate. On a static
-    //     bucket-flickering input that injects neighbor-correlated jitter that
-    //     reads as "shifting noise patches" — exactly what the user reported.
-    //   - prepassBlurRadius = 0. The prepass spatial reuse helps under heavy
-    //     bucket-flicker but its kernel size depends on hitT, which itself is
-    //     flickering — so it visibly modulates each frame. RTXPT's comment is
-    //     blunt: "using prepass blur causes more issues than it solves".
-    //   - specularLobeAngleSlack = 0.2 hides noisy secondary bounces (per
-    //     RTXPT comment) — good for our 4–6 bounce paths.
-    //   - higher specular accumulation (40 frames) since specular signal is
-    //     intrinsically lower-frequency.
     if (m_impl->frameCounter == 0) {
         nrd::RelaxSettings relax{};
+        // Probabilistic per-pixel diffuse/specular bucket selection means the
+        // unselected bucket has hitT=0; AREA_3X3 reconstructs it from neighbors.
+        // Without this, glossy reflections show "hitT collapsed to 0" artifacts.
+        relax.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::AREA_3X3;
+        // Path tracing easily produces fireflies (caustics, glancing GGX). NRD
+        // would otherwise smear a single-frame firefly into a multi-second halo.
         relax.enableAntiFirefly = true;
-        relax.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::OFF;
-        relax.diffusePrepassBlurRadius      = 0.0f;
-        relax.specularPrepassBlurRadius     = 0.0f;
-        relax.atrousIterationNum            = 5;
-        relax.lobeAngleFraction             = 0.7f;
-        relax.specularLobeAngleSlack        = 0.2f;
-        relax.depthThreshold                = 0.004f;
-        relax.diffuseMaxAccumulatedFrameNum     = 25;
-        relax.specularMaxAccumulatedFrameNum    = 40;
-        relax.diffuseMaxFastAccumulatedFrameNum = 5;
-        relax.specularMaxFastAccumulatedFrameNum = 6;
-        relax.antilagSettings.accelerationAmount = 0.55f;
-        relax.antilagSettings.spatialSigmaScale  = 2.5f;
-        relax.antilagSettings.temporalSigmaScale = 0.3f;
-        relax.antilagSettings.resetAmount        = 0.5f;
+        // Faster history response for interactive camera. SPP=1-2 + many bounces
+        // generates plenty of new info per frame, so 30 frames of accumulation
+        // is too laggy.
+        relax.diffuseMaxAccumulatedFrameNum  = 20;
+        relax.specularMaxAccumulatedFrameNum = 20;
         if (m_impl->nrd.SetDenoiserSettings(kRelaxId, &relax) != nrd::Result::SUCCESS) {
             LOG_ERROR("NRD.denoise: SetDenoiserSettings(RELAX) failed");
         } else {
             LOG_INFO("NRD.denoise: RELAX settings applied "
-                     "(RTXPT-tuned: hitDistRecon=OFF, prepassBlur=0, accum=25/40)");
+                     "(antiFirefly=on, hitDistRecon=AREA_3X3, accum=20)");
         }
     }
 

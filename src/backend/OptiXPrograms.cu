@@ -1086,19 +1086,8 @@ extern "C" __global__ void __raygen__path_trace_split()
         float3 throughput      = make_float3(1, 1, 1);
         float3 pathRadiance    = make_float3(0, 0, 0);
         float3 emissiveContrib = make_float3(0, 0, 0);
-        // Direct lighting at the PRIMARY hit, decomposed per-lobe. Computed
-        // deterministically every frame (no probabilistic bucket roll for
-        // direct), which kills the static-frame "shifting noise" pattern
-        // that came from the bucket flicker dominating NRD's input variance.
-        // Primary indirect (bounce>=1 contributions / ReSTIR PT|GI postfix /
-        // continuation pathRadiance) goes into `pathRadiance` and is routed
-        // to the diff bucket — primary indirect is dominated by lambertian
-        // bounce light, which is exactly what RELAX's diffuse denoiser is
-        // tuned for.
-        float3 primaryDirectDiff = make_float3(0, 0, 0);
-        float3 primaryDirectSpec = make_float3(0, 0, 0);
 
-        // Per-sample primary-hit state.
+        // Per-sample primary-hit state for bucket classification.
         bool haveGbuffer = false;
         float3 primaryAlbedo    = make_float3(0, 0, 0);
         float3 primaryNormal    = make_float3(0, 1, 0);
@@ -1106,9 +1095,7 @@ extern "C" __global__ void __raygen__path_trace_split()
         float  primaryViewZ     = 0.0f;
         float2 primaryMvPx      = make_float2(0.0f, 0.0f);
         float  primaryNdcZ      = 1.0f;
-        // Specular-bucket hit distance: distance along the mirror-reflected
-        // ray from the primary hit. Set after we know the primary surface;
-        // overwritten by the post-loop mirror-ray trace for accuracy.
+        int    pickedBucket     = 0;       // 0 = diff, 1 = spec
         float  bucketHitDist    = 0.0f;
         bool   bucketHitDistSet = false;
         float3 primaryHitPos    = make_float3(0, 0, 0);
@@ -1330,12 +1317,7 @@ extern "C" __global__ void __raygen__path_trace_split()
                 if (dot(N, ray.direction) > 0) N = -N;
             }
 
-            // Primary-hit g-buffer capture. Bucket assignment is no longer
-            // stochastic — direct lighting at this hit is decomposed into
-            // diff/spec lobe contributions deterministically (see NEE block
-            // below), and the continuation ray is sampled from the full
-            // mixture BSDF (no 1/pickedP scaling), with its multi-bounce
-            // result accumulated into the diff bucket via `pathRadiance`.
+            // Primary-hit g-buffer capture + bucket classification.
             if (firstBounce) {
                 primaryAlbedo    = albedo;
                 primaryNormal    = N;
@@ -1365,12 +1347,14 @@ extern "C" __global__ void __raygen__path_trace_split()
                     primaryNdcZ = clampf(ndc.z * 0.5f + 0.5f, 0.0f, 1.0f);
                 }
 
+                float3 V = -ray.direction;
+                float specProb = materialSpecProb(mat, N, V, albedo);
+                pickedBucket = (pcg32_float(rng) < specProb) ? 1 : 0;
+                float pickedP = (pickedBucket == 1) ? specProb : (1.0f - specProb);
+                throughput = throughput * (1.0f / fmaxf(pickedP, 1e-4f));
+
                 haveGbuffer = true;
                 firstBounce = false;
-                // primaryLobeOverride drives the per-lobe NEE math at the
-                // primary hit (we evaluate diff and spec brdfs separately
-                // and route to their buckets). Beyond bounce 0 the override
-                // flips off and standard mixture NEE feeds pathRadiance.
                 primaryLobeOverride = true;
             }
 
@@ -1495,47 +1479,34 @@ extern "C" __global__ void __raygen__path_trace_split()
                     float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
                     if (slum > 1e-6f) {
                         float3 V = -ray.direction;
+                        float3 brdf;
+                        if (primaryLobeOverride) {
+                            brdf = (pickedBucket == 0)
+                                ? materialDiffuseLobe_split(mat, N, V, Ld, albedo)
+                                : materialSpecularLobe_split(mat, N, V, Ld, albedo);
+                        } else {
+                            brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
+                        }
                         float3 Le = sampleAreaLightLe(light, b0, b1, b2);
 
-                        if (primaryLobeOverride) {
-                            // Primary-hit NEE: evaluate diff and spec lobe
-                            // BRDFs separately and route each contribution
-                            // to its corresponding bucket. No probabilistic
-                            // bucket pick — this is the core fix for the
-                            // static-frame NRD "shifting noise" symptom.
-                            float3 brdfDiff = materialDiffuseLobe_split(
-                                mat, N, V, Ld, albedo);
-                            float3 brdfSpec = materialSpecularLobe_split(
-                                mat, N, V, Ld, albedo);
-                            if (restirActive) {
-                                float geom = lNdot / d2;
-                                float3 base = st * Le * (NdotL * geom) * restirW;
-                                primaryDirectDiff += clampFirefly_split(brdfDiff * base, 10.0f);
-                                primaryDirectSpec += clampFirefly_split(brdfSpec * base, 10.0f);
-                            } else {
-                                float pTri = light.weight / scene.areaLightTotalWeight;
-                                float pArea = pTri / fmaxf(light.area, 1e-7f);
-                                float pdfOmega = pArea * d2 / fmaxf(lNdot, 1e-7f);
-                                // MIS weight uses the lobe's own pdf for each
-                                // bucket — Veach's combined estimator with
-                                // per-bucket BSDF technique pdf.
-                                float pdfDiff = bsdfDiffusePdf(NdotL);
-                                float pdfSpec = bsdfSpecularPdf(N, V, Ld, mat.roughness);
-                                float wDiff = powerHeuristic(pdfOmega, pdfDiff);
-                                float wSpec = powerHeuristic(pdfOmega, pdfSpec);
-                                float3 base = st * Le * (NdotL / fmaxf(pdfOmega, 1e-7f));
-                                primaryDirectDiff += clampFirefly_split(brdfDiff * base * wDiff, 10.0f);
-                                primaryDirectSpec += clampFirefly_split(brdfSpec * base * wSpec, 10.0f);
-                            }
+                        if (restirActive) {
+                            float geom = lNdot / d2;
+                            float3 neeContrib = throughput * st * brdf * Le *
+                                                (NdotL * geom) * restirW;
+                            pathRadiance += clampFirefly_split(neeContrib, 10.0f);
                         } else {
-                            // Indirect-bounce NEE (bounce >= 1): contribute
-                            // to pathRadiance with mixture-pdf MIS as before.
-                            float3 brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
                             float pTri = light.weight / scene.areaLightTotalWeight;
                             float pArea = pTri / fmaxf(light.area, 1e-7f);
                             float pdfOmega = pArea * d2 / fmaxf(lNdot, 1e-7f);
-                            float spP = materialSpecProb(mat, N, V, albedo);
-                            float pdfBs = materialMixturePdf(mat, N, V, Ld, spP);
+                            float pdfBs;
+                            if (primaryLobeOverride) {
+                                pdfBs = (pickedBucket == 0)
+                                    ? bsdfDiffusePdf(NdotL)
+                                    : bsdfSpecularPdf(N, V, Ld, mat.roughness);
+                            } else {
+                                float spP = materialSpecProb(mat, N, V, albedo);
+                                pdfBs = materialMixturePdf(mat, N, V, Ld, spP);
+                            }
                             float w = powerHeuristic(pdfOmega, pdfBs);
                             float3 neeContrib = throughput * st * brdf * Le *
                                                 (NdotL / fmaxf(pdfOmega, 1e-7f)) * w;
@@ -1552,8 +1523,6 @@ extern "C" __global__ void __raygen__path_trace_split()
             // scenes that have no area lights at all.
             else if (scene.d_pointLights && scene.pointLightCount > 0) {
                 float3 V = -ray.direction;
-                float3 directDiff = make_float3(0,0,0);
-                float3 directSpec = make_float3(0,0,0);
                 float3 direct = make_float3(0,0,0);
                 for (uint32_t li = 0; li < scene.pointLightCount; li++) {
                     GPUPointLight light = scene.d_pointLights[li];
@@ -1576,30 +1545,21 @@ extern "C" __global__ void __raygen__path_trace_split()
                                    + light.quadraticAttenuation * d2;
                     float atten = 1.0f / fmaxf(attenDen, 1e-4f);
                     float3 Li = light.color * (light.intensity * atten);
+                    float3 brdf;
                     if (primaryLobeOverride) {
-                        // Per-lobe deterministic split (same fix as area
-                        // lights — avoids bucket flicker on point-lit pixels).
-                        float3 brdfDiff = materialDiffuseLobe_split(mat, N, V, Ld, albedo);
-                        float3 brdfSpec = materialSpecularLobe_split(mat, N, V, Ld, albedo);
-                        directDiff += clampFirefly_split(brdfDiff * st * Li * NdotL, 10.0f);
-                        directSpec += clampFirefly_split(brdfSpec * st * Li * NdotL, 10.0f);
+                        brdf = (pickedBucket == 0)
+                            ? materialDiffuseLobe_split(mat, N, V, Ld, albedo)
+                            : materialSpecularLobe_split(mat, N, V, Ld, albedo);
                     } else {
-                        float3 brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
-                        direct += clampFirefly_split(brdf * st * Li * NdotL, 10.0f);
+                        brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
                     }
+                    direct += clampFirefly_split(brdf * st * Li * NdotL, 10.0f);
                 }
-                if (primaryLobeOverride) {
-                    primaryDirectDiff += directDiff;
-                    primaryDirectSpec += directSpec;
-                } else {
-                    pathRadiance += throughput * direct;
-                }
+                pathRadiance += throughput * direct;
             }
 
             if (scene.d_directionalLights && scene.directionalLightCount > 0) {
                 float3 V = -ray.direction;
-                float3 directDiff = make_float3(0,0,0);
-                float3 directSpec = make_float3(0,0,0);
                 float3 direct = make_float3(0,0,0);
                 for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
                     GPUDirectionalLight light = scene.d_directionalLights[li];
@@ -1615,34 +1575,28 @@ extern "C" __global__ void __raygen__path_trace_split()
                     float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
                     if (slum < 1e-6f) continue;
 
+                    float3 brdf;
                     if (primaryLobeOverride) {
-                        // Per-lobe deterministic split (same bucket-flicker
-                        // fix as point/area lights).
-                        float3 brdfDiff = materialDiffuseLobe_split(mat, N, V, Ld, albedo);
-                        float3 brdfSpec = materialSpecularLobe_split(mat, N, V, Ld, albedo);
-                        directDiff += clampFirefly_split(brdfDiff * st * light.color * NdotL, 10.0f);
-                        directSpec += clampFirefly_split(brdfSpec * st * light.color * NdotL, 10.0f);
+                        brdf = (pickedBucket == 0)
+                            ? materialDiffuseLobe_split(mat, N, V, Ld, albedo)
+                            : materialSpecularLobe_split(mat, N, V, Ld, albedo);
                     } else {
-                        float3 brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
-                        direct += clampFirefly_split(brdf * st * light.color * NdotL, 10.0f);
+                        brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
                     }
+                    direct += clampFirefly_split(brdf * st * light.color * NdotL, 10.0f);
                 }
-                if (primaryLobeOverride) {
-                    primaryDirectDiff += directDiff;
-                    primaryDirectSpec += directSpec;
-                } else {
-                    pathRadiance += throughput * direct;
-                }
+                pathRadiance += throughput * direct;
             }
 
             // ReSTIR PT / GI consumption at the primary hit on sample s==0.
             // PT takes precedence; both branches add the pre-computed indirect
             // estimate and skip continuation bounces.
             //
-            // No probabilistic 1/pickedP scaling now (we removed bucket
-            // roll). The reservoir-shaded indirect is dominated by lambertian
-            // bounce light, so we route it through `pathRadiance` which the
-            // demod step lands in the diffuse bucket.
+            // CRITICAL: do NOT multiply by `throughput`. throughput == 1/pickedP
+            // from the bucket override; the bucket routing redistributes
+            // pathRadiance to the picked demod bucket already. Multiplying
+            // by throughput would scale indirect by 1/pickedP, and the
+            // demod-composite recovery becomes 2*indirect (double-counted).
             if (primaryLobeOverride && s == 0) {
                 if (scene.restirPTEnabled != 0 && scene.d_restirPTIndirect != nullptr) {
                     float3 indirect = scene.d_restirPTIndirect[pixelIdx];
@@ -1656,14 +1610,16 @@ extern "C" __global__ void __raygen__path_trace_split()
                 }
             }
 
-            // BSDF sampling for next bounce. Mixture sampling at every bounce
-            // (no forced-lobe override) — the primary direct is already split
-            // per-lobe above, and indirect-only continuation can use the
-            // standard mixture sampler with full BRDF evaluation.
+            // BSDF sampling for next bounce. Forced lobe at primary hit.
             float3 V = -ray.direction;
             float specProb = materialSpecProb(mat, N, V, albedo);
             float3 newDir;
-            bool sampleSpecular = (pcg32_float(rng) < specProb);
+            bool sampleSpecular;
+            if (primaryLobeOverride) {
+                sampleSpecular = (pickedBucket == 1);
+            } else {
+                sampleSpecular = (pcg32_float(rng) < specProb);
+            }
             if (sampleSpecular) {
                 float a = mat.roughness * mat.roughness;
                 float u1 = pcg32_float(rng), u2 = pcg32_float(rng);
@@ -1685,8 +1641,20 @@ extern "C" __global__ void __raygen__path_trace_split()
             }
             float NdotLn = dot(N, newDir);
             if (NdotLn < 1e-6f) break;
-            float pdf  = materialMixturePdf(mat, N, V, newDir, specProb);
-            float3 brdf = materialBsdfEvaluate(mat, N, V, newDir, albedo);
+            float pdf;
+            float3 brdf;
+            if (primaryLobeOverride) {
+                if (pickedBucket == 0) {
+                    pdf  = bsdfDiffusePdf(NdotLn);
+                    brdf = materialDiffuseLobe_split(mat, N, V, newDir, albedo);
+                } else {
+                    pdf  = bsdfSpecularPdf(N, V, newDir, mat.roughness);
+                    brdf = materialSpecularLobe_split(mat, N, V, newDir, albedo);
+                }
+            } else {
+                pdf  = materialMixturePdf(mat, N, V, newDir, specProb);
+                brdf = materialBsdfEvaluate(mat, N, V, newDir, albedo);
+            }
             if (pdf < 1e-7f) break;
             throughput = throughput * brdf * (NdotLn / (pdf + 1e-7f));
             prevSurfacePos = hit.position; prevBsdfPdf = pdf; havePrevSurface = true;
@@ -1712,40 +1680,32 @@ extern "C" __global__ void __raygen__path_trace_split()
         pathRadiance.z = fminf(fmaxf(pathRadiance.z, 0.0f), 15.0f);
 
         // Demodulate by albedo (NRD wants irradiance — composite remultiplies).
-        //
-        // Diffuse bucket: primary direct (diffuse-lobe NEE) + indirect from
-        //   continuation bounces / ReSTIR PT/GI. Demod by primaryAlbedo so
-        //   the composite shader's `diff*alb` recovers the radiance space
-        //   (lobeDiff already contains an albedo factor — dividing it back
-        //   out leaves the irradiance NRD wants).
-        // Specular bucket: primary direct (spec-lobe NEE only). The
-        //   continuation specular reflection is handled by the spec hitT
-        //   guide buffer + the temporal denoiser; sending the noisy
-        //   indirect-spec ray through this bucket only added flicker.
         float3 demodDiff = make_float3(0,0,0);
         float3 demodSpec = make_float3(0,0,0);
         if (haveGbuffer) {
-            float3 invA = make_float3(
-                1.0f / fmaxf(primaryAlbedo.x, 1e-3f),
-                1.0f / fmaxf(primaryAlbedo.y, 1e-3f),
-                1.0f / fmaxf(primaryAlbedo.z, 1e-3f));
-            demodDiff = (primaryDirectDiff + pathRadiance) * invA;
-            demodSpec = primaryDirectSpec;
+            if (pickedBucket == 0) {
+                float3 invA = make_float3(
+                    1.0f / fmaxf(primaryAlbedo.x, 1e-3f),
+                    1.0f / fmaxf(primaryAlbedo.y, 1e-3f),
+                    1.0f / fmaxf(primaryAlbedo.z, 1e-3f));
+                demodDiff = pathRadiance * invA;
+            } else {
+                demodSpec = pathRadiance;
+            }
         }
 
         demodDiffSum = demodDiffSum + demodDiff;
         demodSpecSum = demodSpecSum + demodSpec;
         emissiveSum  = emissiveSum  + emissiveContrib;
         if (haveGbuffer && bucketHitDistSet) {
-            // Send the indirect hitT into the diff bucket (primary indirect
-            // dominantly diffuse-y). Spec bucket's hitT is rebuilt post-loop
-            // from the explicit mirror-ray trace.
-            diffHitSum += bucketHitDist; diffHitCount++;
+            if (pickedBucket == 0) { diffHitSum += bucketHitDist; diffHitCount++; }
+            else                    { specHitSum += bucketHitDist; specHitCount++; }
             anyHitSum += bucketHitDist; anyHitCount++;
         }
-        // DLSS-RR noisy combined color: full primary-hit radiance.
-        noisyColorSum = noisyColorSum + (primaryDirectDiff + primaryDirectSpec
-                                         + pathRadiance + emissiveContrib);
+        // DLSS-RR noisy combined color: pathRadiance already incorporates
+        // 1/pickedP, so its expected value over both buckets is the un-modulated
+        // primary-hit radiance.
+        noisyColorSum = noisyColorSum + pathRadiance + emissiveContrib;
         if (!gbufferWritten && haveGbuffer) {
             outPrimaryAlbedo    = primaryAlbedo;
             outPrimaryNormal    = primaryNormal;
@@ -1800,14 +1760,8 @@ extern "C" __global__ void __raygen__path_trace_split()
     }
     if (isnan(rrSpecHitT) || isinf(rrSpecHitT) || rrSpecHitT < 0.0f) rrSpecHitT = 0.0f;
 
-    // Spec bucket's hitT now comes from the deterministic mirror-ray trace
-    // above (rrSpecHitT) — we no longer accumulate per-sample lobe-bounce
-    // hitT into specHitSum (the bucket roll was removed), so specHitAvg
-    // would be 0 here and break RELAX's spatial-blur radius for the spec
-    // signal. Reuse rrSpecHitT (it's the primary-surface→spec-reflected-hit
-    // distance, exactly what NRD wants for IN_SPEC_RADIANCE_HITDIST.A).
     float4 diffTexel = nrd_helpers::packRadianceHitDist(demodDiffAvg, diffHitAvg);
-    float4 specTexel = nrd_helpers::packRadianceHitDist(demodSpecAvg, rrSpecHitT);
+    float4 specTexel = nrd_helpers::packRadianceHitDist(demodSpecAvg, specHitAvg);
     float4 normTexel = nrd_helpers::packNormalRoughness(outPrimaryNormal, outPrimaryRoughness);
     float4 albTexel  = make_float4(
         fminf(fmaxf(outPrimaryAlbedo.x, 0.0f), 1.0f),
