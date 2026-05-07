@@ -4,6 +4,8 @@
 
 #include "render/PathTraceHelpers.cuh"
 #include "render/ReSTIR.h"
+#include "render/VolumeNEE.cuh"
+#include "render/VolumeShadowCuda.cuh"
 #include "gpu/NRDHelpers.cuh"
 #include "accel/BVH.h"
 #include "gpu/Random.h"
@@ -324,146 +326,13 @@ __global__ void pathTraceKernelSplit(
                         float3 mediumPos = ray.origin + ray.direction * tScatter;
                         float3 wo = -ray.direction;
                         float3 ssAlbedo = mediumSingleScatterAlbedo(scene.medium);
-                        float3 inScatter = make_float3(0.0f, 0.0f, 0.0f);
-
-                        // Area lights — picked CDF entry, MIS with phase function.
-                        if (scene.d_areaLights && scene.areaLightCount > 0 &&
-                            scene.d_areaLightCDF && scene.areaLightTotalWeight > 0.0f)
-                        {
-                            uint32_t li = sampleAreaLightIndex(
-                                scene.d_areaLightCDF, scene.areaLightCount,
-                                pcg32_float(rng));
-                            GPUAreaLight light = scene.d_areaLights[li];
-                            float r1 = pcg32_float(rng), r2 = pcg32_float(rng);
-                            float su = sqrtf(r1);
-                            float b0 = 1.0f - su;
-                            float b1 = su * (1.0f - r2);
-                            float b2 = su * r2;
-                            float3 lp = light.v0 * b0
-                                       + (light.v0 + light.e1) * b1
-                                       + (light.v0 + light.e2) * b2;
-                            float3 toL = lp - mediumPos;
-                            float d2 = fmaxf(dot(toL, toL), 1e-6f);
-                            float d = sqrtf(d2);
-                            float3 Ld = toL * (1.0f / d);
-                            float lNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
-                            if (lNdot > 0.0f) {
-                                bool occluded = false;
-                                float3 st = make_float3(1, 1, 1);
-                                if (scene.d_bvhNodes && scene.totalTriangles > 0) {
-                                    Ray sr; sr.origin = mediumPos; sr.direction = Ld;
-                                    sr.tmin = 0.001f; sr.tmax = fmaxf(d - 0.002f, 0.001f);
-                                    for (int sStep = 0; sStep < 8; sStep++) {
-                                        HitRecord sh; sh.t = sr.tmax;
-                                        if (!bvh_closestHit(sr, scene.d_bvhNodes, scene.bvhRootIndex,
-                                                            scene.d_positions, scene.d_indices, scene.d_materialIndices, sh)) break;
-                                        GPUMaterial sm;
-                                        if (sh.materialIndex >= 0 && (uint32_t)sh.materialIndex < scene.materialCount)
-                                            sm = scene.d_materials[sh.materialIndex];
-                                        else { occluded = true; break; }
-                                        if (sm.transmission > 0.0f) {
-                                            float sl = 0.2126f*sm.albedo.x + 0.7152f*sm.albedo.y + 0.0722f*sm.albedo.z;
-                                            if (sl < 0.9f) st = st * sm.albedo;
-                                            sr.origin = sh.position + Ld * 0.002f;
-                                            sr.tmax = fmaxf(d - length(sr.origin - mediumPos) - 0.002f, 0.001f);
-                                        } else { occluded = true; break; }
-                                    }
-                                }
-                                float3 volumetricST = volumeShadowTransmittance(
-                                    mediumPos, Ld, d, scene.medium, rng);
-                                st = st * volumetricST;
-                                float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
-                                if (!occluded && slum > 1e-6f) {
-                                    float pTri = light.weight / scene.areaLightTotalWeight;
-                                    float pArea = pTri / fmaxf(light.area, 1e-7f);
-                                    float pdfOmega = pArea * d2 / fmaxf(lNdot, 1e-7f);
-                                    float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
-                                    float w = powerHeuristic(pdfOmega, phase);
-                                    float3 Le = sampleAreaLightLe(light, b0, b1, b2);
-                                    inScatter += st * Le * (phase / fmaxf(pdfOmega, 1e-7f)) * w;
-                                }
-                            }
-                        }
-
-                        // Point lights.
-                        if (scene.d_pointLights && scene.pointLightCount > 0) {
-                            for (uint32_t li = 0; li < scene.pointLightCount; li++) {
-                                GPUPointLight light = scene.d_pointLights[li];
-                                float3 toL = light.position - mediumPos;
-                                float d2 = fmaxf(dot(toL, toL), 1e-6f);
-                                float d = sqrtf(d2);
-                                float3 Ld = toL * (1.0f / d);
-                                bool occluded = false;
-                                float3 st = make_float3(1, 1, 1);
-                                if (scene.d_bvhNodes && scene.totalTriangles > 0) {
-                                    Ray sr; sr.origin = mediumPos; sr.direction = Ld;
-                                    sr.tmin = 0.001f; sr.tmax = fmaxf(d - 0.002f, 0.001f);
-                                    for (int sStep = 0; sStep < 8; sStep++) {
-                                        HitRecord sh; sh.t = sr.tmax;
-                                        if (!bvh_closestHit(sr, scene.d_bvhNodes, scene.bvhRootIndex,
-                                                            scene.d_positions, scene.d_indices, scene.d_materialIndices, sh)) break;
-                                        GPUMaterial sm;
-                                        if (sh.materialIndex >= 0 && (uint32_t)sh.materialIndex < scene.materialCount)
-                                            sm = scene.d_materials[sh.materialIndex];
-                                        else { occluded = true; break; }
-                                        if (sm.transmission > 0.0f) {
-                                            float sl = 0.2126f*sm.albedo.x + 0.7152f*sm.albedo.y + 0.0722f*sm.albedo.z;
-                                            if (sl < 0.9f) st = st * sm.albedo;
-                                            sr.origin = sh.position + Ld * 0.002f;
-                                            sr.tmax = fmaxf(d - length(sr.origin - mediumPos) - 0.002f, 0.001f);
-                                        } else { occluded = true; break; }
-                                    }
-                                }
-                                float3 volumetricST = volumeShadowTransmittance(
-                                    mediumPos, Ld, d, scene.medium, rng);
-                                st = st * volumetricST;
-                                float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
-                                if (occluded || slum < 1e-6f) continue;
-                                float attenDen = light.constantAttenuation
-                                              + light.linearAttenuation * d
-                                              + light.quadraticAttenuation * d2;
-                                float atten = 1.0f / fmaxf(attenDen, 1e-4f);
-                                float3 Li = light.color * (light.intensity * atten);
-                                float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
-                                inScatter += st * Li * phase;
-                            }
-                        }
-
-                        // Directional lights.
-                        if (scene.d_directionalLights && scene.directionalLightCount > 0) {
-                            for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
-                                GPUDirectionalLight light = scene.d_directionalLights[li];
-                                float3 Ld = light.direction;
-                                bool occluded = false;
-                                float3 st = make_float3(1, 1, 1);
-                                if (scene.d_bvhNodes && scene.totalTriangles > 0) {
-                                    Ray sr; sr.origin = mediumPos; sr.direction = Ld;
-                                    sr.tmin = 0.001f; sr.tmax = 1e30f;
-                                    for (int sStep = 0; sStep < 8; sStep++) {
-                                        HitRecord sh; sh.t = sr.tmax;
-                                        if (!bvh_closestHit(sr, scene.d_bvhNodes, scene.bvhRootIndex,
-                                                            scene.d_positions, scene.d_indices, scene.d_materialIndices, sh)) break;
-                                        GPUMaterial sm;
-                                        if (sh.materialIndex >= 0 && (uint32_t)sh.materialIndex < scene.materialCount)
-                                            sm = scene.d_materials[sh.materialIndex];
-                                        else { occluded = true; break; }
-                                        if (sm.transmission > 0.0f) {
-                                            float sl = 0.2126f*sm.albedo.x + 0.7152f*sm.albedo.y + 0.0722f*sm.albedo.z;
-                                            if (sl < 0.9f) st = st * sm.albedo;
-                                            sr.origin = sh.position + Ld * 0.002f;
-                                            sr.tmax = 1e30f;
-                                        } else { occluded = true; break; }
-                                    }
-                                }
-                                float3 volumetricST = volumeShadowTransmittance(
-                                    mediumPos, Ld, 1e30f, scene.medium, rng);
-                                st = st * volumetricST;
-                                float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
-                                if (occluded || slum < 1e-6f) continue;
-                                float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
-                                inScatter += st * light.color * phase;
-                            }
-                        }
+                        // Single-scatter NEE across all lights, shared with the
+                        // megakernel + OptiX raygens via render/VolumeNEE.cuh.
+                        float3 inScatter = volumeSingleScatterInScatter(
+                            scene, scene.medium, mediumPos, wo, rng,
+                            [&](float3 o, float3 d, float t) {
+                                return cudaTraceTransmissiveShadow(scene, o, d, t);
+                            });
 
                         // Add to emissive bucket. Survives NRD untouched and
                         // appears in DLSS-RR's noisy color (pathRadiance +

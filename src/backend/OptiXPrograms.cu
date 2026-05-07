@@ -26,6 +26,7 @@
 #include "accel/LightBVHSample.h"
 #include "render/ReSTIRDevice.cuh"
 #include "render/ReSTIRGIDevice.cuh"
+#include "render/VolumeNEE.cuh"
 
 #ifndef M_PI_F
 #define M_PI_F 3.14159265358979323846f
@@ -386,88 +387,18 @@ extern "C" __global__ void __raygen__path_trace()
                             // multiply throughput by an explicit transmittance.
                             throughput = throughput * mediumSingleScatterAlbedo(scene.medium);
 
-                            // Single-scatter NEE: area lights.
-                            if (scene.d_areaLights && scene.areaLightCount > 0 &&
-                                scene.d_areaLightCDF && scene.areaLightTotalWeight > 0.0f)
-                            {
-                                uint32_t li = sampleAreaLightIndex(
-                                    scene.d_areaLightCDF, scene.areaLightCount,
-                                    pcg32_float(rng));
-                                GPUAreaLight light = scene.d_areaLights[li];
-                                float r1 = pcg32_float(rng), r2 = pcg32_float(rng);
-                                float su = sqrtf(r1);
-                                float b0 = 1.0f - su;
-                                float b1 = su * (1.0f - r2);
-                                float b2 = su * r2;
-                                float3 lp = light.v0 * b0
-                                           + (light.v0 + light.e1) * b1
-                                           + (light.v0 + light.e2) * b2;
-                                float3 toL = lp - mediumPos;
-                                float d2 = fmaxf(dot(toL, toL), 1e-6f);
-                                float d = sqrtf(d2);
-                                float3 Ld = toL * (1.0f / d);
-                                float lNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
-                                if (lNdot > 0.0f) {
-                                    float3 shadowTransmittance = traceShadowRay(
-                                        handle, mediumPos, Ld, 0.001f, fmaxf(d - 0.002f, 0.001f));
-                                    float3 volumetricST = volumeShadowTransmittance(
-                                        mediumPos, Ld, d, scene.medium, rng);
-                                    shadowTransmittance = shadowTransmittance * volumetricST;
-                                    float slum = 0.2126f*shadowTransmittance.x + 0.7152f*shadowTransmittance.y + 0.0722f*shadowTransmittance.z;
-                                    if (slum > 1e-6f) {
-                                        float pTri = light.weight / scene.areaLightTotalWeight;
-                                        float pArea = pTri / fmaxf(light.area, 1e-7f);
-                                        float pdfOmega = pArea * d2 / fmaxf(lNdot, 1e-7f);
-                                        float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
-                                        float w = powerHeuristic(pdfOmega, phase);
-                                        float3 Le = sampleAreaLightLe(light, b0, b1, b2);
-                                        radiance += throughput * shadowTransmittance * Le * (phase / fmaxf(pdfOmega, 1e-7f)) * w;
-                                    }
-                                }
-                            }
-
-                            // Single-scatter NEE: point lights.
-                            if (scene.d_pointLights && scene.pointLightCount > 0) {
-                                for (uint32_t li = 0; li < scene.pointLightCount; li++) {
-                                    GPUPointLight light = scene.d_pointLights[li];
-                                    float3 toL = light.position - mediumPos;
-                                    float d2 = fmaxf(dot(toL, toL), 1e-6f);
-                                    float d = sqrtf(d2);
-                                    float3 Ld = toL * (1.0f / d);
-                                    float3 shadowTransmittance = traceShadowRay(
-                                        handle, mediumPos, Ld, 0.001f, fmaxf(d - 0.002f, 0.001f));
-                                    float3 volumetricST = volumeShadowTransmittance(
-                                        mediumPos, Ld, d, scene.medium, rng);
-                                    shadowTransmittance = shadowTransmittance * volumetricST;
-                                    float slum = 0.2126f*shadowTransmittance.x + 0.7152f*shadowTransmittance.y + 0.0722f*shadowTransmittance.z;
-                                    if (slum < 1e-6f) continue;
-                                    float attenDen = light.constantAttenuation + light.linearAttenuation * d + light.quadraticAttenuation * d2;
-                                    float atten = 1.0f / fmaxf(attenDen, 1e-4f);
-                                    float3 Li = light.color * (light.intensity * atten);
-                                    float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
-                                    radiance += throughput * shadowTransmittance * Li * phase;
-                                }
-                            }
-
-                            // Single-scatter NEE: directional lights.
-                            if (scene.d_directionalLights && scene.directionalLightCount > 0) {
-                                for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
-                                    GPUDirectionalLight light = scene.d_directionalLights[li];
-                                    float3 Ld = light.direction;
-                                    float3 shadowTransmittance = traceShadowRay(
-                                        handle, mediumPos, Ld, 0.001f, 1e30f);
-                                    // Volume shadow extends from scatter point
-                                    // toward infinity along Ld; ratio tracking
-                                    // clips to the bounding box automatically.
-                                    float3 volumetricST = volumeShadowTransmittance(
-                                        mediumPos, Ld, 1e30f, scene.medium, rng);
-                                    shadowTransmittance = shadowTransmittance * volumetricST;
-                                    float slum = 0.2126f*shadowTransmittance.x + 0.7152f*shadowTransmittance.y + 0.0722f*shadowTransmittance.z;
-                                    if (slum < 1e-6f) continue;
-                                    float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
-                                    radiance += throughput * shadowTransmittance * light.color * phase;
-                                }
-                            }
+                            // Single-scatter NEE shared with the CUDA kernels
+                            // (render/VolumeNEE.cuh). Shadow-ray adapter routes
+                            // through OptiX's GAS via traceShadowRay; the anyhit
+                            // program already accumulates glass tinting, so the
+                            // attenuation comes back ready to multiply.
+                            float3 inScatter = volumeSingleScatterInScatter(
+                                scene, scene.medium, mediumPos, wo, rng,
+                                [&](float3 o, float3 d, float t) {
+                                    float tmax = (t >= 1e29f) ? 1e30f : fmaxf(t - 0.002f, 0.001f);
+                                    return traceShadowRay(handle, o, d, 0.001f, tmax);
+                                });
+                            radiance += throughput * inScatter;
 
                             // Continue from the scatter point in a phase-sampled direction.
                             float3 newDir = phaseHGSample(wo, scene.medium.anisotropy, rng);
@@ -1414,87 +1345,17 @@ extern "C" __global__ void __raygen__path_trace_split()
                             float3 mediumPos = ray.origin + ray.direction * tScatter;
                             float3 wo = -ray.direction;
                             float3 ssAlbedo = mediumSingleScatterAlbedo(scene.medium);
-                            float3 inScatter = make_float3(0.0f, 0.0f, 0.0f);
-
-                            // Area lights — picked CDF entry, MIS with phase function.
-                            if (scene.d_areaLights && scene.areaLightCount > 0 &&
-                                scene.d_areaLightCDF && scene.areaLightTotalWeight > 0.0f)
-                            {
-                                uint32_t li = sampleAreaLightIndex(
-                                    scene.d_areaLightCDF, scene.areaLightCount,
-                                    pcg32_float(rng));
-                                GPUAreaLight light = scene.d_areaLights[li];
-                                float r1 = pcg32_float(rng), r2 = pcg32_float(rng);
-                                float su = sqrtf(r1);
-                                float b0 = 1.0f - su;
-                                float b1 = su * (1.0f - r2);
-                                float b2 = su * r2;
-                                float3 lp = light.v0 * b0
-                                           + (light.v0 + light.e1) * b1
-                                           + (light.v0 + light.e2) * b2;
-                                float3 toL = lp - mediumPos;
-                                float d2 = fmaxf(dot(toL, toL), 1e-6f);
-                                float d = sqrtf(d2);
-                                float3 Ld = toL * (1.0f / d);
-                                float lNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
-                                if (lNdot > 0.0f) {
-                                    float3 shadowTransmittance = traceShadowRay(
-                                        handle, mediumPos, Ld, 0.001f, fmaxf(d - 0.002f, 0.001f));
-                                    float3 volumetricST = volumeShadowTransmittance(
-                                        mediumPos, Ld, d, scene.medium, rng);
-                                    shadowTransmittance = shadowTransmittance * volumetricST;
-                                    float slum = 0.2126f*shadowTransmittance.x + 0.7152f*shadowTransmittance.y + 0.0722f*shadowTransmittance.z;
-                                    if (slum > 1e-6f) {
-                                        float pTri = light.weight / scene.areaLightTotalWeight;
-                                        float pArea = pTri / fmaxf(light.area, 1e-7f);
-                                        float pdfOmega = pArea * d2 / fmaxf(lNdot, 1e-7f);
-                                        float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
-                                        float w = powerHeuristic(pdfOmega, phase);
-                                        float3 Le = sampleAreaLightLe(light, b0, b1, b2);
-                                        inScatter += shadowTransmittance * Le * (phase / fmaxf(pdfOmega, 1e-7f)) * w;
-                                    }
-                                }
-                            }
-
-                            // Point lights.
-                            if (scene.d_pointLights && scene.pointLightCount > 0) {
-                                for (uint32_t li = 0; li < scene.pointLightCount; li++) {
-                                    GPUPointLight light = scene.d_pointLights[li];
-                                    float3 toL = light.position - mediumPos;
-                                    float d2 = fmaxf(dot(toL, toL), 1e-6f);
-                                    float d = sqrtf(d2);
-                                    float3 Ld = toL * (1.0f / d);
-                                    float3 shadowTransmittance = traceShadowRay(
-                                        handle, mediumPos, Ld, 0.001f, fmaxf(d - 0.002f, 0.001f));
-                                    float3 volumetricST = volumeShadowTransmittance(
-                                        mediumPos, Ld, d, scene.medium, rng);
-                                    shadowTransmittance = shadowTransmittance * volumetricST;
-                                    float slum = 0.2126f*shadowTransmittance.x + 0.7152f*shadowTransmittance.y + 0.0722f*shadowTransmittance.z;
-                                    if (slum < 1e-6f) continue;
-                                    float attenDen = light.constantAttenuation + light.linearAttenuation * d + light.quadraticAttenuation * d2;
-                                    float atten = 1.0f / fmaxf(attenDen, 1e-4f);
-                                    float3 Li = light.color * (light.intensity * atten);
-                                    float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
-                                    inScatter += shadowTransmittance * Li * phase;
-                                }
-                            }
-
-                            // Directional lights.
-                            if (scene.d_directionalLights && scene.directionalLightCount > 0) {
-                                for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
-                                    GPUDirectionalLight light = scene.d_directionalLights[li];
-                                    float3 Ld = light.direction;
-                                    float3 shadowTransmittance = traceShadowRay(
-                                        handle, mediumPos, Ld, 0.001f, 1e30f);
-                                    float3 volumetricST = volumeShadowTransmittance(
-                                        mediumPos, Ld, 1e30f, scene.medium, rng);
-                                    shadowTransmittance = shadowTransmittance * volumetricST;
-                                    float slum = 0.2126f*shadowTransmittance.x + 0.7152f*shadowTransmittance.y + 0.0722f*shadowTransmittance.z;
-                                    if (slum < 1e-6f) continue;
-                                    float phase = phaseHGEval(dot(wo, Ld), scene.medium.anisotropy);
-                                    inScatter += shadowTransmittance * light.color * phase;
-                                }
-                            }
+                            // Single-scatter NEE shared with the CUDA kernels
+                            // (render/VolumeNEE.cuh). Shadow ray uses OptiX's
+                            // GAS via traceShadowRay; the anyhit program handles
+                            // glass tinting so the returned attenuation is ready
+                            // to use.
+                            float3 inScatter = volumeSingleScatterInScatter(
+                                scene, scene.medium, mediumPos, wo, rng,
+                                [&](float3 o, float3 d, float t) {
+                                    float tmax = (t >= 1e29f) ? 1e30f : fmaxf(t - 0.002f, 0.001f);
+                                    return traceShadowRay(handle, o, d, 0.001f, tmax);
+                                });
 
                             // Route into the emissive bucket. Path terminates.
                             float3 contrib = throughput * ssAlbedo * inScatter;
