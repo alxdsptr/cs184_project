@@ -18,3 +18,5 @@ optix-native/
 *.bat
 imgui.ini
 camera*.txt
+*.scenecache
+*.scenecache.tmp

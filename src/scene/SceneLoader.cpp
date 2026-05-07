@@ -1,4 +1,5 @@
 #include "scene/SceneLoader.h"
+#include "scene/SceneCache.h"
 #include "scene/SceneTreeBuilder.h"
 #include "scene/Animation.h"
 #include "scene/PbrtLoader.h"
@@ -197,6 +198,20 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         return loadPbrtScene(path, scene);
     }
 
+    // ── Scene cache: skip Assimp entirely on a hit ─────────────
+    // Key includes source mtime+size and the loader options that affect
+    // output. A binary-layout fingerprint inside SceneCache also auto-
+    // invalidates on any scene-struct field addition.
+    SceneCacheKey cacheKey{};
+    bool haveKey = SceneCache::buildKey(path, (uint32_t)sgMode, texturedEmissiveTargetLum, cacheKey);
+    if (haveKey && SceneCache::tryLoad(path, cacheKey, scene)) {
+        // Texture binding (cudaTextureObject_t) happens later in
+        // Application::loadScene; the cache deliberately stores 0 for those.
+        return true;
+    }
+
+    LOG_INFO("Importing scene %s via Assimp", path.c_str());
+
     Assimp::Importer importer;
     // Note: NO aiProcess_PreTransformVertices — we need the node hierarchy
     // intact so we can resolve animation channels. The pose-update kernel
@@ -213,6 +228,9 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         LOG_ERROR("Assimp: %s", importer.GetErrorString());
         return false;
     }
+
+    LOG_INFO("Assimp scene loaded with %u meshes, %u materials, %u animations",
+              aiScn->mNumMeshes, aiScn->mNumMaterials, aiScn->mNumAnimations);
 
     // Apply unit scaling for FBX files (handles cm vs m + the
     // large-coordinate heuristic). With PreTransformVertices dropped from the
@@ -734,6 +752,12 @@ bool SceneLoader::load(const std::string& path, Scene& scene, SGWorkflowMode sgM
         }
         LOG_INFO("Emissive triangle lights: %zu (static=%zu dynamic=%zu)",
                  scene.getAreaLights().size(), nStatic, nDyn);
+    }
+
+    // ── Persist the cache for next run ─────────────────────────
+    // Best-effort: a write failure is non-fatal (logged inside save()).
+    if (haveKey) {
+        SceneCache::save(path, cacheKey, scene);
     }
 
     return true;

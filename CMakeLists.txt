@@ -186,6 +186,7 @@ add_executable(pathtracer
     # Scene
     src/scene/Scene.cpp
     src/scene/SceneLoader.cpp
+    src/scene/SceneCache.cpp
     src/scene/SceneTreeBuilder.cpp
     src/scene/AnimationEval.cpp
     src/scene/PbrtLoader.cpp
