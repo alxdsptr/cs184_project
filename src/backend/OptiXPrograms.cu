@@ -20,6 +20,7 @@
 #include "accel/LightBVHSample.h"
 #include "render/PathTraceHelpers.cuh"
 #include "render/GBufferWriters.cuh"
+#include "render/NEEHelpers.cuh"
 #include "render/ReSTIRDevice.cuh"
 #include "render/ReSTIRGIDevice.cuh"
 #include "render/VolumeNEE.cuh"
@@ -320,11 +321,8 @@ extern "C" __global__ void __raygen__path_trace()
                 N = normalize(n0 * baryW + n1 * baryU + n2 * baryV);
             }
             if (mat.transmission <= 0.0f && mat.normalTex != 0 && scene.d_tangents) {
-                float4 t0 = scene.d_tangents[i0];
-                float4 t1 = scene.d_tangents[i1];
-                float4 t2 = scene.d_tangents[i2];
-                float4 tangent = t0 * baryW + t1 * baryU + t2 * baryV;
-                N = applyNormalMap(N, tangent, mat.normalTex, texUV);
+                N = applyInterpolatedNormalMap(N, scene, i0, i1, i2, baryU, baryV, baryW,
+                                               mat.normalTex, texUV);
             }
             if (mat.transmission <= 0.0f) {
                 if (dot(N, ray.direction) > 0) N = -N;
@@ -398,23 +396,16 @@ extern "C" __global__ void __raygen__path_trace()
             if (isEmissive) {
                 float3 Le = emissiveColor * mat.emissionStrength;
                 float weight = 1.0f;
-                bool isAreaLight = false;
+                // MIS the emissive hit against the light-sampling strategy.
+                // OptiX mono uses CDF-only pTri (the light BVH path is mono
+                // CUDA only — see PathTraceKernel.cu).
                 if (bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
                     int areaLightIndex = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
                     if (areaLightIndex >= 0 && scene.d_areaLights && scene.areaLightCount > 0) {
-                        isAreaLight = true;
                         GPUAreaLight light = scene.d_areaLights[areaLightIndex];
-                        float3 toLight = hit.position - prevSurfacePos;
-                        float dist2 = fmaxf(dot(toLight, toLight), 1e-6f);
-                        float3 wi = normalize(toLight);
-                        float lightNdot = fmaxf(dot(light.normal, -wi), 0.0f);
-                        if (lightNdot > 0.0f) {
-                            float pTri = light.weight / fmaxf(scene.areaLightTotalWeight, 1e-7f);
-                            float pArea = pTri / fmaxf(light.area, 1e-7f);
-                            float pLight = pArea * dist2 / fmaxf(lightNdot, 1e-7f);
-                            float pBsdf = prevBsdfPdf;
-                            weight = powerHeuristic(pBsdf, pLight);
-                        }
+                        float pTri = light.weight / fmaxf(scene.areaLightTotalWeight, 1e-7f);
+                        weight = computeEmissiveMISWeight(
+                            light, hit.position, prevSurfacePos, prevBsdfPdf, pTri);
                     }
                 }
                 radiance += throughput * Le * weight;
@@ -424,6 +415,22 @@ extern "C" __global__ void __raygen__path_trace()
                     break;
                 }
             }
+
+            // NEE callables — defined once per bounce, used by every light type.
+            // OptiX traceShadow wraps the GAS / anyhit pair to match the
+            // signature of the CUDA `cudaTraceTransmissiveShadow` adapter.
+            // Mono kernels always use the full mixture (primaryLobeOverride=false).
+            float3 V = -ray.direction;
+            auto traceShadow = [&](float3 o, float3 d, float dist) {
+                float tmax = (dist >= 1e29f) ? 1e30f : fmaxf(dist - 0.002f, 0.001f);
+                return traceShadowRay(handle, o, d, 0.001f, tmax);
+            };
+            auto neeBrdf = [&](float3 Ld, float NdotL) {
+                return evalNEEBrdf(mat, N, V, Ld, albedo, /*primaryLobeOverride=*/false, 0);
+            };
+            auto neePdf = [&](float3 Ld, float NdotL) {
+                return evalNEEBrdfPdf(mat, N, V, Ld, albedo, /*primaryLobeOverride=*/false, 0);
+            };
 
             // Direct lighting NEE
             if (scene.d_areaLights && scene.areaLightCount > 0 &&
@@ -469,138 +476,32 @@ extern "C" __global__ void __raygen__path_trace()
 
                 if (!restirSkip) {
                 GPUAreaLight light = scene.d_areaLights[lightIndex];
-
-                float3 lightV0 = light.v0;
-                float3 lightV1 = light.v0 + light.e1;
-                float3 lightV2 = light.v0 + light.e2;
-                float3 lightPos = lightV0 * b0 + lightV1 * b1 + lightV2 * b2;
-
-                float3 toLight = lightPos - hit.position;
-                float dist2 = fmaxf(dot(toLight, toLight), 1e-6f);
-                float dist = sqrtf(dist2);
-                float3 Ld = toLight * (1.0f / dist);
-
-                float NdotL = fmaxf(dot(N, Ld), 0.0f);
-                float lightNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
-                if (NdotL > 0.0f && lightNdot > 0.0f) {
-                    float3 shadowOrigin = hit.position + N * 0.001f;
-                    float shadowTmax = fmaxf(dist - 0.002f, 0.001f);
-                    float3 shadowTransmittance = traceShadowRay(
-                        handle, shadowOrigin, Ld, 0.001f, shadowTmax);
-                    // Volumetric attenuation along the surface→area-light shadow.
-                    float3 volumetricST = volumeShadowTransmittance(
-                        shadowOrigin, Ld, dist, scene.medium, rng);
-                    shadowTransmittance = shadowTransmittance * volumetricST;
-                    float shadowLum = 0.2126f * shadowTransmittance.x +
-                                      0.7152f * shadowTransmittance.y +
-                                      0.0722f * shadowTransmittance.z;
-                    if (shadowLum > 1e-6f) {
-                        float3 V = -ray.direction;
-                        float3 brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
-                        float3 Le = sampleAreaLightLe(light, b0, b1, b2);
-
-                        if (restirActive) {
-                            // ReSTIR estimator: f(x) * W where f is the
-                            // unshadowed integrand (BRDF * Le * G * NdotL) and
-                            // W is the reservoir's contribution weight. No MIS
-                            // against BSDF sampling — ReSTIR *is* the
-                            // light-side strategy at the primary hit.
-                            float geom = lightNdot / dist2;
-                            float3 neeContrib = throughput * shadowTransmittance *
-                                                brdf * Le * (NdotL * geom) * restirW;
-                            // Mirror PathTraceKernel.cu / Split: cap the per-
-                            // frame contribution so a near-grazing reservoir
-                            // sample doesn't dump a 50-lum spike into the
-                            // accumulator (M7 flash-and-decay artifact).
-                            float lumNee = 0.2126f * neeContrib.x +
-                                           0.7152f * neeContrib.y +
-                                           0.0722f * neeContrib.z;
-                            const float clampMax = 10.0f;
-                            if (lumNee > clampMax) {
-                                neeContrib = neeContrib * (clampMax / lumNee);
-                            }
-                            radiance += neeContrib;
-                        } else {
-                            float pTri = light.weight / scene.areaLightTotalWeight;
-                            float pArea = pTri / fmaxf(light.area, 1e-7f);
-                            float pdfOmega = pArea * dist2 / fmaxf(lightNdot, 1e-7f);
-
-                            float neeSpecProb = materialSpecProb(mat, N, V, albedo);
-                            float pdfBsdf = materialMixturePdf(mat, N, V, Ld, neeSpecProb);
-                            float weight = powerHeuristic(pdfOmega, pdfBsdf);
-
-                            radiance += throughput * shadowTransmittance * brdf *
-                                        Le *
-                                        (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
-                        }
-                    }
-                }
+                float pSelect = light.weight / fmaxf(scene.areaLightTotalWeight, 1e-7f);
+                // Mono ReSTIR-DI: cap=10 firefly clamp on the f*W estimator
+                // (matches PathTraceKernel.cu / Split — M7 flash-and-decay
+                // protection). Mono non-ReSTIR: no per-contribution clamp;
+                // the end-of-loop luminance clamp catches outliers.
+                float fireflyClamp = restirActive ? 10.0f : 0.0f;
+                radiance += evalAreaLightNEEContribution(
+                    throughput, hit.position, N, light, b0, b1, b2, pSelect,
+                    restirActive, restirW,
+                    scene.medium, rng, traceShadow, neeBrdf, neePdf, fireflyClamp);
                 } // end !restirSkip
             }
 
             // Point lights are delta emitters — always sampled, regardless of
             // whether area lights also exist. See PathTraceKernel.cu comment.
             else if (scene.d_pointLights && scene.pointLightCount > 0) {
-                float3 direct = make_float3(0.0f, 0.0f, 0.0f);
-                float3 V = -ray.direction;
-                for (uint32_t li = 0; li < scene.pointLightCount; li++) {
-                    GPUPointLight light = scene.d_pointLights[li];
-                    float3 toLight = light.position - hit.position;
-                    float dist2 = fmaxf(dot(toLight, toLight), 1e-6f);
-                    float dist = sqrtf(dist2);
-                    float3 Ld = toLight * (1.0f / dist);
-                    float NdotL = fmaxf(dot(N, Ld), 0.0f);
-                    if (NdotL <= 0.0f) continue;
-
-                    float3 shadowOrigin = hit.position + N * 0.001f;
-                    float shadowTmax = fmaxf(dist - 0.002f, 0.001f);
-                    float3 shadowTransmittancePL = traceShadowRay(
-                        handle, shadowOrigin, Ld, 0.001f, shadowTmax);
-                    // Volumetric attenuation along the surface→point-light shadow.
-                    float3 volumetricSTPL = volumeShadowTransmittance(
-                        shadowOrigin, Ld, dist, scene.medium, rng);
-                    shadowTransmittancePL = shadowTransmittancePL * volumetricSTPL;
-                    float shadowLumPL = 0.2126f * shadowTransmittancePL.x +
-                                        0.7152f * shadowTransmittancePL.y +
-                                        0.0722f * shadowTransmittancePL.z;
-                    if (shadowLumPL < 1e-6f) continue;
-
-                    float attenDen = light.constantAttenuation
-                                   + light.linearAttenuation * dist
-                                   + light.quadraticAttenuation * dist2;
-                    float attenuation = 1.0f / fmaxf(attenDen, 1e-4f);
-                    float3 Li = light.color * (light.intensity * attenuation);
-                    float3 brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
-                    direct += brdf * shadowTransmittancePL * Li * NdotL;
-                }
+                float3 direct = evalAllPointLightsNEE(
+                    scene, scene.medium, hit.position, N, rng,
+                    traceShadow, neeBrdf, /*fireflyClamp=*/0.0f);
                 radiance += throughput * direct;
             }
 
             if (scene.d_directionalLights && scene.directionalLightCount > 0) {
-                float3 direct = make_float3(0.0f, 0.0f, 0.0f);
-                float3 V = -ray.direction;
-                for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
-                    GPUDirectionalLight light = scene.d_directionalLights[li];
-                    float3 Ld = light.direction;
-                    float NdotL = fmaxf(dot(N, Ld), 0.0f);
-                    if (NdotL <= 0.0f) continue;
-
-                    float3 shadowOriginDL = hit.position + N * 0.001f;
-                    float3 shadowTransmittanceDL = traceShadowRay(
-                        handle, shadowOriginDL, Ld, 0.001f, 1e30f);
-                    // Ratio-track through the volume to the bounding-box exit
-                    // along Ld. For unbounded media this gracefully skips.
-                    float3 volumetricDL = volumeShadowTransmittance(
-                        shadowOriginDL, Ld, 1e30f, scene.medium, rng);
-                    shadowTransmittanceDL = shadowTransmittanceDL * volumetricDL;
-                    float shadowLumDL = 0.2126f * shadowTransmittanceDL.x +
-                                        0.7152f * shadowTransmittanceDL.y +
-                                        0.0722f * shadowTransmittanceDL.z;
-                    if (shadowLumDL < 1e-6f) continue;
-
-                    float3 brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
-                    direct += brdf * shadowTransmittanceDL * light.color * NdotL;
-                }
+                float3 direct = evalAllDirectionalLightsNEE(
+                    scene, scene.medium, hit.position, N, rng,
+                    traceShadow, neeBrdf, /*fireflyClamp=*/0.0f);
                 radiance += throughput * direct;
             }
 
@@ -627,8 +528,7 @@ extern "C" __global__ void __raygen__path_trace()
                 break;
             }
 
-            // BRDF sampling
-            float3 V = -ray.direction;
+            // BRDF sampling — V was hoisted earlier for NEE.
             float specProb = materialSpecProb(mat, N, V, albedo);
             float3 newDir;
 
@@ -1055,11 +955,8 @@ extern "C" __global__ void __raygen__path_trace_split()
                 N = normalize(n0 * baryW + n1 * baryU + n2 * baryV);
             }
             if (mat.transmission <= 0.0f && mat.normalTex != 0 && scene.d_tangents) {
-                float4 t0 = scene.d_tangents[i0];
-                float4 t1 = scene.d_tangents[i1];
-                float4 t2 = scene.d_tangents[i2];
-                float4 tangent = t0 * baryW + t1 * baryU + t2 * baryV;
-                N = applyNormalMap(N, tangent, mat.normalTex, texUV);
+                N = applyInterpolatedNormalMap(N, scene, i0, i1, i2, baryU, baryV, baryW,
+                                               mat.normalTex, texUV);
             }
             if (mat.transmission <= 0.0f) {
                 if (dot(N, ray.direction) > 0) N = -N;
@@ -1132,29 +1029,41 @@ extern "C" __global__ void __raygen__path_trace_split()
             if (isEmissive) {
                 float3 Le = emissiveColor * mat.emissionStrength;
                 float weight = 1.0f;
+                // MIS the emissive hit against light-sampling (CDF pTri).
                 if (bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
                     int ali = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
                     if (ali >= 0 && scene.d_areaLights && scene.areaLightCount > 0) {
                         GPUAreaLight light = scene.d_areaLights[ali];
-                        float3 toL = hit.position - prevSurfacePos;
-                        float d2 = fmaxf(dot(toL, toL), 1e-6f);
-                        float3 wi = normalize(toL);
-                        float lNdot = fmaxf(dot(light.normal, -wi), 0.0f);
-                        if (lNdot > 0.0f) {
-                            float pTri = light.weight / fmaxf(scene.areaLightTotalWeight, 1e-7f);
-                            float pArea = pTri / fmaxf(light.area, 1e-7f);
-                            float pLight = pArea * d2 / fmaxf(lNdot, 1e-7f);
-                            weight = powerHeuristic(prevBsdfPdf, pLight);
-                        }
+                        float pTri = light.weight / fmaxf(scene.areaLightTotalWeight, 1e-7f);
+                        weight = computeEmissiveMISWeight(
+                            light, hit.position, prevSurfacePos, prevBsdfPdf, pTri);
                     }
                 }
                 if (bounce == 0) {
-                    emissiveContrib = Le * weight;   // Primary emissive — separate image.
+                    // Primary emissive routes to the non-denoised emissive
+                    // bucket (NRD's diff/spec demodulation has no surface to
+                    // demodulate against). Composite adds it as `+ emis`.
+                    emissiveContrib = Le * weight;
                 } else {
                     pathRadiance += clampFirefly(throughput * Le * weight, 10.0f);
                 }
                 if (mat.emissiveTex == 0) break;
             }
+
+            // NEE callables — defined once per bounce, used by every light type.
+            // Split kernels respect the primary-hit lobe override so the demod
+            // buckets stay invariant; indirect bounces fall back to the mixture.
+            float3 V = -ray.direction;
+            auto traceShadow = [&](float3 o, float3 d, float dist) {
+                float tmax = (dist >= 1e29f) ? 1e30f : fmaxf(dist - 0.002f, 0.001f);
+                return traceShadowRay(handle, o, d, 0.001f, tmax);
+            };
+            auto neeBrdf = [&](float3 Ld, float NdotL) {
+                return evalNEEBrdf(mat, N, V, Ld, albedo, primaryLobeOverride, pickedBucket);
+            };
+            auto neePdf = [&](float3 Ld, float NdotL) {
+                return evalNEEBrdfPdf(mat, N, V, Ld, albedo, primaryLobeOverride, pickedBucket);
+            };
 
             // NEE area lights.  ReSTIR DI replaces the per-frame CDF pick at
             // the primary hit (s==0, bounce==0) with the resampled
@@ -1195,60 +1104,14 @@ extern "C" __global__ void __raygen__path_trace_split()
                 }
                 if (!restirSkip) {
                 GPUAreaLight light = scene.d_areaLights[li];
-                float3 lp = light.v0 * b0
-                          + (light.v0 + light.e1) * b1
-                          + (light.v0 + light.e2) * b2;
-                float3 toL = lp - hit.position;
-                float d2 = fmaxf(dot(toL, toL), 1e-6f);
-                float d  = sqrtf(d2);
-                float3 Ld = toL * (1.0f / d);
-                float NdotL = fmaxf(dot(N, Ld), 0.0f);
-                float lNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
-                if (NdotL > 0.0f && lNdot > 0.0f) {
-                    float3 shadowOrigin = hit.position + N * 0.001f;
-                    float shadowTmax = fmaxf(d - 0.002f, 0.001f);
-                    float3 st = traceShadowRay(handle, shadowOrigin, Ld, 0.001f, shadowTmax);
-                    float3 volumetricST = volumeShadowTransmittance(
-                        shadowOrigin, Ld, d, scene.medium, rng);
-                    st = st * volumetricST;
-                    float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
-                    if (slum > 1e-6f) {
-                        float3 V = -ray.direction;
-                        float3 brdf;
-                        if (primaryLobeOverride) {
-                            brdf = (pickedBucket == 0)
-                                ? materialDiffuseLobe(mat, N, V, Ld, albedo)
-                                : materialSpecularLobe(mat, N, V, Ld, albedo);
-                        } else {
-                            brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
-                        }
-                        float3 Le = sampleAreaLightLe(light, b0, b1, b2);
-
-                        if (restirActive) {
-                            float geom = lNdot / d2;
-                            float3 neeContrib = throughput * st * brdf * Le *
-                                                (NdotL * geom) * restirW;
-                            pathRadiance += clampFirefly(neeContrib, 10.0f);
-                        } else {
-                            float pTri = light.weight / scene.areaLightTotalWeight;
-                            float pArea = pTri / fmaxf(light.area, 1e-7f);
-                            float pdfOmega = pArea * d2 / fmaxf(lNdot, 1e-7f);
-                            float pdfBs;
-                            if (primaryLobeOverride) {
-                                pdfBs = (pickedBucket == 0)
-                                    ? bsdfDiffusePdf(NdotL)
-                                    : bsdfSpecularPdf(N, V, Ld, mat.roughness);
-                            } else {
-                                float spP = materialSpecProb(mat, N, V, albedo);
-                                pdfBs = materialMixturePdf(mat, N, V, Ld, spP);
-                            }
-                            float w = powerHeuristic(pdfOmega, pdfBs);
-                            float3 neeContrib = throughput * st * brdf * Le *
-                                                (NdotL / fmaxf(pdfOmega, 1e-7f)) * w;
-                            pathRadiance += clampFirefly(neeContrib, 10.0f);
-                        }
-                    }
-                }
+                float pSelect = light.weight / fmaxf(scene.areaLightTotalWeight, 1e-7f);
+                // Split kernel always clamps NEE contributions at cap=10 — RELAX
+                // is sensitive to single-sample spikes (water-ripple artifact).
+                pathRadiance += evalAreaLightNEEContribution(
+                    throughput, hit.position, N, light, b0, b1, b2, pSelect,
+                    restirActive, restirW,
+                    scene.medium, rng, traceShadow, neeBrdf, neePdf,
+                    /*fireflyClamp=*/10.0f);
                 } // end !restirSkip
             }
 
@@ -1257,69 +1120,16 @@ extern "C" __global__ void __raygen__path_trace_split()
             // emissive geometry; explicit point lights are a fallback for
             // scenes that have no area lights at all.
             else if (scene.d_pointLights && scene.pointLightCount > 0) {
-                float3 V = -ray.direction;
-                float3 direct = make_float3(0,0,0);
-                for (uint32_t li = 0; li < scene.pointLightCount; li++) {
-                    GPUPointLight light = scene.d_pointLights[li];
-                    float3 toL = light.position - hit.position;
-                    float d2 = fmaxf(dot(toL, toL), 1e-6f);
-                    float d  = sqrtf(d2);
-                    float3 Ld = toL * (1.0f / d);
-                    float NdotL = fmaxf(dot(N, Ld), 0.0f);
-                    if (NdotL <= 0.0f) continue;
-                    float3 shadowOrigin = hit.position + N * 0.001f;
-                    float shadowTmax = fmaxf(d - 0.002f, 0.001f);
-                    float3 st = traceShadowRay(handle, shadowOrigin, Ld, 0.001f, shadowTmax);
-                    float3 volumetricSTPL = volumeShadowTransmittance(
-                        shadowOrigin, Ld, d, scene.medium, rng);
-                    st = st * volumetricSTPL;
-                    float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
-                    if (slum < 1e-6f) continue;
-                    float attenDen = light.constantAttenuation
-                                   + light.linearAttenuation  * d
-                                   + light.quadraticAttenuation * d2;
-                    float atten = 1.0f / fmaxf(attenDen, 1e-4f);
-                    float3 Li = light.color * (light.intensity * atten);
-                    float3 brdf;
-                    if (primaryLobeOverride) {
-                        brdf = (pickedBucket == 0)
-                            ? materialDiffuseLobe(mat, N, V, Ld, albedo)
-                            : materialSpecularLobe(mat, N, V, Ld, albedo);
-                    } else {
-                        brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
-                    }
-                    direct += clampFirefly(brdf * st * Li * NdotL, 10.0f);
-                }
+                float3 direct = evalAllPointLightsNEE(
+                    scene, scene.medium, hit.position, N, rng,
+                    traceShadow, neeBrdf, /*fireflyClamp=*/10.0f);
                 pathRadiance += throughput * direct;
             }
 
             if (scene.d_directionalLights && scene.directionalLightCount > 0) {
-                float3 V = -ray.direction;
-                float3 direct = make_float3(0,0,0);
-                for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
-                    GPUDirectionalLight light = scene.d_directionalLights[li];
-                    float3 Ld = light.direction;
-                    float NdotL = fmaxf(dot(N, Ld), 0.0f);
-                    if (NdotL <= 0.0f) continue;
-
-                    float3 shadowOriginDL = hit.position + N * 0.001f;
-                    float3 st = traceShadowRay(handle, shadowOriginDL, Ld, 0.001f, 1e30f);
-                    float3 volumetricDL = volumeShadowTransmittance(
-                        shadowOriginDL, Ld, 1e30f, scene.medium, rng);
-                    st = st * volumetricDL;
-                    float slum = 0.2126f*st.x + 0.7152f*st.y + 0.0722f*st.z;
-                    if (slum < 1e-6f) continue;
-
-                    float3 brdf;
-                    if (primaryLobeOverride) {
-                        brdf = (pickedBucket == 0)
-                            ? materialDiffuseLobe(mat, N, V, Ld, albedo)
-                            : materialSpecularLobe(mat, N, V, Ld, albedo);
-                    } else {
-                        brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
-                    }
-                    direct += clampFirefly(brdf * st * light.color * NdotL, 10.0f);
-                }
+                float3 direct = evalAllDirectionalLightsNEE(
+                    scene, scene.medium, hit.position, N, rng,
+                    traceShadow, neeBrdf, /*fireflyClamp=*/10.0f);
                 pathRadiance += throughput * direct;
             }
 
@@ -1346,7 +1156,7 @@ extern "C" __global__ void __raygen__path_trace_split()
             }
 
             // BSDF sampling for next bounce. Forced lobe at primary hit.
-            float3 V = -ray.direction;
+            // V was hoisted earlier for NEE.
             float specProb = materialSpecProb(mat, N, V, albedo);
             float3 newDir;
             bool sampleSpecular;

@@ -588,6 +588,29 @@ __device__ inline GlassBounce sampleGlassBounce(
     return r;
 }
 
+// ── Tangent interpolation + normal-map application ──────────
+// Interpolates the per-vertex tangents at a hit's barycentric coordinates and
+// applies the material's tangent-space normal map. Optionally writes the
+// interpolated tangent through `outTangent` so the mono CUDA debug-viz can
+// inspect handedness.
+//
+// Caller is responsible for gating the call (e.g. `mat.transmission <= 0 &&
+// mat.normalTex != 0 && scene.d_tangents`).
+__device__ inline float3 applyInterpolatedNormalMap(
+    float3 N, const DeviceSceneData& scene,
+    uint32_t i0, uint32_t i1, uint32_t i2,
+    float baryU, float baryV, float baryW,
+    cudaTextureObject_t normalTex, float2 texUV,
+    float4* outTangent = nullptr)
+{
+    float4 t0 = scene.d_tangents[i0];
+    float4 t1 = scene.d_tangents[i1];
+    float4 t2 = scene.d_tangents[i2];
+    float4 tangent = t0 * baryW + t1 * baryU + t2 * baryV;
+    if (outTangent) *outTangent = tangent;
+    return applyNormalMap(N, tangent, normalTex, texUV);
+}
+
 // Fetch Le at a barycentric point on an area light (texture-aware).
 __device__ inline float3 sampleAreaLightLe(
     const GPUAreaLight& light, float b0, float b1, float b2)

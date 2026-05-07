@@ -1,6 +1,7 @@
 #include "render/PathTraceKernel.h"
 #include "render/PathTraceHelpers.cuh"
 #include "render/GBufferWriters.cuh"
+#include "render/NEEHelpers.cuh"
 #include "core/Halton.h"
 #include "core/VolumeMedium.h"
 #include "core/VolumeDevice.cuh"
@@ -270,14 +271,12 @@ __global__ void pathTraceKernel(
         float3 debugNPreFlip = N;
         const float3 debugRayDir = ray.direction;
         if (mat.normalTex != 0 && scene.d_tangents && isOpaque && scene.enableNormalMap) {
-            float4 t0 = scene.d_tangents[i0];
-            float4 t1 = scene.d_tangents[i1];
-            float4 t2 = scene.d_tangents[i2];
-            float4 tangent = t0 * baryW + t1 * baryU + t2 * baryV;
-            debugHandedness = tangent.w;
+            float4 tangent;
+            N = applyInterpolatedNormalMap(N, scene, i0, i1, i2, baryU, baryV, baryW,
+                                           mat.normalTex, texUV, &tangent);
+            debugHandedness   = tangent.w;
             debugNormalMapped = true;
-            N = applyNormalMap(N, tangent, mat.normalTex, texUV);
-            debugNPreFlip = N;
+            debugNPreFlip     = N;
         }
 
         // Debug: publish (position, perturbed N) into the sparse arrow grid.
@@ -424,38 +423,27 @@ __global__ void pathTraceKernel(
             float3 Le = emissiveColor * mat.emissionStrength;
             float weight = 1.0f;
 
-            // Check if this triangle is a registered area light (NEE-sampleable
-            // via the area light CDF). Texture-emitter triangles are now
-            // registered too, so MIS applies uniformly.
-            bool isAreaLight = false;
+            // MIS the emissive hit against the light-sampling strategy. pTri
+            // must match the strategy used in NEE: if we sampled via the
+            // light BVH at prevSurfacePos, the MIS inverse probability is the
+            // BVH PDF of reaching `areaLightIndex` from there. Texture-emitter
+            // triangles are registered as area lights too, so MIS applies
+            // uniformly.
             if (bounce > 0 && havePrevSurface && !lastBounceDelta && scene.d_triangleAreaLightIndex) {
                 int areaLightIndex = scene.d_triangleAreaLightIndex[(uint32_t)hit.primitiveIndex];
                 if (areaLightIndex >= 0 && scene.d_areaLights && scene.areaLightCount > 0) {
-                    isAreaLight = true;
                     GPUAreaLight light = scene.d_areaLights[areaLightIndex];
-                    float3 toLight = hit.position - prevSurfacePos;
-                    float dist2 = fmaxf(dot(toLight, toLight), 1e-6f);
-                    float3 wi = normalize(toLight);
-                    float lightNdot = fmaxf(dot(light.normal, -wi), 0.0f);
-                    if (lightNdot > 0.0f) {
-                        // pTri must match the light-selection strategy used in
-                        // NEE: if we sampled this light via the BVH at
-                        // prevSurfacePos, the MIS inverse probability is the
-                        // BVH PDF of reaching `areaLightIndex` from there.
-                        float pTri;
-                        if (scene.d_lightBVHNodes && scene.d_lightIndexToSlot) {
-                            uint32_t slot = scene.d_lightIndexToSlot[(uint32_t)areaLightIndex];
-                            pTri = lightBVH_pdf(scene.d_lightBVHNodes,
-                                                scene.lightBVHRootIndex,
-                                                prevSurfacePos, slot);
-                        } else {
-                            pTri = light.weight / fmaxf(scene.areaLightTotalWeight, 1e-7f);
-                        }
-                        float pArea = pTri / fmaxf(light.area, 1e-7f);
-                        float pLight = pArea * dist2 / fmaxf(lightNdot, 1e-7f);
-                        float pBsdf = prevBsdfPdf;
-                        weight = powerHeuristic(pBsdf, pLight);
+                    float pTri;
+                    if (scene.d_lightBVHNodes && scene.d_lightIndexToSlot) {
+                        uint32_t slot = scene.d_lightIndexToSlot[(uint32_t)areaLightIndex];
+                        pTri = lightBVH_pdf(scene.d_lightBVHNodes,
+                                            scene.lightBVHRootIndex,
+                                            prevSurfacePos, slot);
+                    } else {
+                        pTri = light.weight / fmaxf(scene.areaLightTotalWeight, 1e-7f);
                     }
+                    weight = computeEmissiveMISWeight(
+                        light, hit.position, prevSurfacePos, prevBsdfPdf, pTri);
                 }
             }
 
@@ -470,6 +458,20 @@ __global__ void pathTraceKernel(
                 break;
             }
         }
+
+        // NEE callables — defined once per bounce, used by every light type
+        // below. `traceShadow` adapts the CUDA SAH-BVH; mono kernels always
+        // use the full Cook-Torrance mixture (primaryLobeOverride=false).
+        float3 V = -ray.direction;
+        auto traceShadow = [&](float3 o, float3 d, float dist) {
+            return cudaTraceTransmissiveShadow(scene, o, d, dist);
+        };
+        auto neeBrdf = [&](float3 Ld, float NdotL) {
+            return evalNEEBrdf(mat, N, V, Ld, albedo, /*primaryLobeOverride=*/false, 0);
+        };
+        auto neePdf = [&](float3 Ld, float NdotL) {
+            return evalNEEBrdfPdf(mat, N, V, Ld, albedo, /*primaryLobeOverride=*/false, 0);
+        };
 
         // Direct lighting from emissive triangle lights (next-event estimation).
         if (scene.d_areaLights && scene.areaLightCount > 0 &&
@@ -533,115 +535,16 @@ __global__ void pathTraceKernel(
 
             if (!restirSkip) {
             GPUAreaLight light = scene.d_areaLights[lightIndex];
-
-            float3 lightV0 = light.v0;
-            float3 lightV1 = light.v0 + light.e1;
-            float3 lightV2 = light.v0 + light.e2;
-            float3 lightPos = lightV0 * b0 + lightV1 * b1 + lightV2 * b2;
-
-            float3 toLight = lightPos - hit.position;
-            float dist2 = fmaxf(dot(toLight, toLight), 1e-6f);
-            float dist = sqrtf(dist2);
-            float3 Ld = toLight * (1.0f / dist);
-
-            float NdotL = fmaxf(dot(N, Ld), 0.0f);
-            float lightNdot = fmaxf(dot(light.normal, -Ld), 0.0f);
-            if (NdotL > 0.0f && lightNdot > 0.0f) {
-                // Shadow ray with glass transparency
-                float3 shadowTransmittance = make_float3(1.0f, 1.0f, 1.0f);
-                bool occluded = false;
-                if (scene.d_bvhNodes && scene.totalTriangles > 0) {
-                    Ray shadowRay;
-                    shadowRay.origin = hit.position + N * 0.001f;
-                    shadowRay.direction = Ld;
-                    shadowRay.tmin = 0.001f;
-                    shadowRay.tmax = fmaxf(dist - 0.002f, 0.001f);
-
-                    for (int shadowStep = 0; shadowStep < 8; shadowStep++) {
-                        HitRecord shadowHit;
-                        shadowHit.t = shadowRay.tmax;
-                        bool didHitShadow = bvh_closestHit(
-                            shadowRay, scene.d_bvhNodes, scene.bvhRootIndex,
-                            scene.d_positions, scene.d_indices, scene.d_materialIndices,
-                            shadowHit);
-                        if (!didHitShadow) break;
-
-                        // Check if the hit surface is glass
-                        GPUMaterial shadowMat;
-                        if (shadowHit.materialIndex >= 0 && (uint32_t)shadowHit.materialIndex < scene.materialCount)
-                            shadowMat = scene.d_materials[shadowHit.materialIndex];
-                        else { occluded = true; break; }
-
-                        if (shadowMat.transmission > 0.0f) {
-                            // Attenuate by glass color for colored glass;
-                            // near-white glass is treated as fully transparent.
-                            float sAlbLum = 0.2126f * shadowMat.albedo.x + 0.7152f * shadowMat.albedo.y + 0.0722f * shadowMat.albedo.z;
-                            if (sAlbLum < 0.9f) {
-                                shadowTransmittance = shadowTransmittance * shadowMat.albedo;
-                            }
-                            // Continue shadow ray past the glass surface
-                            shadowRay.origin = shadowHit.position + Ld * 0.002f;
-                            shadowRay.tmax = fmaxf(dist - length(shadowRay.origin - (hit.position + N * 0.001f)) - 0.002f, 0.001f);
-                        } else {
-                            occluded = true;
-                            break;
-                        }
-                    }
-                }
-
-                // Volumetric attenuation along the surface→area-light shadow
-                // segment. Returns (1,1,1) when no medium is enabled.
-                {
-                    float3 shadowOriginV = hit.position + N * 0.001f;
-                    float3 volumetricST = volumeShadowTransmittance(
-                        shadowOriginV, Ld, dist, scene.medium, rng);
-                    shadowTransmittance = shadowTransmittance * volumetricST;
-                }
-
-                float shadowLum = 0.2126f * shadowTransmittance.x + 0.7152f * shadowTransmittance.y + 0.0722f * shadowTransmittance.z;
-                if (!occluded && shadowLum > 1e-6f) {
-                    float3 V = -ray.direction;
-                    float3 brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
-                    float3 Le = sampleAreaLightLe(light, b0, b1, b2);
-
-                    if (restirActive) {
-                        // ReSTIR estimator: f(x) * W where f is the unshadowed
-                        // integrand (BRDF * Le * G * NdotL) and W is the
-                        // reservoir's contribution weight. No MIS against BSDF
-                        // sampling here — ReSTIR *is* our light-side strategy
-                        // at the primary hit, and mixing it with BSDF MIS
-                        // requires a bounded-weight variant beyond the scope
-                        // of this implementation.
-                        float geom = lightNdot / dist2;
-                        float3 neeContrib = throughput * shadowTransmittance *
-                                            brdf * Le * (NdotL * geom) * restirW;
-                        // Per-frame firefly clamp on the ReSTIR-DI NEE term.
-                        // PathTraceKernelSplit.cu already does this (line 580
-                        // with clampFirefly cap=10); the megakernel was
-                        // missing it. Without the clamp a near-grazing
-                        // sample held by the reservoir produces a single-
-                        // frame ~50-luminance spike that survives in the
-                        // accumulator for many frames (M7 flash-and-decay).
-                        float lumNee = 0.2126f * neeContrib.x +
-                                       0.7152f * neeContrib.y +
-                                       0.0722f * neeContrib.z;
-                        const float clampMax = 10.0f;
-                        if (lumNee > clampMax) {
-                            neeContrib = neeContrib * (clampMax / lumNee);
-                        }
-                        radiance += neeContrib;
-                    } else {
-                        float pTri = pSelect;
-                        float pArea = pTri / fmaxf(light.area, 1e-7f);
-                        float pdfOmega = pArea * dist2 / fmaxf(lightNdot, 1e-7f);
-                        float neeSpecProb = materialSpecProb(mat, N, V, albedo);
-                        float pdfBsdf = materialMixturePdf(mat, N, V, Ld, neeSpecProb);
-                        float weight = powerHeuristic(pdfOmega, pdfBsdf);
-                        radiance += throughput * shadowTransmittance * brdf * Le *
-                                    (NdotL / fmaxf(pdfOmega, 1e-7f)) * weight;
-                    }
-                }
-            }
+            // Mono ReSTIR-DI: cap=10 firefly clamp on the f*W estimator (a
+            // near-grazing reservoir sample produces a single-frame ~50-lum
+            // spike that survives the accumulator otherwise — M7 flash-and-decay).
+            // Mono non-ReSTIR: no per-contribution clamp; relies on the
+            // end-of-loop luminance clamp.
+            float fireflyClamp = restirActive ? 10.0f : 0.0f;
+            radiance += evalAreaLightNEEContribution(
+                throughput, hit.position, N, light, b0, b1, b2, pSelect,
+                restirActive, restirW,
+                scene.medium, rng, traceShadow, neeBrdf, neePdf, fireflyClamp);
             } // end !restirSkip
         }
 
@@ -651,142 +554,16 @@ __global__ void pathTraceKernel(
         // in addition to emissive mesh geometry — gating this branch behind
         // "no area lights" would drop those entirely.
         else if (scene.d_pointLights && scene.pointLightCount > 0) {
-            float3 direct = make_float3(0.0f, 0.0f, 0.0f);
-            float3 V = -ray.direction;
-
-            for (uint32_t li = 0; li < scene.pointLightCount; li++) {
-                GPUPointLight light = scene.d_pointLights[li];
-
-                float3 toLight = light.position - hit.position;
-                float dist2 = fmaxf(dot(toLight, toLight), 1e-6f);
-                float dist = sqrtf(dist2);
-                float3 Ld = toLight * (1.0f / dist);
-
-                float NdotL = fmaxf(dot(N, Ld), 0.0f);
-                if (NdotL <= 0.0f) continue;
-
-                // Shadow ray with glass transparency
-                float3 shadowTransmittancePL = make_float3(1.0f, 1.0f, 1.0f);
-                bool occluded = false;
-                if (scene.d_bvhNodes && scene.totalTriangles > 0) {
-                    Ray shadowRay;
-                    shadowRay.origin = hit.position + N * 0.001f;
-                    shadowRay.direction = Ld;
-                    shadowRay.tmin = 0.001f;
-                    shadowRay.tmax = fmaxf(dist - 0.002f, 0.001f);
-
-                    for (int shadowStep = 0; shadowStep < 8; shadowStep++) {
-                        HitRecord shadowHit;
-                        shadowHit.t = shadowRay.tmax;
-                        bool didHitShadow = bvh_closestHit(
-                            shadowRay, scene.d_bvhNodes, scene.bvhRootIndex,
-                            scene.d_positions, scene.d_indices, scene.d_materialIndices,
-                            shadowHit);
-                        if (!didHitShadow) break;
-
-                        GPUMaterial shadowMat;
-                        if (shadowHit.materialIndex >= 0 && (uint32_t)shadowHit.materialIndex < scene.materialCount)
-                            shadowMat = scene.d_materials[shadowHit.materialIndex];
-                        else { occluded = true; break; }
-
-                        if (shadowMat.transmission > 0.0f) {
-                            float sAlbLumPL = 0.2126f * shadowMat.albedo.x + 0.7152f * shadowMat.albedo.y + 0.0722f * shadowMat.albedo.z;
-                            if (sAlbLumPL < 0.9f) {
-                                shadowTransmittancePL = shadowTransmittancePL * shadowMat.albedo;
-                            }
-                            shadowRay.origin = shadowHit.position + Ld * 0.002f;
-                            shadowRay.tmax = fmaxf(dist - length(shadowRay.origin - (hit.position + N * 0.001f)) - 0.002f, 0.001f);
-                        } else {
-                            occluded = true;
-                            break;
-                        }
-                    }
-                }
-
-                // Volumetric attenuation along the surface→point-light shadow
-                // segment. Returns (1,1,1) when no medium is enabled.
-                {
-                    float3 shadowOriginPL = hit.position + N * 0.001f;
-                    float3 volumetricSTPL = volumeShadowTransmittance(
-                        shadowOriginPL, Ld, dist, scene.medium, rng);
-                    shadowTransmittancePL = shadowTransmittancePL * volumetricSTPL;
-                }
-
-                float shadowLumPL = 0.2126f * shadowTransmittancePL.x + 0.7152f * shadowTransmittancePL.y + 0.0722f * shadowTransmittancePL.z;
-                if (occluded || shadowLumPL < 1e-6f) continue;
-
-                float attenDen = light.constantAttenuation
-                               + light.linearAttenuation * dist
-                               + light.quadraticAttenuation * dist2;
-                float attenuation = 1.0f / fmaxf(attenDen, 1e-4f);
-                float3 Li = light.color * (light.intensity * attenuation);
-                float3 brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
-
-                direct += brdf * shadowTransmittancePL * Li * NdotL;
-            }
-
+            float3 direct = evalAllPointLightsNEE(
+                scene, scene.medium, hit.position, N, rng,
+                traceShadow, neeBrdf, /*fireflyClamp=*/0.0f);
             radiance += throughput * direct;
         }
 
         if (scene.d_directionalLights && scene.directionalLightCount > 0) {
-            float3 direct = make_float3(0.0f, 0.0f, 0.0f);
-            float3 V = -ray.direction;
-
-            for (uint32_t li = 0; li < scene.directionalLightCount; li++) {
-                GPUDirectionalLight light = scene.d_directionalLights[li];
-                float3 Ld = light.direction;
-
-                float NdotL = fmaxf(dot(N, Ld), 0.0f);
-                if (NdotL <= 0.0f) continue;
-
-                float3 shadowTransmittanceDL = make_float3(1.0f, 1.0f, 1.0f);
-                bool occluded = false;
-                if (scene.d_bvhNodes && scene.totalTriangles > 0) {
-                    Ray shadowRay;
-                    shadowRay.origin = hit.position + N * 0.001f;
-                    shadowRay.direction = Ld;
-                    shadowRay.tmin = 0.001f;
-                    shadowRay.tmax = 1e30f;
-
-                    for (int shadowStep = 0; shadowStep < 8; shadowStep++) {
-                        HitRecord shadowHit;
-                        shadowHit.t = shadowRay.tmax;
-                        bool didHitShadow = bvh_closestHit(
-                            shadowRay, scene.d_bvhNodes, scene.bvhRootIndex,
-                            scene.d_positions, scene.d_indices, scene.d_materialIndices,
-                            shadowHit);
-                        if (!didHitShadow) break;
-
-                        GPUMaterial shadowMat;
-                        if (shadowHit.materialIndex >= 0 && (uint32_t)shadowHit.materialIndex < scene.materialCount)
-                            shadowMat = scene.d_materials[shadowHit.materialIndex];
-                        else { occluded = true; break; }
-
-                        if (shadowMat.transmission > 0.0f) {
-                            float sAlbLumDL = 0.2126f * shadowMat.albedo.x + 0.7152f * shadowMat.albedo.y + 0.0722f * shadowMat.albedo.z;
-                            if (sAlbLumDL < 0.9f) {
-                                shadowTransmittanceDL = shadowTransmittanceDL * shadowMat.albedo;
-                            }
-                            shadowRay.origin = shadowHit.position + Ld * 0.002f;
-                            shadowRay.tmax = 1e30f;
-                        } else {
-                            occluded = true;
-                            break;
-                        }
-                    }
-                }
-
-                float3 shadowOriginDL = hit.position + N * 0.001f;
-                float3 volumetricDL = volumeShadowTransmittance(
-                    shadowOriginDL, Ld, 1e30f, scene.medium, rng);
-                shadowTransmittanceDL = shadowTransmittanceDL * volumetricDL;
-                float shadowLumDL = 0.2126f * shadowTransmittanceDL.x + 0.7152f * shadowTransmittanceDL.y + 0.0722f * shadowTransmittanceDL.z;
-                if (occluded || shadowLumDL < 1e-6f) continue;
-
-                float3 brdf = materialBsdfEvaluate(mat, N, V, Ld, albedo);
-                direct += brdf * shadowTransmittanceDL * light.color * NdotL;
-            }
-
+            float3 direct = evalAllDirectionalLightsNEE(
+                scene, scene.medium, hit.position, N, rng,
+                traceShadow, neeBrdf, /*fireflyClamp=*/0.0f);
             radiance += throughput * direct;
         }
 
@@ -812,8 +589,8 @@ __global__ void pathTraceKernel(
             break;
         }
 
-        // BRDF sampling: Fresnel-weighted blend between diffuse and specular
-        float3 V = -ray.direction;
+        // BRDF sampling: Fresnel-weighted blend between diffuse and specular.
+        // V was hoisted earlier for NEE.
         float specProb = materialSpecProb(mat, N, V, albedo);
 
         float3 newDir;
