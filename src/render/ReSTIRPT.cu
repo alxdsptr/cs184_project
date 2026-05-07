@@ -149,6 +149,8 @@ __device__ inline float3 ptPathPostfix(
     float3 throughput = make_float3(1.0f, 1.0f, 1.0f);
 
     for (uint32_t i = 0; i < bounces; i++) {
+        float3 prevPos = curr.position;          // BSDF-sample origin for MIS
+
         float3 wi;
         float  pdfBsdf = 0.0f;
         if (!restirSampleBsdfDir(curr, rng, wi, pdfBsdf)) break;
@@ -190,18 +192,19 @@ __device__ inline float3 ptPathPostfix(
                         hPos, hN, hAlbedo, hEmis,
                         hRoughness, hMetallic, hPure)) break;
 
-        // Add BSDF-sampled emitter hits at every bounce. NEE at the previous
-        // vertex already covered the same emitter via direct sampling, so in
-        // theory we should MIS-weight to avoid double-counting; but in
-        // emitter-heavy scenes (e.g. M7's 9759 small emissive triangles) the
-        // NEE-only path postfix systematically under-estimates BSDF-coherent
-        // lighting (specular reflections off near-grazing emitters, dense
-        // emitter clusters where NEE rarely selects the closest one). The
-        // resulting darkness is much worse than the modest over-count from
-        // unweighted accumulation. The shade-stage firefly clamp + per-vertex
-        // NEE clamp (liCap=25) bound the worst case.
+        // BSDF-direct-hits-emitter at this postfix vertex. The previous
+        // bounce's NEE (`ptDirectLightingAtVertex` on `curr` before this
+        // update) already estimates the same direct lighting → balance with
+        // powerHeuristic(pdfBsdf, pdfArea_solid). Without MIS the two
+        // estimators sum to ~2× direct, matching the "everything brighter"
+        // PT symptom. Helper in ReSTIRDevice.cuh.
+        // Historical note: this path used to skip MIS entirely with a
+        // comment about emitter-heavy scenes; revisit M7 darkening if MIS
+        // here regresses that case.
         if (luminance(hEmis) > 0.0f) {
-            L = L + throughput * hEmis;
+            float misEmis = restirBsdfHitsEmitterMISWeight(
+                scene, (uint32_t)nh.primitiveIndex, prevPos, hPos, pdfBsdf);
+            L = L + throughput * hEmis * misEmis;
         }
 
         float3 nViewDir = -wi;
@@ -498,8 +501,17 @@ __global__ void kReSTIRPT_InitCandidates(
                            xPos, xN, xAlbedo, xEmis,
                            xRoughness, xMetallic, xPure)) {
                 float3 viewAtXr = -wi;
+                // MIS-balance the BSDF-direct-hits-emitter contribution at x_r
+                // against the path tracer's primary-NEE at q. Without this, an
+                // x_r that lands on the area light double-counts direct
+                // lighting (path-tracer NEE adds it with powerHeuristic(area,
+                // bsdf), and we'd add the same direct again at full weight in
+                // the postfix's `L = xrEmis` term). Helper in NEEHelpers.cuh.
+                float3 xEmisMIS = xEmis * restirBsdfHitsEmitterMISWeight(
+                    scene, (uint32_t)hit2.primitiveIndex,
+                    hPos, xPos, pdfBsdf);
                 Lo = ptPathPostfix(scene,
-                                   xPos, xN, xAlbedo, xEmis,
+                                   xPos, xN, xAlbedo, xEmisMIS,
                                    xRoughness, xMetallic, xPure,
                                    viewAtXr,
                                    enableEnvironment != 0,

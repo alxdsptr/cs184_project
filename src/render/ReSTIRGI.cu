@@ -206,7 +206,15 @@ __global__ void kReSTIRGI_InitCandidates(
                 fmaxf(hSec.mat.roughness, 0.04f), hSec.mat.metallic,
                 hSec.pureDiffuse, viewDir2, rng);
 
-            Lo = hSec.emission + direct;
+            // MIS-balance the BSDF-direct-hits-emitter contribution against the
+            // path tracer's primary-NEE at q (powerHeuristic(pdfArea, pdfBsdf)
+            // — see NEEHelpers.cuh:130). Without this weight, both estimators
+            // add at full strength → ~2× direct in regions where the BSDF
+            // reliably finds the area light, and unchanged elsewhere.
+            float misEmis = restirBsdfHitsEmitterMISWeight(
+                scene, (uint32_t)hit2.primitiveIndex,
+                hit.position, hit2.position, pdfBsdf);
+            Lo = hSec.emission * misEmis + direct;
             samplePos    = hit2.position;
             sampleNormal = hSec.normal;
             isEnvSample  = false;

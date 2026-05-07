@@ -13,8 +13,10 @@
 
 #include "render/ReSTIR.h"
 #include "render/PathTraceHelpers.cuh"
+#include "render/NEEHelpers.cuh"      // computeEmissiveMISWeight + lightBVH_pdf transitive
 #include "gpu/Random.h"
 #include "gpu/Sampling.h"
+#include "accel/LightBVHSample.h"     // lightBVH_pdf
 
 // Sample a BSDF direction at a ReSTIR surface — shared by ReSTIR DI / GI / PT
 // initial-candidate generators (CUDA + OptiX). Mixture sampling between GGX
@@ -84,6 +86,52 @@ __device__ inline float3 restirEvalBrdf(
     float3 kd = (make_float3(1,1,1) - F) * (1.0f - s.metallic);
     float3 diff = kd * s.albedo * (1.0f / M_PI_F);
     return diff + spec;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// MIS weight for the BSDF-direct-hits-emitter case used by ReSTIR GI / PT.
+//
+// Background:
+//   The path tracer's primary-NEE at the visible point applies
+//   powerHeuristic(pdfArea, pdfBsdf) to the area-light contribution
+//   (NEEHelpers.cuh:130). That weight assumes the *other* technique
+//   ("BSDF-sample-from-prev hits the emitter at the next vertex") is added
+//   too with weight powerHeuristic(pdfBsdf, pdfArea). The regular path
+//   tracer adds that next-vertex emissive hit at PathTraceKernel.cu:458.
+//   ReSTIR GI / PT replaces the next bounce with a precomputed indirect
+//   estimate — if it adds emission at full weight, the two estimators sum
+//   to ~2× direct in regions where BSDF reliably finds the light.
+//
+// This helper computes the missing powerHeuristic(pdfBsdf, pdfArea) factor
+// for the BSDF-side estimator. Returns 1.0 when the hit triangle isn't a
+// registered area light (no NEE-side estimator to balance against).
+//
+// `prevPos` is the surface where the BSDF was sampled; `hitPos` is the
+// point on the emitter that the BSDF ray landed on. For init candidates
+// `prevPos` is the visible point q; for postfix bounces it's the
+// previous walk vertex.
+// ─────────────────────────────────────────────────────────────────────────
+__device__ inline float restirBsdfHitsEmitterMISWeight(
+    const DeviceSceneData& scene,
+    uint32_t hitPrimIdx,
+    const float3& prevPos,
+    const float3& hitPos,
+    float pdfBsdfAtPrev)
+{
+    if (!scene.d_triangleAreaLightIndex || !scene.d_areaLights ||
+        scene.areaLightCount == 0) return 1.0f;
+    int aliIdx = scene.d_triangleAreaLightIndex[hitPrimIdx];
+    if (aliIdx < 0 || (uint32_t)aliIdx >= scene.areaLightCount) return 1.0f;
+    GPUAreaLight light = scene.d_areaLights[aliIdx];
+    float pTri;
+    if (scene.d_lightBVHNodes && scene.d_lightIndexToSlot) {
+        uint32_t slot = scene.d_lightIndexToSlot[(uint32_t)aliIdx];
+        pTri = lightBVH_pdf(scene.d_lightBVHNodes,
+                            scene.lightBVHRootIndex, prevPos, slot);
+    } else {
+        pTri = light.weight / fmaxf(scene.areaLightTotalWeight, 1e-7f);
+    }
+    return computeEmissiveMISWeight(light, hitPos, prevPos, pdfBsdfAtPrev, pTri);
 }
 
 // Target pdf for RIS: luminance(Le) * |BRDF * NdotL| * geometry, NO visibility.

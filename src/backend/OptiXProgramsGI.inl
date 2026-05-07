@@ -151,7 +151,14 @@ extern "C" __global__ void __raygen__restir_gi_init_candidates()
                         scene, handle, hSec.pos, hSec.normal, hSec.albedo,
                         fmaxf(hSec.mat.roughness, 0.04f), hSec.mat.metallic,
                         hSec.pureDiffuse, viewDir2, rng);
-                    Lo          = hSec.emission + direct;
+
+                    // MIS-balance the BSDF-direct-hits-emitter contribution
+                    // against the path tracer's primary-NEE at q. Mirrors the
+                    // CUDA kernel exactly so OptiX/CUDA reservoirs stay
+                    // bitwise-comparable. Helper in NEEHelpers.cuh.
+                    float misEmis = restirBsdfHitsEmitterMISWeight(
+                        scene, rp2.primIdx, hPrim.pos, hSec.pos, pdfBsdf);
+                    Lo          = hSec.emission * misEmis + direct;
                     candPos     = hSec.pos;
                     candNormal  = hSec.normal;
                     isEnvCand   = false;

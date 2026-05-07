@@ -72,6 +72,8 @@ __device__ inline float3 ptPathPostfixOptiX(
     float3 throughput = make_float3(1.0f, 1.0f, 1.0f);
 
     for (uint32_t i = 0; i < bounces; i++) {
+        float3 prevPos = curr.position;          // BSDF-sample origin for MIS
+
         float3 wi;
         float  pdfBsdf = 0.0f;
         if (!restirSampleBsdfDir(curr, rng, wi, pdfBsdf)) break;
@@ -101,7 +103,10 @@ __device__ inline float3 ptPathPostfixOptiX(
         if (!ptShadeHitOptiX(scene, rp, wi,
                              hPos, hN, hAlbedo, hEmis,
                              hRoughness, hMetallic, hPure)) break;
-        L = L + throughput * hEmis;
+        // BSDF-direct-hits-emitter MIS — see CUDA twin in ReSTIRPT.cu.
+        float misEmis = restirBsdfHitsEmitterMISWeight(
+            scene, rp.primIdx, prevPos, hPos, pdfBsdf);
+        L = L + throughput * hEmis * misEmis;
 
         float3 nViewDir = -wi;
         float specProb = computeSpecProb(hN, nViewDir, hAlbedo, hMetallic);
@@ -251,8 +256,13 @@ extern "C" __global__ void __raygen__restir_pt_init_candidates()
                                            xPos, xN, xAlbedo, xEmis,
                                            xRoughness, xMetallic, xPure)) {
                 float3 viewAtXr = -wi;
+                // MIS-balance the BSDF-direct-hits-emitter contribution at x_r
+                // against the path tracer's primary-NEE at q. Mirrors the CUDA
+                // kernel exactly. Helper in NEEHelpers.cuh.
+                float3 xEmisMIS = xEmis * restirBsdfHitsEmitterMISWeight(
+                    scene, rp2.primIdx, hPos, xPos, pdfBsdf);
                 Lo = pt_optix::ptPathPostfixOptiX(scene, handle,
-                                                   xPos, xN, xAlbedo, xEmis,
+                                                   xPos, xN, xAlbedo, xEmisMIS,
                                                    xRoughness, xMetallic, xPure,
                                                    viewAtXr,
                                                    enableEnvironment,
